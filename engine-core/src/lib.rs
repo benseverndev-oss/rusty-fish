@@ -17,6 +17,29 @@ const WHITE_QUEENSIDE: u8 = 0b0010;
 const BLACK_KINGSIDE: u8 = 0b0100;
 const BLACK_QUEENSIDE: u8 = 0b1000;
 
+const KNIGHT_DELTAS: [(i8, i8); 8] = [
+    (-2, -1),
+    (-2, 1),
+    (-1, -2),
+    (-1, 2),
+    (1, -2),
+    (1, 2),
+    (2, -1),
+    (2, 1),
+];
+const KING_DELTAS: [(i8, i8); 8] = [
+    (-1, -1),
+    (-1, 0),
+    (-1, 1),
+    (0, -1),
+    (0, 1),
+    (1, -1),
+    (1, 0),
+    (1, 1),
+];
+const KNIGHT_ATTACK_TABLE: [Bitboard; 64] = build_step_attack_table(&KNIGHT_DELTAS);
+const KING_ATTACK_TABLE: [Bitboard; 64] = build_step_attack_table(&KING_DELTAS);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Color {
     White,
@@ -1203,35 +1226,11 @@ fn pop_lsb(bitboard: &mut Bitboard) -> Square {
 }
 
 fn knight_attacks(square: Square) -> Bitboard {
-    attack_mask(
-        square,
-        &[
-            (-2, -1),
-            (-2, 1),
-            (-1, -2),
-            (-1, 2),
-            (1, -2),
-            (1, 2),
-            (2, -1),
-            (2, 1),
-        ],
-    )
+    KNIGHT_ATTACK_TABLE[square.0 as usize]
 }
 
 fn king_attacks(square: Square) -> Bitboard {
-    attack_mask(
-        square,
-        &[
-            (-1, -1),
-            (-1, 0),
-            (-1, 1),
-            (0, -1),
-            (0, 1),
-            (1, -1),
-            (1, 0),
-            (1, 1),
-        ],
-    )
+    KING_ATTACK_TABLE[square.0 as usize]
 }
 
 fn bishop_attacks(square: Square, occupied: Bitboard) -> Bitboard {
@@ -1262,12 +1261,27 @@ fn sliding_attack_mask(square: Square, occupied: Bitboard, directions: &[(i8, i8
     attacks
 }
 
-fn attack_mask(square: Square, deltas: &[(i8, i8)]) -> Bitboard {
-    deltas.iter().fold(0, |mask, &(file_delta, rank_delta)| {
-        square
-            .offset(file_delta, rank_delta)
-            .map_or(mask, |target| mask | (1_u64 << target.0))
-    })
+const fn build_step_attack_table(deltas: &[(i8, i8)]) -> [Bitboard; 64] {
+    let mut table = [0; 64];
+    let mut square = 0;
+    while square < 64 {
+        let file = (square % 8) as i8;
+        let rank = (square / 8) as i8;
+        let mut attacks = 0;
+        let mut delta = 0;
+        while delta < deltas.len() {
+            let (file_delta, rank_delta) = deltas[delta];
+            let target_file = file + file_delta;
+            let target_rank = rank + rank_delta;
+            if target_file >= 0 && target_file < 8 && target_rank >= 0 && target_rank < 8 {
+                attacks |= 1_u64 << (target_rank as u8 * 8 + target_file as u8);
+            }
+            delta += 1;
+        }
+        table[square] = attacks;
+        square += 1;
+    }
+    table
 }
 
 fn piece_hash(piece: Piece, square: Square) -> u64 {
