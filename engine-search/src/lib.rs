@@ -2074,6 +2074,11 @@ mod tests {
     }
 
     #[test]
+    fn singular_extension_uses_a_fixed_verification_margin() {
+        assert_eq!(singular_verification_beta(80), 48);
+    }
+
+    #[test]
     fn syzygy_loader_reports_a_missing_tablebase_path_without_affecting_search() {
         assert!(SyzygyTablebases::load("missing-syzygy-tablebases").is_err());
     }
