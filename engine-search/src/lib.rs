@@ -1581,7 +1581,7 @@ mod tests {
     use super::{
         Bound, ClockControl, OpeningBook, SearchLimits, Searcher, SyzygyTablebases,
         TranspositionEntry, TranspositionTable, evaluate_position, late_move_reduction,
-        static_exchange_evaluation, threat_bonus, history_index,
+        passed_pawn_extension, static_exchange_evaluation, threat_bonus, history_index,
     };
 
     #[test]
@@ -1784,6 +1784,33 @@ mod tests {
         let black_edge = Board::from_fen("4k3/4bb2/8/8/3p4/8/8/4K3 b - - 0 1").unwrap();
         assert!(evaluate_position(&white_edge) > 0);
         assert!(evaluate_position(&black_edge) > 0);
+    }
+
+    #[test]
+    fn passed_pawn_extension_requires_an_advanced_unblocked_pawn_push() {
+        let white = Board::from_fen("4k3/8/3P4/8/8/8/8/4K3 w - - 0 1").unwrap();
+        assert_eq!(
+            passed_pawn_extension(&white, white.parse_uci_move("d6d7").unwrap()),
+            1
+        );
+
+        let black = Board::from_fen("4k3/8/8/8/8/3p4/8/4K3 b - - 0 1").unwrap();
+        assert_eq!(
+            passed_pawn_extension(&black, black.parse_uci_move("d3d2").unwrap()),
+            1
+        );
+
+        let blocked = Board::from_fen("4k3/2p5/3P4/8/8/8/8/4K3 w - - 0 1").unwrap();
+        assert_eq!(
+            passed_pawn_extension(&blocked, blocked.parse_uci_move("d6d7").unwrap()),
+            0
+        );
+
+        let promotion = Board::from_fen("4k3/3P4/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        assert_eq!(
+            passed_pawn_extension(&promotion, promotion.parse_uci_move("d7d8q").unwrap()),
+            0
+        );
     }
 
     #[test]
