@@ -167,6 +167,73 @@ impl MatchScore {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct SprtConfig {
+    pub elo0: f64,
+    pub elo1: f64,
+    pub alpha: f64,
+    pub beta: f64,
+}
+
+impl Default for SprtConfig {
+    fn default() -> Self {
+        Self {
+            elo0: 0.0,
+            elo1: 5.0,
+            alpha: 0.05,
+            beta: 0.05,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SprtDecision {
+    AcceptH0,
+    AcceptH1,
+    Continue,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SprtResult {
+    pub log_likelihood_ratio: f64,
+    pub lower_bound: f64,
+    pub upper_bound: f64,
+    pub decision: SprtDecision,
+}
+
+pub fn sprt(score: MatchScore, config: SprtConfig) -> Option<SprtResult> {
+    let games = score.games();
+    (games > 0).then(|| {
+        let draw_rate = f64::from(score.draws) / f64::from(games);
+        let probabilities = |elo: f64| {
+            let expected_score = 1.0 / (1.0 + 10_f64.powf(-elo / 400.0));
+            let win = (expected_score - draw_rate * 0.5).clamp(1e-12, 1.0 - 1e-12);
+            let loss = (1.0 - draw_rate - win).clamp(1e-12, 1.0 - 1e-12);
+            (win, draw_rate.clamp(1e-12, 1.0 - 1e-12), loss)
+        };
+        let (win0, draw0, loss0) = probabilities(config.elo0);
+        let (win1, draw1, loss1) = probabilities(config.elo1);
+        let llr = f64::from(score.wins) * (win1 / win0).ln()
+            + f64::from(score.draws) * (draw1 / draw0).ln()
+            + f64::from(score.losses) * (loss1 / loss0).ln();
+        let lower_bound = (config.beta / (1.0 - config.alpha)).ln();
+        let upper_bound = ((1.0 - config.beta) / config.alpha).ln();
+        let decision = if llr <= lower_bound {
+            SprtDecision::AcceptH0
+        } else if llr >= upper_bound {
+            SprtDecision::AcceptH1
+        } else {
+            SprtDecision::Continue
+        };
+        SprtResult {
+            log_likelihood_ratio: llr,
+            lower_bound,
+            upper_bound,
+            decision,
+        }
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct MatchConfig {
     pub candidate_depth: u8,
     pub baseline_depth: u8,
@@ -299,7 +366,8 @@ fn outcome_from_status(status: GameStatus, candidate_color: Color) -> GameOutcom
 mod tests {
     use super::{
         DEFAULT_TACTICAL_SUITE, MatchScore, measure_throughput, run_tactical_suite,
-        tactical_solve_rate, tactical_tsv_report, throughput_tsv_report,
+        sprt, tactical_solve_rate, tactical_tsv_report, throughput_tsv_report, SprtConfig,
+        SprtDecision,
     };
 
     #[test]
@@ -326,6 +394,38 @@ mod tests {
             }
             .elo_difference()
             .is_some_and(|elo| elo > 0.0)
+        );
+    }
+
+    #[test]
+    fn sprt_keeps_balanced_results_inconclusive_and_accepts_a_large_win_margin() {
+        let config = SprtConfig::default();
+        assert!(sprt(MatchScore::default(), config).is_none());
+        assert_eq!(
+            sprt(
+                MatchScore {
+                    wins: 10,
+                    draws: 0,
+                    losses: 10,
+                },
+                config,
+            )
+            .unwrap()
+            .decision,
+            SprtDecision::Continue
+        );
+        assert_eq!(
+            sprt(
+                MatchScore {
+                    wins: 400,
+                    draws: 0,
+                    losses: 0,
+                },
+                config,
+            )
+            .unwrap()
+            .decision,
+            SprtDecision::AcceptH1
         );
     }
 
