@@ -570,6 +570,14 @@ impl Searcher {
     where
         F: FnMut(&SearchInfo),
     {
+        if let Some(root) = self
+            .syzygy
+            .as_ref()
+            .and_then(|tables| tables.probe_root(board))
+        {
+            return root_tablebase_search_result(root);
+        }
+
         if let Some(best_move) = self
             .opening_book
             .as_ref()
@@ -1181,6 +1189,17 @@ fn syzygy_score(wdl: SyzygyWdl, ply: i32) -> i32 {
         SyzygyWdl::Win => MATE_SCORE - 512 - ply,
         SyzygyWdl::Draw => 0,
         SyzygyWdl::Loss => -MATE_SCORE + 512 + ply,
+    }
+}
+
+fn root_tablebase_search_result(root: SyzygyRootProbe) -> SearchResult {
+    SearchResult {
+        best_move: Some(root.best_move),
+        depth: 0,
+        score_cp: syzygy_score(root.wdl, 0),
+        nodes: 0,
+        elapsed: Duration::ZERO,
+        pv: vec![root.best_move],
     }
 }
 
