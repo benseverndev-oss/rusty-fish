@@ -1,3 +1,7 @@
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 use std::time::Duration;
 
 use engine_core::{Board, Color, GameStatus};
@@ -260,6 +264,40 @@ pub struct MatchConfig {
     pub max_plies: u32,
 }
 
+#[derive(Clone, Debug)]
+pub struct ExternalMatchConfig {
+    pub uci_path: Option<String>,
+    pub candidate_depth: u8,
+    pub opponent_movetime: Duration,
+    pub max_plies: u32,
+    pub response_timeout: Duration,
+}
+
+impl Default for ExternalMatchConfig {
+    fn default() -> Self {
+        Self {
+            uci_path: std::env::var("RUSTY_FISH_EXTERNAL_UCI").ok(),
+            candidate_depth: 5,
+            opponent_movetime: Duration::from_millis(100),
+            max_plies: 160,
+            response_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+impl ExternalMatchConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        match self.uci_path.as_deref().filter(|path| !path.trim().is_empty()) {
+            Some(_) => Ok(()),
+            None => Err("RUSTY_FISH_EXTERNAL_UCI must name an external UCI executable".to_string()),
+        }
+    }
+}
+
+pub fn external_match_game_count(position_count: usize) -> usize {
+    position_count.saturating_mul(2)
+}
+
 impl Default for MatchConfig {
     fn default() -> Self {
         Self {
@@ -298,6 +336,20 @@ pub fn run_fixed_opponent_match(
     Ok(records)
 }
 
+pub fn run_external_opponent_match(
+    positions: &[&str],
+    config: &ExternalMatchConfig,
+) -> Result<Vec<GameRecord>, String> {
+    config.validate()?;
+    let mut records = Vec::with_capacity(external_match_game_count(positions.len()));
+    for fen in positions {
+        for candidate_color in [Color::White, Color::Black] {
+            records.push(play_external_game(fen, candidate_color, config)?);
+        }
+    }
+    Ok(records)
+}
+
 pub fn summarize(records: &[GameRecord]) -> MatchScore {
     records
         .iter()
@@ -321,6 +373,26 @@ pub fn tsv_report(records: &[GameRecord], config: MatchConfig) -> String {
             env!("CARGO_PKG_VERSION"),
             config.candidate_depth,
             config.baseline_depth,
+            config.max_plies,
+            record.fen,
+            record.candidate_color,
+            record.outcome,
+            record.plies,
+        ));
+    }
+    report
+}
+
+pub fn external_tsv_report(records: &[GameRecord], config: &ExternalMatchConfig) -> String {
+    let opponent = config.uci_path.as_deref().unwrap_or("");
+    let mut report = "engine_version\topponent_uci\tcandidate_depth\topponent_movetime_ms\tmax_plies\tfen\tcandidate_color\toutcome\tplies\n".to_string();
+    for record in records {
+        report.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{:?}\t{}\n",
+            env!("CARGO_PKG_VERSION"),
+            opponent,
+            config.candidate_depth,
+            config.opponent_movetime.as_millis(),
             config.max_plies,
             record.fen,
             record.candidate_color,
@@ -371,6 +443,144 @@ fn play_game(fen: &str, candidate_color: Color, config: MatchConfig) -> Result<G
     })
 }
 
+fn play_external_game(
+    fen: &str,
+    candidate_color: Color,
+    config: &ExternalMatchConfig,
+) -> Result<GameRecord, String> {
+    let opponent_path = config
+        .uci_path
+        .as_deref()
+        .ok_or_else(|| "external UCI path disappeared after validation".to_string())?;
+    let mut board = Board::from_fen(fen)?;
+    let mut candidate = Searcher::default();
+    let mut opponent = UciProcess::start(opponent_path, config.response_timeout)?;
+    for ply in 0..config.max_plies {
+        let mv = if board.side_to_move == candidate_color {
+            candidate
+                .search(
+                    &board,
+                    SearchLimits {
+                        depth: Some(config.candidate_depth),
+                        ..SearchLimits::default()
+                    },
+                )
+                .best_move
+        } else {
+            let reply = opponent.best_move(&board, config.opponent_movetime)?;
+            Some(board.parse_uci_move(&reply)?)
+        };
+        let Some(mv) = mv else {
+            return Ok(GameRecord {
+                fen: fen.to_string(),
+                candidate_color,
+                outcome: outcome_from_status(board.game_status(), candidate_color),
+                plies: ply,
+            });
+        };
+        board.make_move(mv)?;
+    }
+    Ok(GameRecord {
+        fen: fen.to_string(),
+        candidate_color,
+        outcome: GameOutcome::Draw,
+        plies: config.max_plies,
+    })
+}
+
+struct UciProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: Receiver<Result<String, String>>,
+    response_timeout: Duration,
+}
+
+impl UciProcess {
+    fn start(path: &str, response_timeout: Duration) -> Result<Self, String> {
+        let mut child = Command::new(path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("failed to start external UCI engine {path}: {error}"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "external UCI engine has no stdin".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "external UCI engine has no stdout".to_string())?;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let line = line.map_err(|error| error.to_string());
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut process = Self {
+            child,
+            stdin,
+            stdout: rx,
+            response_timeout,
+        };
+        process.send("uci")?;
+        process.wait_for("uciok")?;
+        process.send("setoption name Threads value 1")?;
+        process.send("setoption name Hash value 16")?;
+        process.send("isready")?;
+        process.wait_for("readyok")?;
+        Ok(process)
+    }
+
+    fn best_move(&mut self, board: &Board, movetime: Duration) -> Result<String, String> {
+        self.send(&format!("position fen {}", board.to_fen()))?;
+        self.send(&format!("go movetime {}", movetime.as_millis()))?;
+        loop {
+            let line = self.next_line()?;
+            if let Some(best_move) = line.strip_prefix("bestmove ") {
+                let best_move = best_move.split_whitespace().next().unwrap_or_default();
+                if best_move == "0000" || best_move.is_empty() {
+                    return Err("external UCI engine returned no legal move".to_string());
+                }
+                return Ok(best_move.to_string());
+            }
+        }
+    }
+
+    fn send(&mut self, command: &str) -> Result<(), String> {
+        writeln!(self.stdin, "{command}")
+            .map_err(|error| format!("failed to send UCI command `{command}`: {error}"))?;
+        self.stdin
+            .flush()
+            .map_err(|error| format!("failed to flush UCI command `{command}`: {error}"))
+    }
+
+    fn wait_for(&mut self, expected: &str) -> Result<(), String> {
+        loop {
+            if self.next_line()? == expected {
+                return Ok(());
+            }
+        }
+    }
+
+    fn next_line(&self) -> Result<String, String> {
+        self.stdout
+            .recv_timeout(self.response_timeout)
+            .map_err(|error| format!("timed out waiting for external UCI response: {error}"))?
+    }
+}
+
+impl Drop for UciProcess {
+    fn drop(&mut self) {
+        let _ = self.send("quit");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 fn outcome_from_status(status: GameStatus, candidate_color: Color) -> GameOutcome {
     match status {
         GameStatus::Checkmate(mated) if mated == candidate_color => GameOutcome::Loss,
@@ -385,9 +595,9 @@ fn outcome_from_status(status: GameStatus, candidate_color: Color) -> GameOutcom
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TACTICAL_SUITE, MatchScore, measure_throughput, run_tactical_suite,
-        sprt, tactical_solve_rate, tactical_tsv_report, throughput_tsv_report, SprtConfig,
-        SprtDecision,
+        DEFAULT_TACTICAL_SUITE, ExternalMatchConfig, MatchScore, external_match_game_count,
+        external_tsv_report, measure_throughput, run_tactical_suite, sprt, tactical_solve_rate,
+        tactical_tsv_report, throughput_tsv_report, SprtConfig, SprtDecision,
     };
 
     #[test]
@@ -479,6 +689,25 @@ mod tests {
         };
         assert!(configured.validate().is_ok());
         assert_eq!(external_match_game_count(16), 32);
+    }
+
+    #[test]
+    fn external_report_records_the_pinned_opponent_settings() {
+        let config = ExternalMatchConfig {
+            uci_path: Some("/opt/stockfish".to_string()),
+            ..ExternalMatchConfig::default()
+        };
+        let report = external_tsv_report(
+            &[super::GameRecord {
+                fen: "test".to_string(),
+                candidate_color: engine_core::Color::Black,
+                outcome: super::GameOutcome::Loss,
+                plies: 42,
+            }],
+            &config,
+        );
+        assert!(report.contains("opponent_uci\tcandidate_depth\topponent_movetime_ms"));
+        assert!(report.contains("/opt/stockfish"));
     }
 
     #[test]
