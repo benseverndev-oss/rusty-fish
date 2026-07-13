@@ -1,9 +1,8 @@
 [workspace]
-members = ["engine-core", "engine-search", "engine-uci", "app-desktop"]
+members = ["engine-core", "engine-search", "engine-uci", "engine-bench", "app-desktop"]
 resolver = "2"
 
 [workspace.package]
 edition = "2024"
 license = "MIT"
 version = "0.1.0"
-
