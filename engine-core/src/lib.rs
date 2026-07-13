@@ -1375,7 +1375,7 @@ mod tests {
                 &[(1, 14), (2, 191), (3, 2_812), (4, 43_238)],
             ),
             (
-                "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1p2PP/R2Q1RK1 w kq - 0 1",
+                "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
                 &[(1, 6), (2, 264), (3, 9_467), (4, 422_333)],
             ),
             (
@@ -1391,9 +1391,6 @@ mod tests {
         for (fen, expected) in cases {
             for &(depth, nodes) in expected.iter() {
                 let mut board = Board::from_fen(fen).unwrap();
-                if depth == 1 && nodes == 6 {
-                    eprintln!("{fen}: {:?}", board.generate_legal_moves());
-                }
                 assert_eq!(board.perft(depth), nodes, "FEN {fen}, depth {depth}");
             }
         }
