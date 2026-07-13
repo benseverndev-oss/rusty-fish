@@ -233,6 +233,26 @@ pub fn sprt(score: MatchScore, config: SprtConfig) -> Option<SprtResult> {
     })
 }
 
+pub fn sprt_tsv_report(score: MatchScore, config: SprtConfig) -> String {
+    let result = sprt(score, config);
+    format!(
+        "engine_version\twins\tdraws\tlosses\telo_estimate\telo0\telo1\talpha\tbeta\tllr\tlower_bound\tupper_bound\tdecision\n{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        env!("CARGO_PKG_VERSION"),
+        score.wins,
+        score.draws,
+        score.losses,
+        score.elo_difference().map_or_else(|| "".to_string(), |elo| format!("{elo:.2}")),
+        config.elo0,
+        config.elo1,
+        config.alpha,
+        config.beta,
+        result.map_or_else(|| "".to_string(), |result| format!("{:.6}", result.log_likelihood_ratio)),
+        result.map_or_else(|| "".to_string(), |result| format!("{:.6}", result.lower_bound)),
+        result.map_or_else(|| "".to_string(), |result| format!("{:.6}", result.upper_bound)),
+        result.map_or_else(|| "".to_string(), |result| format!("{:?}", result.decision)),
+    )
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct MatchConfig {
     pub candidate_depth: u8,
