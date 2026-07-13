@@ -1251,6 +1251,21 @@ fn can_apply_static_pruning(
         && beta.abs() < MATE_SCORE - 1_024
 }
 
+fn can_try_singular_extension(
+    depth: u8,
+    in_check: bool,
+    has_non_pawn_material: bool,
+    entry: TranspositionEntry,
+) -> bool {
+    depth >= 6
+        && !in_check
+        && has_non_pawn_material
+        && entry.depth >= depth.saturating_add(2)
+        && entry.bound == Bound::Exact
+        && entry.best_move.is_some()
+        && entry.score.abs() < MATE_SCORE - 1_024
+}
+
 fn root_tablebase_search_result(root: SyzygyRootProbe) -> SearchResult {
     SearchResult {
         best_move: Some(root.best_move),
@@ -1815,7 +1830,7 @@ mod tests {
         evaluate_position, history_index, late_move_reduction, passed_pawn_extension,
         promotion_from_tablebase, root_tablebase_search_result, static_exchange_evaluation,
         syzygy_score, syzygy_wdl, threat_bonus, late_move_pruning_limit, razor_margin,
-        reverse_futility_margin, can_apply_static_pruning,
+        reverse_futility_margin, can_apply_static_pruning, can_try_singular_extension,
     };
 
     #[test]
