@@ -299,6 +299,7 @@ pub struct Searcher {
     tt: TranspositionTable,
     killer_moves: Vec<[Option<ChessMove>; 2]>,
     history: Vec<i32>,
+    counter_moves: Vec<Option<ChessMove>>,
     options: SearchOptions,
     opening_book: Option<OpeningBook>,
     syzygy: Option<SyzygyTablebases>,
@@ -314,6 +315,7 @@ impl Default for Searcher {
             tt: TranspositionTable::new(tt_capacity_entries_for(SearchOptions::default().hash_mb)),
             killer_moves: vec![[None, None]; MAX_KILLER_PLY],
             history: vec![0; HISTORY_SIZE],
+            counter_moves: vec![None; HISTORY_SIZE],
             options: SearchOptions::default(),
             opening_book: None,
             syzygy: None,
@@ -499,6 +501,7 @@ impl Searcher {
         self.tt.begin_search();
         self.killer_moves.fill([None, None]);
         self.history.fill(0);
+        self.counter_moves.fill(None);
 
         let max_depth = limits
             .depth
@@ -601,7 +604,7 @@ impl Searcher {
             .get(board.position_hash())
             .and_then(|entry| entry.best_move);
         let mut moves = board.generate_legal_move_list();
-        self.order_moves(board, moves.as_mut_slice(), 0, tt_move);
+        self.order_moves(board, moves.as_mut_slice(), 0, tt_move, None);
         if moves.is_empty() {
             return (self.evaluate_terminal(board, 0), Vec::new());
         }
@@ -616,14 +619,16 @@ impl Searcher {
             let undo = board.make_move(mv).expect("generated move must be legal");
             let child_depth = depth.saturating_sub(1);
             let (mut score, mut line) = if move_index == 0 {
-                let (score, line) = self.negamax(board, child_depth, 1, -beta, -alpha);
+                let (score, line) = self.negamax(board, child_depth, 1, -beta, -alpha, Some(mv));
                 (-score, line)
             } else {
-                let (score, line) = self.negamax(board, child_depth, 1, -alpha - 1, -alpha);
+                let (score, line) =
+                    self.negamax(board, child_depth, 1, -alpha - 1, -alpha, Some(mv));
                 (-score, line)
             };
             if move_index > 0 && score > alpha && score < beta && !self.stopped {
-                let (full_score, full_line) = self.negamax(board, child_depth, 1, -beta, -alpha);
+                let (full_score, full_line) =
+                    self.negamax(board, child_depth, 1, -beta, -alpha, Some(mv));
                 score = -full_score;
                 line = full_line;
             }
@@ -637,7 +642,7 @@ impl Searcher {
             }
             alpha = alpha.max(score);
             if alpha >= beta {
-                self.record_cutoff(0, mv, depth);
+                self.record_cutoff(0, mv, depth, None, self.is_quiet_move(board, mv));
                 break;
             }
         }
@@ -667,6 +672,7 @@ impl Searcher {
         ply: i32,
         mut alpha: i32,
         beta: i32,
+        previous_move: Option<ChessMove>,
     ) -> (i32, Vec<ChessMove>) {
         if self.should_stop() {
             return (self.evaluate(board), Vec::new());
@@ -714,7 +720,13 @@ impl Searcher {
 
         let tt_move = self.tt.get(tt_key).and_then(|entry| entry.best_move);
         let mut moves = board.generate_legal_move_list();
-        self.order_moves(board, moves.as_mut_slice(), ply as usize, tt_move);
+        self.order_moves(
+            board,
+            moves.as_mut_slice(),
+            ply as usize,
+            tt_move,
+            previous_move.and_then(|mv| self.counter_moves[history_index(mv)]),
+        );
         if moves.is_empty() {
             return (self.evaluate_terminal(board, ply), Vec::new());
         }
@@ -729,21 +741,29 @@ impl Searcher {
             let reduction = late_move_reduction(depth, move_index, is_quiet && extension == 0);
             let search_depth = next_depth.saturating_sub(reduction);
             let (mut score, mut line) = if move_index == 0 {
-                let (score, line) = self.negamax(board, search_depth, ply + 1, -beta, -alpha);
+                let (score, line) =
+                    self.negamax(board, search_depth, ply + 1, -beta, -alpha, Some(mv));
                 (-score, line)
             } else {
-                let (score, line) = self.negamax(board, search_depth, ply + 1, -alpha - 1, -alpha);
+                let (score, line) = self.negamax(
+                    board,
+                    search_depth,
+                    ply + 1,
+                    -alpha - 1,
+                    -alpha,
+                    Some(mv),
+                );
                 (-score, line)
             };
             if reduction > 0 && score > alpha && !self.stopped {
                 let (reduced_score, reduced_line) =
-                    self.negamax(board, next_depth, ply + 1, -alpha - 1, -alpha);
+                    self.negamax(board, next_depth, ply + 1, -alpha - 1, -alpha, Some(mv));
                 score = -reduced_score;
                 line = reduced_line;
             }
             if move_index > 0 && score > alpha && score < beta && !self.stopped {
                 let (full_score, full_line) =
-                    self.negamax(board, next_depth, ply + 1, -beta, -alpha);
+                    self.negamax(board, next_depth, ply + 1, -beta, -alpha, Some(mv));
                 score = -full_score;
                 line = full_line;
             }
@@ -757,7 +777,7 @@ impl Searcher {
             }
             alpha = alpha.max(score);
             if alpha >= beta {
-                self.record_cutoff(ply as usize, mv, depth);
+                self.record_cutoff(ply as usize, mv, depth, previous_move, is_quiet);
                 break;
             }
             if self.should_stop() {
@@ -796,7 +816,7 @@ impl Searcher {
                 .tt
                 .get(board.position_hash())
                 .and_then(|entry| entry.best_move);
-            self.order_moves(board, evasions.as_mut_slice(), 0, tt_move);
+            self.order_moves(board, evasions.as_mut_slice(), 0, tt_move, None);
             if evasions.is_empty() {
                 return self.evaluate_terminal(board, 0);
             }
@@ -819,7 +839,7 @@ impl Searcher {
         alpha = alpha.max(stand_pat);
 
         let mut moves = board.generate_capture_move_list();
-        self.order_moves(board, moves.as_mut_slice(), 0, None);
+        self.order_moves(board, moves.as_mut_slice(), 0, None, None);
         for &mv in moves.as_slice() {
             if !self.is_promising_quiescence_capture(board, mv, stand_pat, alpha) {
                 continue;
@@ -862,8 +882,11 @@ impl Searcher {
         moves: &mut [ChessMove],
         ply: usize,
         tt_move: Option<ChessMove>,
+        counter_move: Option<ChessMove>,
     ) {
-        moves.sort_by_cached_key(|mv| -self.move_order_score(board, *mv, ply, tt_move));
+        moves.sort_by_cached_key(|mv| {
+            -self.move_order_score(board, *mv, ply, tt_move, counter_move)
+        });
     }
 
     fn move_order_score(
@@ -872,6 +895,7 @@ impl Searcher {
         mv: ChessMove,
         ply: usize,
         tt_move: Option<ChessMove>,
+        counter_move: Option<ChessMove>,
     ) -> i32 {
         if tt_move == Some(mv) {
             return 2_000_000;
@@ -898,6 +922,9 @@ impl Searcher {
         if let Some(promotion) = mv.promotion {
             score += 800_000 + piece_kind_value(promotion);
         }
+        if counter_move == Some(mv) {
+            score += 750_000;
+        }
 
         if let Some(killers) = self.killer_moves.get(ply) {
             if killers[0] == Some(mv) {
@@ -910,7 +937,14 @@ impl Searcher {
         score + self.history[history_index(mv)]
     }
 
-    fn record_cutoff(&mut self, ply: usize, mv: ChessMove, depth: u8) {
+    fn record_cutoff(
+        &mut self,
+        ply: usize,
+        mv: ChessMove,
+        depth: u8,
+        previous_move: Option<ChessMove>,
+        is_quiet: bool,
+    ) {
         if ply < self.killer_moves.len() {
             let entry = &mut self.killer_moves[ply];
             if entry[0] != Some(mv) {
@@ -920,6 +954,11 @@ impl Searcher {
         }
         let history = &mut self.history[history_index(mv)];
         *history = history.saturating_add(i32::from(depth) * i32::from(depth) * 16);
+        if is_quiet {
+            if let Some(previous_move) = previous_move {
+                self.counter_moves[history_index(previous_move)] = Some(mv);
+            }
+        }
     }
 
     fn store_tt(&mut self, key: u64, entry: TranspositionEntry) {
@@ -936,6 +975,7 @@ impl Searcher {
                 ply + 1,
                 -beta,
                 -beta + 1,
+                None,
             )
             .0
     }
@@ -1509,6 +1549,26 @@ mod tests {
 
         assert_ne!(history_index(quiet), history_index(different_destination));
         assert_ne!(history_index(queen_promotion), history_index(knight_promotion));
+    }
+
+    #[test]
+    fn quiet_cutoff_records_and_prioritizes_a_counter_move() {
+        let previous_move = ChessMove::from_uci("e2e4").unwrap();
+        let counter_move = ChessMove::from_uci("d7d5").unwrap();
+        let another_quiet_move = ChessMove::from_uci("g8f6").unwrap();
+        let mut searcher = Searcher::default();
+
+        searcher.record_cutoff(1, counter_move, 4, Some(previous_move), true);
+
+        assert_eq!(
+            searcher.counter_moves[history_index(previous_move)],
+            Some(counter_move)
+        );
+        let board = Board::startpos();
+        assert!(
+            searcher.move_order_score(&board, counter_move, 0, None, Some(counter_move))
+                > searcher.move_order_score(&board, another_quiet_move, 0, None, Some(counter_move))
+        );
     }
 
     #[test]
