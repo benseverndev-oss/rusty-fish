@@ -529,11 +529,15 @@ impl Searcher {
         self.history.fill(0);
         self.counter_moves.fill(None);
 
-        let max_depth = limits
-            .depth
-            .unwrap_or(self.options.max_depth)
-            .max(1)
-            .min(self.options.max_depth);
+        let max_depth = if limits.infinite {
+            u8::MAX
+        } else {
+            limits
+                .depth
+                .unwrap_or(self.options.max_depth)
+                .max(1)
+                .min(self.options.max_depth)
+        };
         let mut best_move = None;
         let mut best_score = 0;
         let mut best_pv = Vec::new();
