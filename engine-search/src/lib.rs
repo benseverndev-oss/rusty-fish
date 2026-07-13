@@ -1575,7 +1575,7 @@ mod tests {
 
     use super::{
         Bound, ClockControl, OpeningBook, SearchLimits, Searcher, SyzygyTablebases,
-        TranspositionEntry, TranspositionTable, evaluate_position, late_move_reduction,
+        TaperedScore, TranspositionEntry, TranspositionTable, evaluate_position, late_move_reduction,
         passed_pawn_extension, static_exchange_evaluation, threat_bonus, history_index,
     };
 
@@ -1588,6 +1588,15 @@ mod tests {
 
         assert_ne!(history_index(quiet), history_index(different_destination));
         assert_ne!(history_index(queen_promotion), history_index(knight_promotion));
+    }
+
+    #[test]
+    fn tapered_scores_interpolate_between_phase_endpoints() {
+        let score = TaperedScore::new(120, 40);
+        assert_eq!(score.interpolate(0), 120);
+        assert_eq!(score.interpolate(24), 40);
+        assert_eq!(score.interpolate(12), 80);
+        assert_eq!(TaperedScore::equal(17).interpolate(9), 17);
     }
 
     #[test]
