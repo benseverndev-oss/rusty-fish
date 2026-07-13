@@ -73,6 +73,52 @@ pub struct SearchResult {
     pub pv: Vec<ChessMove>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct OpeningBook {
+    entries: HashMap<u64, Vec<ChessMove>>,
+}
+
+impl OpeningBook {
+    pub fn from_text(text: &str) -> Result<Self, String> {
+        let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+        if lines.next() != Some("rusty-fish-book v1") {
+            return Err("opening book must start with `rusty-fish-book v1`".to_string());
+        }
+
+        let mut entries = HashMap::new();
+        for (line_number, line) in lines.enumerate() {
+            let (fen, moves) = line.split_once('\t').ok_or_else(|| {
+                format!(
+                    "opening book line {} must contain a tab separator",
+                    line_number + 2
+                )
+            })?;
+            let board = Board::from_fen(fen)?;
+            let moves = moves
+                .split_whitespace()
+                .map(|uci| board.parse_uci_move(uci))
+                .collect::<Result<Vec<_>, _>>()?;
+            if moves.is_empty() {
+                return Err(format!(
+                    "opening book line {} has no moves",
+                    line_number + 2
+                ));
+            }
+            entries.insert(board.position_hash(), moves);
+        }
+        Ok(Self { entries })
+    }
+
+    pub fn select(&self, board: &Board) -> Option<ChessMove> {
+        self.entries.get(&board.position_hash()).and_then(|moves| {
+            moves
+                .iter()
+                .copied()
+                .find(|mv| board.parse_uci_move(&mv.to_uci()).is_ok())
+        })
+    }
+}
+
 pub struct Searcher {
     nodes: u64,
     start: Instant,
@@ -82,6 +128,7 @@ pub struct Searcher {
     killer_moves: Vec<[Option<ChessMove>; 2]>,
     history: HashMap<ChessMove, i32>,
     options: SearchOptions,
+    opening_book: Option<OpeningBook>,
 }
 
 impl Default for Searcher {
@@ -95,6 +142,7 @@ impl Default for Searcher {
             killer_moves: vec![[None, None]; MAX_KILLER_PLY],
             history: HashMap::new(),
             options: SearchOptions::default(),
+            opening_book: None,
         }
     }
 }
@@ -212,6 +260,10 @@ impl Searcher {
         }
     }
 
+    pub fn set_opening_book(&mut self, opening_book: Option<OpeningBook>) {
+        self.opening_book = opening_book;
+    }
+
     pub fn search(&mut self, board: &Board, limits: SearchLimits) -> SearchResult {
         self.search_with_callback(board, limits, |_info| {})
     }
@@ -225,6 +277,20 @@ impl Searcher {
     where
         F: FnMut(&SearchInfo),
     {
+        if let Some(best_move) = self
+            .opening_book
+            .as_ref()
+            .and_then(|book| book.select(board))
+        {
+            return SearchResult {
+                best_move: Some(best_move),
+                depth: 0,
+                score_cp: 0,
+                nodes: 0,
+                elapsed: Duration::ZERO,
+                pv: vec![best_move],
+            };
+        }
         self.nodes = 0;
         self.start = Instant::now();
         self.deadline = self
@@ -1197,8 +1263,9 @@ mod tests {
     use engine_core::{Board, Color};
 
     use super::{
-        Bound, ClockControl, SearchLimits, Searcher, TranspositionEntry, TranspositionTable,
-        evaluate_position, late_move_reduction, static_exchange_evaluation, threat_bonus,
+        Bound, ClockControl, OpeningBook, SearchLimits, Searcher, TranspositionEntry,
+        TranspositionTable, evaluate_position, late_move_reduction, static_exchange_evaluation,
+        threat_bonus,
     };
 
     #[test]
@@ -1272,6 +1339,35 @@ mod tests {
         assert_eq!(late_move_reduction(2, 4, true), 0);
         assert_eq!(late_move_reduction(5, 4, true), 1);
         assert_eq!(late_move_reduction(8, 10, true), 2);
+    }
+
+    #[test]
+    fn versioned_opening_book_selects_a_legal_move_for_the_position() {
+        let book = OpeningBook::from_text(
+            "rusty-fish-book v1\nrnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1\te2e4 d2d4\n",
+        )
+        .unwrap();
+        assert_eq!(
+            book.select(&Board::startpos()).map(|mv| mv.to_uci()),
+            Some("e2e4".to_string())
+        );
+    }
+
+    #[test]
+    fn search_uses_a_configured_opening_book_before_searching() {
+        let mut searcher = Searcher::default();
+        searcher.set_opening_book(Some(
+            OpeningBook::from_text(
+                "rusty-fish-book v1\nrnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1\td2d4\n",
+            )
+            .unwrap(),
+        ));
+        let result = searcher.search(&Board::startpos(), SearchLimits::default());
+        assert_eq!(
+            result.best_move.map(|mv| mv.to_uci()),
+            Some("d2d4".to_string())
+        );
+        assert_eq!(result.depth, 0);
     }
 
     #[test]
