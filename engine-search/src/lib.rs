@@ -1454,13 +1454,24 @@ fn king_safety_bonus(board: &Board, color: Color) -> i32 {
 mod tests {
     use std::time::Duration;
 
-    use engine_core::{Board, Color};
+    use engine_core::{Board, ChessMove, Color};
 
     use super::{
         Bound, ClockControl, OpeningBook, SearchLimits, Searcher, SyzygyTablebases,
         TranspositionEntry, TranspositionTable, evaluate_position, late_move_reduction,
-        static_exchange_evaluation, threat_bonus,
+        static_exchange_evaluation, threat_bonus, history_index,
     };
+
+    #[test]
+    fn history_index_distinguishes_move_destinations_and_promotions() {
+        let quiet = ChessMove::from_uci("a2a3").unwrap();
+        let different_destination = ChessMove::from_uci("a2a4").unwrap();
+        let queen_promotion = ChessMove::from_uci("a7a8q").unwrap();
+        let knight_promotion = ChessMove::from_uci("a7a8n").unwrap();
+
+        assert_ne!(history_index(quiet), history_index(different_destination));
+        assert_ne!(history_index(queen_promotion), history_index(knight_promotion));
+    }
 
     #[test]
     fn finds_simple_mate_in_one() {
