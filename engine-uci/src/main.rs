@@ -172,6 +172,11 @@ fn write_uci_header(mut stdout: impl Write, options: &SearchOptions) -> io::Resu
         "option name Max Depth type spin default {} min 1 max 64",
         options.max_depth
     )?;
+    writeln!(
+        stdout,
+        "option name Threads type spin default {} min 1 max 256",
+        options.threads
+    )?;
     writeln!(stdout, "uciok")
 }
 
@@ -256,6 +261,13 @@ fn apply_option(state: &mut EngineState, command: &str) -> Result<(), String> {
                 .parse::<u8>()
                 .map_err(|_| format!("invalid Max Depth value: {value}"))?;
             state.options.max_depth = depth.clamp(1, 64);
+        }
+        "Threads" => {
+            let value = value.ok_or_else(|| "missing option value".to_string())?;
+            let threads = value
+                .parse::<usize>()
+                .map_err(|_| format!("invalid Threads value: {value}"))?;
+            state.options.threads = threads.clamp(1, 256);
         }
         _ => return Err(format!("unsupported option: {name}")),
     }
@@ -371,10 +383,26 @@ mod tests {
         apply_option(&mut state, "setoption name Hash value 64").unwrap();
         apply_option(&mut state, "setoption name Move Overhead value 100").unwrap();
         apply_option(&mut state, "setoption name Max Depth value 20").unwrap();
+        apply_option(&mut state, "setoption name Threads value 8").unwrap();
         assert_eq!(state.options.hash_mb, 64);
         assert_eq!(state.options.move_overhead, Duration::from_millis(100));
         assert_eq!(state.options.max_depth, 20);
+        assert_eq!(state.options.threads, 8);
         assert_eq!(state.searcher.options().hash_mb, 64);
+    }
+
+    #[test]
+    fn threads_option_is_advertised_and_clamped() {
+        let mut state = EngineState::default();
+        apply_option(&mut state, "setoption name Threads value 0").unwrap();
+        assert_eq!(state.options.threads, 1);
+        apply_option(&mut state, "setoption name Threads value 9999").unwrap();
+        assert_eq!(state.options.threads, 256);
+
+        let mut header = Vec::new();
+        write_uci_header(&mut header, &state.options).unwrap();
+        let header = String::from_utf8(header).unwrap();
+        assert!(header.contains("option name Threads type spin default 256 min 1 max 256"));
     }
 
     #[test]
