@@ -572,13 +572,24 @@ impl Searcher {
         let mut best_score = -MATE_SCORE;
         let mut best_line = Vec::new();
         let original_alpha = alpha;
-        for mv in moves {
+        for (move_index, mv) in moves.into_iter().enumerate() {
             if self.should_stop() {
                 break;
             }
             let undo = board.make_move(mv).expect("generated move must be legal");
-            let (score, mut line) = self.negamax(board, depth.saturating_sub(1), 1, -beta, -alpha);
-            let score = -score;
+            let child_depth = depth.saturating_sub(1);
+            let (mut score, mut line) = if move_index == 0 {
+                let (score, line) = self.negamax(board, child_depth, 1, -beta, -alpha);
+                (-score, line)
+            } else {
+                let (score, line) = self.negamax(board, child_depth, 1, -alpha - 1, -alpha);
+                (-score, line)
+            };
+            if move_index > 0 && score > alpha && score < beta && !self.stopped {
+                let (full_score, full_line) = self.negamax(board, child_depth, 1, -beta, -alpha);
+                score = -full_score;
+                line = full_line;
+            }
             board.unmake_move(mv, undo);
 
             if score > best_score {
@@ -679,15 +690,21 @@ impl Searcher {
             let extension = u8::from(board.in_check(board.side_to_move));
             let next_depth = depth.saturating_sub(1) + extension.min(1);
             let reduction = late_move_reduction(depth, move_index, is_quiet && extension == 0);
-            let (child_score, mut line) = self.negamax(
-                board,
-                next_depth.saturating_sub(reduction),
-                ply + 1,
-                -beta,
-                -alpha,
-            );
-            let mut score = -child_score;
+            let search_depth = next_depth.saturating_sub(reduction);
+            let (mut score, mut line) = if move_index == 0 {
+                let (score, line) = self.negamax(board, search_depth, ply + 1, -beta, -alpha);
+                (-score, line)
+            } else {
+                let (score, line) = self.negamax(board, search_depth, ply + 1, -alpha - 1, -alpha);
+                (-score, line)
+            };
             if reduction > 0 && score > alpha && !self.stopped {
+                let (reduced_score, reduced_line) =
+                    self.negamax(board, next_depth, ply + 1, -alpha - 1, -alpha);
+                score = -reduced_score;
+                line = reduced_line;
+            }
+            if move_index > 0 && score > alpha && score < beta && !self.stopped {
                 let (full_score, full_line) =
                     self.negamax(board, next_depth, ply + 1, -beta, -alpha);
                 score = -full_score;
