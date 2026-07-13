@@ -591,7 +591,12 @@ impl Searcher {
         let mut score = 0;
         if let Some(victim) = board.piece_at(mv.to) {
             let attacker = board.piece_at(mv.from).map(piece_value).unwrap_or_default();
-            score += 1_000_000 + piece_value(victim) * 16 - attacker;
+            let see = static_exchange_evaluation(board, mv);
+            score += if see >= 0 {
+                1_000_000 + see * 32 + piece_value(victim) * 16 - attacker
+            } else {
+                100_000 + see
+            };
         }
         if board.en_passant() == Some(mv.to)
             && board
@@ -731,6 +736,45 @@ impl Searcher {
 
 fn piece_value(piece: Piece) -> i32 {
     piece_kind_value(piece.kind)
+}
+
+fn static_exchange_evaluation(board: &Board, mv: ChessMove) -> i32 {
+    let captured_value = board.piece_at(mv.to).map(piece_value).unwrap_or_else(|| {
+        if board.en_passant() == Some(mv.to) {
+            piece_kind_value(PieceKind::Pawn)
+        } else {
+            0
+        }
+    });
+    if captured_value == 0 {
+        return 0;
+    }
+
+    let mut after_capture = board.clone();
+    if after_capture.make_move(mv).is_err() {
+        return -MATE_SCORE;
+    }
+    captured_value - best_exchange_gain(&mut after_capture, mv.to)
+}
+
+fn best_exchange_gain(board: &mut Board, target: engine_core::Square) -> i32 {
+    let mut best_gain = 0;
+    let recaptures = board
+        .generate_capture_moves()
+        .into_iter()
+        .filter(|mv| mv.to == target)
+        .collect::<Vec<_>>();
+
+    for recapture in recaptures {
+        let captured_value = board.piece_at(target).map(piece_value).unwrap_or_default();
+        let undo = board
+            .make_move(recapture)
+            .expect("generated capture must be legal");
+        let gain = captured_value - best_exchange_gain(board, target);
+        board.unmake_move(recapture, undo);
+        best_gain = best_gain.max(gain);
+    }
+    best_gain
 }
 
 fn piece_kind_value(kind: PieceKind) -> i32 {
@@ -1094,7 +1138,7 @@ mod tests {
 
     use super::{
         Bound, ClockControl, SearchLimits, Searcher, TranspositionEntry, TranspositionTable,
-        evaluate_position, late_move_reduction,
+        evaluate_position, late_move_reduction, static_exchange_evaluation,
     };
 
     #[test]
@@ -1168,6 +1212,13 @@ mod tests {
         assert_eq!(late_move_reduction(2, 4, true), 0);
         assert_eq!(late_move_reduction(5, 4, true), 1);
         assert_eq!(late_move_reduction(8, 10, true), 2);
+    }
+
+    #[test]
+    fn static_exchange_evaluation_rejects_a_losing_queen_capture() {
+        let board = Board::from_fen("3rk3/8/8/3p4/3Q4/8/8/4K3 w - - 0 1").unwrap();
+        let mv = board.parse_uci_move("d4d5").unwrap();
+        assert!(static_exchange_evaluation(&board, mv) < 0);
     }
 
     #[test]
