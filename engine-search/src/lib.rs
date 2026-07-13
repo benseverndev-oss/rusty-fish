@@ -641,9 +641,8 @@ impl Searcher {
             }
         }
 
-        match board.game_status() {
-            GameStatus::Ongoing => {}
-            _ => return (self.evaluate_terminal(board, ply), Vec::new()),
+        if board.is_draw_by_rule() {
+            return (0, Vec::new());
         }
 
         if let Some(wdl) = self

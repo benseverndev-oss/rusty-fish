@@ -472,6 +472,10 @@ impl Board {
             >= 3
     }
 
+    pub fn is_draw_by_rule(&self) -> bool {
+        self.halfmove_clock >= 100 || self.is_threefold_repetition()
+    }
+
     pub fn king_square(&self, color: Color) -> Option<Square> {
         self.squares
             .iter()
