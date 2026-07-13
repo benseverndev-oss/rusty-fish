@@ -77,7 +77,7 @@ fn main() -> io::Result<()> {
                 parse_go(trimmed),
             ));
         } else if trimmed == "stop" {
-            stop_and_join_active_search(&mut active_search);
+            stop_active_search(&active_search);
         } else if trimmed == "d" {
             writeln!(stdout, "info string fen {}", state.board.to_fen())?;
         } else if trimmed == "quit" {
