@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use engine_core::{Board, ChessMove, Color, GameStatus, Piece, PieceKind, Square};
@@ -14,6 +15,7 @@ const ASPIRATION_WINDOW: i32 = 50;
 const HISTORY_PROMOTION_STATES: usize = 5;
 const HISTORY_SIZE: usize = 64 * 64 * HISTORY_PROMOTION_STATES;
 const TT_CLUSTER_SIZE: usize = 4;
+const TT_SHARD_COUNT: usize = 64;
 
 fn tt_capacity_entries_for(hash_mb: usize) -> usize {
     let bytes = hash_mb.max(1) * 1024 * 1024;
@@ -65,6 +67,7 @@ pub struct SearchOptions {
     pub move_overhead: Duration,
     pub syzygy_probe_depth: u8,
     pub syzygy_probe_limit: u8,
+    pub threads: usize,
 }
 
 impl Default for SearchOptions {
@@ -75,6 +78,7 @@ impl Default for SearchOptions {
             move_overhead: Duration::from_millis(25),
             syzygy_probe_depth: 1,
             syzygy_probe_limit: 7,
+            threads: 1,
         }
     }
 }
@@ -370,7 +374,7 @@ pub struct Searcher {
     deadline: Option<Instant>,
     stopped: bool,
     stop_signal: Option<Arc<AtomicBool>>,
-    tt: TranspositionTable,
+    tt: Arc<SharedTranspositionTable>,
     killer_moves: Vec<[Option<ChessMove>; 2]>,
     history: Vec<i32>,
     counter_moves: Vec<Option<ChessMove>>,
@@ -387,7 +391,9 @@ impl Default for Searcher {
             deadline: None,
             stopped: false,
             stop_signal: None,
-            tt: TranspositionTable::new(tt_capacity_entries_for(SearchOptions::default().hash_mb)),
+            tt: Arc::new(SharedTranspositionTable::new(tt_capacity_entries_for(
+                SearchOptions::default().hash_mb,
+            ))),
             killer_moves: vec![[None, None]; MAX_KILLER_PLY],
             history: vec![0; HISTORY_SIZE],
             counter_moves: vec![None; HISTORY_SIZE],
@@ -519,6 +525,90 @@ impl TranspositionTable {
     }
 }
 
+/// A transposition table that many search threads may probe and store into
+/// concurrently. It shards the key space across independently locked
+/// [`TranspositionTable`]s: the shard is chosen from the key's high bits while
+/// each inner table indexes clusters from the low bits, keeping the two
+/// selections decorrelated. Entries are `Copy`, so no borrow is ever held
+/// across a lock.
+#[derive(Debug)]
+struct SharedTranspositionTable {
+    shards: Vec<Mutex<TranspositionTable>>,
+}
+
+impl SharedTranspositionTable {
+    fn new(capacity: usize) -> Self {
+        let per_shard = capacity.div_ceil(TT_SHARD_COUNT).max(TT_CLUSTER_SIZE);
+        let shards = (0..TT_SHARD_COUNT)
+            .map(|_| Mutex::new(TranspositionTable::new(per_shard)))
+            .collect();
+        Self { shards }
+    }
+
+    fn shard(&self, key: u64) -> &Mutex<TranspositionTable> {
+        let index = (key >> 48) as usize % self.shards.len();
+        &self.shards[index]
+    }
+
+    fn begin_search(&self) {
+        for shard in &self.shards {
+            shard.lock().expect("transposition shard poisoned").begin_search();
+        }
+    }
+
+    fn resize(&self, capacity: usize) {
+        let per_shard = capacity.div_ceil(TT_SHARD_COUNT).max(TT_CLUSTER_SIZE);
+        for shard in &self.shards {
+            shard.lock().expect("transposition shard poisoned").resize(per_shard);
+        }
+    }
+
+    fn get(&self, key: u64) -> Option<TranspositionEntry> {
+        self.shard(key)
+            .lock()
+            .expect("transposition shard poisoned")
+            .get(key)
+            .copied()
+    }
+
+    fn store(&self, key: u64, entry: TranspositionEntry) {
+        self.shard(key)
+            .lock()
+            .expect("transposition shard poisoned")
+            .store(key, entry);
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.shards
+            .iter()
+            .all(|shard| shard.lock().expect("transposition shard poisoned").is_empty())
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, key: u64) -> bool {
+        self.shard(key)
+            .lock()
+            .expect("transposition shard poisoned")
+            .contains_key(key)
+    }
+
+    #[cfg(test)]
+    fn values(&self) -> impl Iterator<Item = TranspositionEntry> {
+        let mut entries = Vec::new();
+        for shard in &self.shards {
+            entries.extend(
+                shard
+                    .lock()
+                    .expect("transposition shard poisoned")
+                    .values()
+                    .copied(),
+            );
+        }
+        entries.into_iter()
+    }
+}
+
 impl Searcher {
     pub fn options(&self) -> &SearchOptions {
         &self.options
@@ -538,6 +628,69 @@ impl Searcher {
 
     pub fn set_syzygy_tablebases(&mut self, syzygy: Option<SyzygyTablebases>) {
         self.syzygy = syzygy;
+    }
+
+    /// Builds a helper searcher for Lazy SMP. It shares the transposition table
+    /// (via the `Arc`) but keeps its own killer/history/counter-move tables and
+    /// never consults the opening book or Syzygy tablebases; the primary thread
+    /// remains the single source of reported output.
+    fn helper(tt: Arc<SharedTranspositionTable>, options: SearchOptions) -> Self {
+        Self {
+            nodes: 0,
+            start: Instant::now(),
+            deadline: None,
+            stopped: false,
+            stop_signal: None,
+            tt,
+            killer_moves: vec![[None, None]; MAX_KILLER_PLY],
+            history: vec![0; HISTORY_SIZE],
+            counter_moves: vec![None; HISTORY_SIZE],
+            options,
+            opening_book: None,
+            syzygy: None,
+        }
+    }
+
+    /// Runs a helper thread's iterative deepening. It only deepens the shared
+    /// transposition table; its results are discarded. It must not bump the
+    /// shared generation (the primary thread already did) and it exits as soon
+    /// as the shared stop signal fires or the deadline passes.
+    fn run_lazy_smp_helper(
+        &mut self,
+        board: &Board,
+        max_depth: u8,
+        deadline: Option<Instant>,
+        stop_signal: Arc<AtomicBool>,
+        index: usize,
+    ) {
+        self.nodes = 0;
+        self.start = Instant::now();
+        self.deadline = deadline;
+        self.stopped = false;
+        self.stop_signal = Some(stop_signal);
+        self.killer_moves.fill([None, None]);
+        self.history.fill(0);
+        self.counter_moves.fill(None);
+
+        // Desynchronise the fleet: odd-indexed helpers begin one ply deeper so
+        // threads explore the shared tree from different starting points.
+        let start_depth = 1 + u8::from(index % 2 == 1);
+        let mut best_score = 0;
+        for depth in start_depth..=max_depth {
+            let mut clone = board.clone();
+            let (score, _pv) = if depth == 1 {
+                self.negamax_root(&mut clone, depth, -MATE_SCORE, MATE_SCORE)
+            } else {
+                self.aspiration_search(&mut clone, depth, best_score)
+            };
+            if self.stopped {
+                break;
+            }
+            best_score = score;
+            if best_score.abs() >= MATE_SCORE - 128 {
+                break;
+            }
+        }
     }
 
     pub fn search(&mut self, board: &Board, limits: SearchLimits) -> SearchResult {
@@ -618,6 +771,40 @@ impl Searcher {
                 .max(1)
                 .min(self.options.max_depth)
         };
+        // Lazy SMP: spawn helper threads that cooperate through the shared
+        // transposition table. They share only the table and the stop signal;
+        // each keeps its own search heuristics. Nothing non-`Send` crosses the
+        // thread boundary because each helper builds its `Searcher` inside its
+        // own closure.
+        let threads = self.options.threads.max(1);
+        let mut helper_handles = Vec::new();
+        if threads > 1 && max_depth > 1 && !self.stopped {
+            let shared_stop = match self.stop_signal.clone() {
+                Some(signal) => signal,
+                None => {
+                    let signal = Arc::new(AtomicBool::new(false));
+                    self.stop_signal = Some(Arc::clone(&signal));
+                    signal
+                }
+            };
+            let deadline = self.deadline;
+            for index in 1..threads {
+                let tt = Arc::clone(&self.tt);
+                let options = self.options.clone();
+                let helper_board = board.clone();
+                let stop = Arc::clone(&shared_stop);
+                helper_handles.push(thread::spawn(move || {
+                    Searcher::helper(tt, options).run_lazy_smp_helper(
+                        &helper_board,
+                        max_depth,
+                        deadline,
+                        stop,
+                        index,
+                    );
+                }));
+            }
+        }
+
         let mut best_move = None;
         let mut best_score = 0;
         let mut best_pv = Vec::new();
@@ -658,6 +845,16 @@ impl Searcher {
             callback(&info);
             if best_score.abs() >= MATE_SCORE - 128 {
                 break;
+            }
+        }
+
+        // Signal helpers to stop and wait for them to unwind before returning.
+        if !helper_handles.is_empty() {
+            if let Some(signal) = self.stop_signal.as_ref() {
+                signal.store(true, Ordering::Relaxed);
+            }
+            for handle in helper_handles {
+                let _ = handle.join();
             }
         }
 
@@ -796,7 +993,7 @@ impl Searcher {
         let in_check = board.in_check(board.side_to_move);
 
         if excluded_move.is_none()
-            && let Some(entry) = self.tt.get(tt_key).copied()
+            && let Some(entry) = self.tt.get(tt_key)
             && entry.depth >= depth
         {
             match entry.bound {
@@ -853,7 +1050,6 @@ impl Searcher {
         let singular_candidate = excluded_move.is_none().then(|| {
             self.tt
                 .get(tt_key)
-                .copied()
                 .filter(|entry| {
                     can_try_singular_extension(
                         depth,
@@ -1874,7 +2070,8 @@ mod tests {
     use pyrrhic_rs::{Piece as TbPiece, WdlProbeResult};
 
     use super::{
-        Bound, ClockControl, MATE_SCORE, OpeningBook, SearchLimits, Searcher, SyzygyRootProbe,
+        Bound, ClockControl, MATE_SCORE, OpeningBook, SearchLimits, SearchOptions, Searcher,
+        SharedTranspositionTable, SyzygyRootProbe,
         SyzygyTablebases, SyzygyWdl, TaperedScore, TranspositionEntry, TranspositionTable,
         evaluate_position, history_index, late_move_reduction, passed_pawn_extension,
         promotion_from_tablebase, root_tablebase_search_result, static_exchange_evaluation,
@@ -1882,6 +2079,67 @@ mod tests {
         reverse_futility_margin, can_apply_static_pruning, can_try_singular_extension,
         singular_verification_beta,
     };
+
+    #[test]
+    fn default_search_options_use_one_thread() {
+        assert_eq!(SearchOptions::default().threads, 1);
+    }
+
+    #[test]
+    fn shared_transposition_table_round_trips_across_shards() {
+        let table = SharedTranspositionTable::new(4_096);
+        // Keys chosen to land in distinct shards (shard = key >> 48).
+        for key in [1u64, 1 << 48, (7 << 48) | 9, (63 << 48) | 5] {
+            table.store(
+                key,
+                TranspositionEntry {
+                    depth: 4,
+                    score: 12,
+                    bound: Bound::Exact,
+                    best_move: None,
+                },
+            );
+            assert_eq!(table.get(key).map(|entry| entry.score), Some(12));
+        }
+    }
+
+    #[test]
+    fn multi_threaded_search_finds_the_winning_capture() {
+        // White rook on h1 can capture the undefended black queen on h4.
+        let board = Board::from_fen("4k3/8/8/8/7q/8/8/4K2R w K - 0 1").unwrap();
+        let mut options = SearchOptions::default();
+        options.threads = 4;
+        let mut searcher = Searcher::default();
+        searcher.set_options(options);
+        let result = searcher.search(
+            &board,
+            SearchLimits {
+                depth: Some(6),
+                ..SearchLimits::default()
+            },
+        );
+        assert_eq!(result.best_move.map(|mv| mv.to_uci()), Some("h1h4".to_string()));
+    }
+
+    #[test]
+    fn single_and_multi_threaded_search_agree_on_a_clear_best_move() {
+        let board = Board::from_fen("4k3/8/8/8/7q/8/8/4K2R w K - 0 1").unwrap();
+        let limits = SearchLimits {
+            depth: Some(6),
+            ..SearchLimits::default()
+        };
+
+        let mut single = Searcher::default();
+        let single_result = single.search(&board, limits.clone());
+
+        let mut options = SearchOptions::default();
+        options.threads = 3;
+        let mut multi = Searcher::default();
+        multi.set_options(options);
+        let multi_result = multi.search(&board, limits);
+
+        assert_eq!(single_result.best_move, multi_result.best_move);
+    }
 
     #[test]
     fn history_index_distinguishes_move_destinations_and_promotions() {
