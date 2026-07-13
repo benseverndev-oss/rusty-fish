@@ -469,6 +469,19 @@ mod tests {
     }
 
     #[test]
+    fn external_match_requires_a_uci_path_and_schedules_color_pairs() {
+        let missing_path = ExternalMatchConfig::default();
+        assert!(missing_path.validate().is_err());
+
+        let configured = ExternalMatchConfig {
+            uci_path: Some("/tmp/stockfish".to_string()),
+            ..ExternalMatchConfig::default()
+        };
+        assert!(configured.validate().is_ok());
+        assert_eq!(external_match_game_count(16), 32);
+    }
+
+    #[test]
     fn throughput_sample_reports_nodes_per_second() {
         let sample = measure_throughput(
             "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
