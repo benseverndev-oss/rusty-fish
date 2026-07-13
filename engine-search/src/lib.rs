@@ -726,16 +726,16 @@ impl Searcher {
             let undo = board.make_move(mv).expect("generated move must be legal");
             let child_depth = depth.saturating_sub(1);
             let (mut score, mut line) = if move_index == 0 {
-                let (score, line) = self.negamax(board, child_depth, 1, -beta, -alpha, Some(mv));
+                let (score, line) = self.negamax(board, child_depth, 1, -beta, -alpha, Some(mv), None);
                 (-score, line)
             } else {
                 let (score, line) =
-                    self.negamax(board, child_depth, 1, -alpha - 1, -alpha, Some(mv));
+                    self.negamax(board, child_depth, 1, -alpha - 1, -alpha, Some(mv), None);
                 (-score, line)
             };
             if move_index > 0 && score > alpha && score < beta && !self.stopped {
                 let (full_score, full_line) =
-                    self.negamax(board, child_depth, 1, -beta, -alpha, Some(mv));
+                    self.negamax(board, child_depth, 1, -beta, -alpha, Some(mv), None);
                 score = -full_score;
                 line = full_line;
             }
@@ -780,6 +780,7 @@ impl Searcher {
         mut alpha: i32,
         beta: i32,
         previous_move: Option<ChessMove>,
+        excluded_move: Option<ChessMove>,
     ) -> (i32, Vec<ChessMove>) {
         if self.should_stop() {
             return (self.evaluate(board), Vec::new());
@@ -789,7 +790,8 @@ impl Searcher {
         let tt_key = board.position_hash();
         let in_check = board.in_check(board.side_to_move);
 
-        if let Some(entry) = self.tt.get(tt_key).copied()
+        if excluded_move.is_none()
+            && let Some(entry) = self.tt.get(tt_key).copied()
             && entry.depth >= depth
         {
             match entry.bound {
@@ -843,6 +845,19 @@ impl Searcher {
         }
 
         let tt_move = self.tt.get(tt_key).and_then(|entry| entry.best_move);
+        let singular_candidate = excluded_move.is_none().then(|| {
+            self.tt
+                .get(tt_key)
+                .copied()
+                .filter(|entry| {
+                    can_try_singular_extension(
+                        depth,
+                        in_check,
+                        self.has_non_pawn_material(board, board.side_to_move),
+                        *entry,
+                    )
+                })
+        }).flatten();
         let mut moves = board.generate_legal_move_list();
         self.order_moves(
             board,
@@ -858,6 +873,24 @@ impl Searcher {
         let mut best_score = -MATE_SCORE;
         let mut best_line = Vec::new();
         for (move_index, &mv) in moves.as_slice().iter().enumerate() {
+            if excluded_move == Some(mv) {
+                continue;
+            }
+            let singular_extension = singular_candidate.is_some_and(|entry| {
+                entry.best_move == Some(mv)
+                    && self
+                        .negamax(
+                            board,
+                            depth / 2,
+                            ply,
+                            singular_verification_beta(entry.score) - 1,
+                            singular_verification_beta(entry.score),
+                            previous_move,
+                            Some(mv),
+                        )
+                        .0
+                        < singular_verification_beta(entry.score)
+            });
             let is_quiet = self.is_quiet_move(board, mv);
             let pawn_extension = passed_pawn_extension(board, mv);
             let is_priority_move = Some(mv) == tt_move
@@ -877,13 +910,15 @@ impl Searcher {
                 break;
             }
             let undo = board.make_move(mv).expect("generated move must be legal");
-            let extension = u8::from(board.in_check(board.side_to_move)).max(pawn_extension);
+            let extension = u8::from(board.in_check(board.side_to_move))
+                .max(pawn_extension)
+                .max(u8::from(singular_extension));
             let next_depth = depth.saturating_sub(1) + extension.min(1);
             let reduction = late_move_reduction(depth, move_index, is_quiet && extension == 0);
             let search_depth = next_depth.saturating_sub(reduction);
             let (mut score, mut line) = if move_index == 0 {
                 let (score, line) =
-                    self.negamax(board, search_depth, ply + 1, -beta, -alpha, Some(mv));
+                    self.negamax(board, search_depth, ply + 1, -beta, -alpha, Some(mv), None);
                 (-score, line)
             } else {
                 let (score, line) = self.negamax(
@@ -893,18 +928,19 @@ impl Searcher {
                     -alpha - 1,
                     -alpha,
                     Some(mv),
+                    None,
                 );
                 (-score, line)
             };
             if reduction > 0 && score > alpha && !self.stopped {
                 let (reduced_score, reduced_line) =
-                    self.negamax(board, next_depth, ply + 1, -alpha - 1, -alpha, Some(mv));
+                    self.negamax(board, next_depth, ply + 1, -alpha - 1, -alpha, Some(mv), None);
                 score = -reduced_score;
                 line = reduced_line;
             }
             if move_index > 0 && score > alpha && score < beta && !self.stopped {
                 let (full_score, full_line) =
-                    self.negamax(board, next_depth, ply + 1, -beta, -alpha, Some(mv));
+                    self.negamax(board, next_depth, ply + 1, -beta, -alpha, Some(mv), None);
                 score = -full_score;
                 line = full_line;
             }
@@ -932,15 +968,17 @@ impl Searcher {
         } else {
             Bound::Exact
         };
-        self.store_tt(
-            tt_key,
-            TranspositionEntry {
-                depth,
-                score: best_score,
-                bound,
-                best_move: best_line.first().copied(),
-            },
-        );
+        if excluded_move.is_none() {
+            self.store_tt(
+                tt_key,
+                TranspositionEntry {
+                    depth,
+                    score: best_score,
+                    bound,
+                    best_move: best_line.first().copied(),
+                },
+            );
+        }
         (best_score, best_line)
     }
 
@@ -1117,6 +1155,7 @@ impl Searcher {
                 -beta,
                 -beta + 1,
                 None,
+                None,
             )
             .0
     }
@@ -1249,6 +1288,26 @@ fn can_apply_static_pruning(
         && has_non_pawn_material
         && alpha.abs() < MATE_SCORE - 1_024
         && beta.abs() < MATE_SCORE - 1_024
+}
+
+fn can_try_singular_extension(
+    depth: u8,
+    in_check: bool,
+    has_non_pawn_material: bool,
+    entry: TranspositionEntry,
+) -> bool {
+    depth >= 6
+        && !in_check
+        && has_non_pawn_material
+        && entry.depth >= depth.saturating_sub(3)
+        && entry.depth < depth
+        && entry.bound == Bound::Exact
+        && entry.best_move.is_some()
+        && entry.score.abs() < MATE_SCORE - 1_024
+}
+
+fn singular_verification_beta(tt_score: i32) -> i32 {
+    tt_score - 32
 }
 
 fn root_tablebase_search_result(root: SyzygyRootProbe) -> SearchResult {
@@ -1815,7 +1874,8 @@ mod tests {
         evaluate_position, history_index, late_move_reduction, passed_pawn_extension,
         promotion_from_tablebase, root_tablebase_search_result, static_exchange_evaluation,
         syzygy_score, syzygy_wdl, threat_bonus, late_move_pruning_limit, razor_margin,
-        reverse_futility_margin, can_apply_static_pruning,
+        reverse_futility_margin, can_apply_static_pruning, can_try_singular_extension,
+        singular_verification_beta,
     };
 
     #[test]
@@ -2043,6 +2103,29 @@ mod tests {
             true,
         ));
         assert!(can_apply_static_pruning(2, false, 0, 50, true));
+    }
+
+    #[test]
+    fn singular_extension_requires_an_unresolved_exact_non_mate_tt_entry() {
+        let entry = TranspositionEntry {
+            depth: 5,
+            score: 40,
+            bound: Bound::Exact,
+            best_move: Some(ChessMove::from_uci("e2e4").unwrap()),
+        };
+        assert!(can_try_singular_extension(6, false, true, entry));
+        assert!(!can_try_singular_extension(
+            6,
+            false,
+            true,
+            TranspositionEntry { depth: 6, ..entry },
+        ));
+        assert!(!can_try_singular_extension(6, true, true, entry));
+    }
+
+    #[test]
+    fn singular_extension_uses_a_fixed_verification_margin() {
+        assert_eq!(singular_verification_beta(80), 48);
     }
 
     #[test]
