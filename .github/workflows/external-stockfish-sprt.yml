@@ -1,0 +1,36 @@
+name: External Stockfish SPRT
+
+on:
+  workflow_dispatch:
+
+jobs:
+  external-sprt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Download pinned Stockfish 18
+        run: |
+          mkdir -p tools artifacts
+          curl --fail --location --retry 3 \
+            --output tools/stockfish-ubuntu-x86-64.tar \
+            https://github.com/official-stockfish/Stockfish/releases/download/sf_18/stockfish-ubuntu-x86-64.tar
+          echo "5c6f38b02a4da5f3ffe763f27da6c3e743eebefd92b50cb3661623b96696adff  tools/stockfish-ubuntu-x86-64.tar" | sha256sum --check --status
+          tar --extract --file tools/stockfish-ubuntu-x86-64.tar --directory tools
+          stockfish="$(find tools -type f -name stockfish-ubuntu-x86-64 -print -quit)"
+          test -n "$stockfish"
+          chmod +x "$stockfish"
+          echo "RUSTY_FISH_EXTERNAL_UCI=$PWD/$stockfish" >> "$GITHUB_ENV"
+      - name: Run 32-game external SPRT campaign
+        run: |
+          cargo run --release -p engine-bench -- external-sprt \
+            > artifacts/external-stockfish-sprt.tsv \
+            2> artifacts/external-stockfish-games.tsv
+      - name: Upload external SPRT reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: external-stockfish-sprt-tsv
+          path: |
+            artifacts/external-stockfish-sprt.tsv
+            artifacts/external-stockfish-games.tsv
