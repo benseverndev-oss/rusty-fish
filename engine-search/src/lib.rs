@@ -1260,7 +1260,8 @@ fn can_try_singular_extension(
     depth >= 6
         && !in_check
         && has_non_pawn_material
-        && entry.depth >= depth.saturating_add(2)
+        && entry.depth >= depth.saturating_sub(3)
+        && entry.depth < depth
         && entry.bound == Bound::Exact
         && entry.best_move.is_some()
         && entry.score.abs() < MATE_SCORE - 1_024
