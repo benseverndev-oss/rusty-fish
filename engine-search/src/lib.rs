@@ -1930,6 +1930,22 @@ mod tests {
     }
 
     #[test]
+    fn root_tablebase_result_uses_the_exact_move_and_existing_score_scale() {
+        let board = Board::startpos();
+        let root = SyzygyRootProbe {
+            best_move: board.parse_uci_move("e2e4").unwrap(),
+            wdl: SyzygyWdl::Win,
+            dtz: 1,
+        };
+
+        let result = root_tablebase_search_result(root);
+
+        assert_eq!(result.best_move, Some(root.best_move));
+        assert_eq!(result.score_cp, syzygy_score(SyzygyWdl::Win, 0));
+        assert_eq!(result.nodes, 0);
+    }
+
+    #[test]
     fn syzygy_loader_reports_a_missing_tablebase_path_without_affecting_search() {
         assert!(SyzygyTablebases::load("missing-syzygy-tablebases").is_err());
     }
