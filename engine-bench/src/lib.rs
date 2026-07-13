@@ -1,5 +1,55 @@
+use std::time::Duration;
+
 use engine_core::{Board, Color, GameStatus};
 use engine_search::{SearchLimits, Searcher};
+
+#[derive(Clone, Debug)]
+pub struct ThroughputSample {
+    pub fen: String,
+    pub depth: u8,
+    pub nodes: u64,
+    pub elapsed: Duration,
+    pub nodes_per_second: u64,
+}
+
+pub fn measure_throughput(fen: &str, depth: u8) -> Result<ThroughputSample, String> {
+    let board = Board::from_fen(fen)?;
+    let mut searcher = Searcher::default();
+    let result = searcher.search(
+        &board,
+        SearchLimits {
+            depth: Some(depth),
+            ..SearchLimits::default()
+        },
+    );
+    let elapsed_nanos = result.elapsed.as_nanos().max(1);
+    let nodes_per_second = (u128::from(result.nodes) * 1_000_000_000 / elapsed_nanos) as u64;
+
+    Ok(ThroughputSample {
+        fen: fen.to_string(),
+        depth,
+        nodes: result.nodes,
+        elapsed: result.elapsed,
+        nodes_per_second,
+    })
+}
+
+pub fn throughput_tsv_report(samples: &[ThroughputSample]) -> String {
+    let mut report =
+        "engine_version\tdepth\tnodes\telapsed_ms\tnodes_per_second\tfen\n".to_string();
+    for sample in samples {
+        report.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\n",
+            env!("CARGO_PKG_VERSION"),
+            sample.depth,
+            sample.nodes,
+            sample.elapsed.as_millis(),
+            sample.nodes_per_second,
+            sample.fen,
+        ));
+    }
+    report
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MatchScore {
@@ -158,7 +208,7 @@ fn outcome_from_status(status: GameStatus, candidate_color: Color) -> GameOutcom
 
 #[cfg(test)]
 mod tests {
-    use super::MatchScore;
+    use super::{MatchScore, measure_throughput, throughput_tsv_report};
 
     #[test]
     fn balanced_score_has_zero_elo_difference() {
@@ -204,5 +254,29 @@ mod tests {
         );
         assert!(report.contains("candidate_depth\tbaseline_depth"));
         assert!(report.contains("\t5\t3\t"));
+    }
+
+    #[test]
+    fn throughput_sample_reports_nodes_per_second() {
+        let sample = measure_throughput(
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            3,
+        )
+        .expect("start position is valid");
+        assert_eq!(sample.depth, 3);
+        assert!(sample.nodes > 0);
+        assert!(sample.nodes_per_second > 0);
+    }
+
+    #[test]
+    fn throughput_report_contains_measurement_fields() {
+        let sample = measure_throughput(
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            2,
+        )
+        .expect("start position is valid");
+        let report = throughput_tsv_report(&[sample]);
+        assert!(report.contains("nodes_per_second"));
+        assert!(report.contains("\t2\t"));
     }
 }
