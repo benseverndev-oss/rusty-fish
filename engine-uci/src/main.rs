@@ -1,11 +1,12 @@
 use std::io::{self, BufRead, Write};
+use std::path::Path;
 use std::sync::{Arc, mpsc};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use engine_core::{Board, CLASSIC_STARTPOS_FEN};
-use engine_search::{ClockControl, SearchLimits, SearchOptions, SearchResult, Searcher};
+use engine_search::{ClockControl, SearchLimits, SearchOptions, SearchResult, Searcher, SyzygyTablebases};
 
 fn main() -> io::Result<()> {
     let mut stdout = io::stdout();
@@ -30,8 +31,13 @@ fn main() -> io::Result<()> {
         if let Some(search) = active_search.as_ref()
             && let Ok(result) = search.result_rx.try_recv()
         {
+            active_search
+                .take()
+                .expect("active search must be present")
+                .worker
+                .join()
+                .expect("search worker panicked");
             write_best_move(&mut stdout, result)?;
-            active_search = None;
             stdout.flush()?;
         }
 
@@ -50,26 +56,24 @@ fn main() -> io::Result<()> {
         } else if trimmed == "isready" {
             writeln!(stdout, "readyok")?;
         } else if trimmed == "ucinewgame" {
-            stop_active_search(&active_search);
-            active_search = None;
+            stop_and_join_active_search(&mut active_search);
             state.board = Board::startpos();
         } else if trimmed.starts_with("position ") {
-            stop_active_search(&active_search);
-            active_search = None;
+            stop_and_join_active_search(&mut active_search);
             if let Err(err) = apply_position(&mut state.board, trimmed) {
                 writeln!(stdout, "info string position error: {err}")?;
             }
         } else if trimmed.starts_with("setoption ") {
-            stop_active_search(&active_search);
-            active_search = None;
+            stop_and_join_active_search(&mut active_search);
             if let Err(err) = apply_option(&mut state, trimmed) {
                 writeln!(stdout, "info string setoption error: {err}")?;
             }
         } else if trimmed.starts_with("go") {
-            stop_active_search(&active_search);
+            stop_and_join_active_search(&mut active_search);
             active_search = Some(start_search(
                 state.board.clone(),
                 state.options.clone(),
+                state.syzygy_path.clone(),
                 parse_go(trimmed),
             ));
         } else if trimmed == "stop" {
@@ -89,27 +93,44 @@ fn main() -> io::Result<()> {
 struct ActiveSearch {
     stop_signal: Arc<AtomicBool>,
     result_rx: mpsc::Receiver<SearchResult>,
+    worker: JoinHandle<()>,
 }
 
-fn start_search(board: Board, options: SearchOptions, limits: SearchLimits) -> ActiveSearch {
+fn start_search(
+    board: Board,
+    options: SearchOptions,
+    syzygy_path: Option<String>,
+    limits: SearchLimits,
+) -> ActiveSearch {
     let stop_signal = Arc::new(AtomicBool::new(false));
     let worker_signal = Arc::clone(&stop_signal);
     let (result_tx, result_rx) = mpsc::channel();
-    thread::spawn(move || {
+    let worker = thread::spawn(move || {
         let mut searcher = Searcher::default();
         searcher.set_options(options);
+        searcher.set_syzygy_tablebases(
+            syzygy_path.and_then(|path| SyzygyTablebases::load(&path).ok()),
+        );
         let result = searcher.search_with_stop_signal(&board, limits, worker_signal);
         let _ = result_tx.send(result);
     });
     ActiveSearch {
         stop_signal,
         result_rx,
+        worker,
     }
 }
 
 fn stop_active_search(active_search: &Option<ActiveSearch>) {
     if let Some(search) = active_search {
         search.stop_signal.store(true, Ordering::Relaxed);
+    }
+}
+
+fn stop_and_join_active_search(active_search: &mut Option<ActiveSearch>) {
+    stop_active_search(active_search);
+    if let Some(search) = active_search.take() {
+        search.worker.join().expect("search worker panicked");
     }
 }
 
@@ -126,11 +147,13 @@ struct EngineState {
     board: Board,
     searcher: Searcher,
     options: SearchOptions,
+    syzygy_path: Option<String>,
 }
 
 fn write_uci_header(mut stdout: impl Write, options: &SearchOptions) -> io::Result<()> {
     writeln!(stdout, "id name Rusty Fish")?;
     writeln!(stdout, "id author Ben Severn + Codex")?;
+    writeln!(stdout, "option name SyzygyPath type string default")?;
     writeln!(
         stdout,
         "option name Hash type spin default {} min 1 max 1024",
@@ -192,23 +215,32 @@ fn apply_option(state: &mut EngineState, command: &str) -> Result<(), String> {
     let value = tokens
         .get(value_idx + 1..)
         .map(|parts| parts.join(" "))
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "missing option value".to_string())?;
+        .filter(|s| !s.is_empty());
 
     match name.as_str() {
+        "SyzygyPath" => {
+            let path = value.unwrap_or_default();
+            if !path.is_empty() && path.split(';').any(|entry| !Path::new(entry).is_dir()) {
+                return Err(format!("Syzygy tablebase directory does not exist: {path}"));
+            }
+            state.syzygy_path = (!path.is_empty()).then_some(path);
+        }
         "Hash" => {
+            let value = value.ok_or_else(|| "missing option value".to_string())?;
             let hash_mb = value
                 .parse::<usize>()
                 .map_err(|_| format!("invalid Hash value: {value}"))?;
             state.options.hash_mb = hash_mb.clamp(1, 1024);
         }
         "Move Overhead" => {
+            let value = value.ok_or_else(|| "missing option value".to_string())?;
             let ms = value
                 .parse::<u64>()
                 .map_err(|_| format!("invalid Move Overhead value: {value}"))?;
             state.options.move_overhead = Duration::from_millis(ms.min(5_000));
         }
         "Max Depth" => {
+            let value = value.ok_or_else(|| "missing option value".to_string())?;
             let depth = value
                 .parse::<u8>()
                 .map_err(|_| format!("invalid Max Depth value: {value}"))?;
@@ -294,6 +326,7 @@ fn parse_millis(raw: &str) -> Option<u64> {
 mod tests {
     use std::sync::{Arc, mpsc};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
     use std::time::Duration;
 
     use engine_search::ClockControl;
@@ -332,6 +365,15 @@ mod tests {
     }
 
     #[test]
+    fn syzygy_path_keeps_the_previous_path_on_error() {
+        let mut state = EngineState::default();
+        apply_option(&mut state, "setoption name SyzygyPath value .").unwrap();
+        assert_eq!(state.syzygy_path.as_deref(), Some("."));
+        assert!(apply_option(&mut state, "setoption name SyzygyPath value missing-tables").is_err());
+        assert_eq!(state.syzygy_path.as_deref(), Some("."));
+    }
+
+    #[test]
     fn clock_control_type_is_constructible() {
         let clock = ClockControl {
             white_time: Duration::from_secs(60),
@@ -350,6 +392,7 @@ mod tests {
         let active = Some(ActiveSearch {
             stop_signal: Arc::clone(&stop_signal),
             result_rx,
+            worker: thread::spawn(|| {}),
         });
 
         stop_active_search(&active);
