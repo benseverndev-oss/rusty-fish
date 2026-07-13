@@ -1661,12 +1661,14 @@ mod tests {
 
     use std::time::Duration;
 
-    use engine_core::{Board, ChessMove, Color};
+    use engine_core::{Board, ChessMove, Color, PieceKind};
+    use pyrrhic_rs::{Piece as TbPiece, WdlProbeResult};
 
     use super::{
         Bound, ClockControl, OpeningBook, SearchLimits, Searcher, SyzygyTablebases,
         TaperedScore, TranspositionEntry, TranspositionTable, evaluate_position, late_move_reduction,
         passed_pawn_extension, static_exchange_evaluation, threat_bonus, history_index,
+        promotion_from_tablebase, syzygy_wdl,
     };
 
     #[test]
@@ -1863,6 +1865,21 @@ mod tests {
     #[test]
     fn syzygy_loader_reports_a_missing_tablebase_path_without_affecting_search() {
         assert!(SyzygyTablebases::load("missing-syzygy-tablebases").is_err());
+    }
+
+    #[test]
+    fn tablebase_promotion_conversion_matches_uci_piece_kinds() {
+        assert_eq!(
+            promotion_from_tablebase(TbPiece::Queen),
+            Some(PieceKind::Queen)
+        );
+        assert_eq!(promotion_from_tablebase(TbPiece::Pawn), None);
+    }
+
+    #[test]
+    fn tablebase_wdl_categories_keep_cursed_results_on_the_winning_side() {
+        assert_eq!(syzygy_wdl(WdlProbeResult::CursedWin), SyzygyWdl::Win);
+        assert_eq!(syzygy_wdl(WdlProbeResult::BlessedLoss), SyzygyWdl::Loss);
     }
 
     #[test]
