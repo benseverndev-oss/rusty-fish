@@ -1,0 +1,36 @@
+name: Tactical Suite
+
+on:
+  push:
+    paths:
+      - 'engine-core/**'
+      - 'engine-search/**'
+      - 'engine-bench/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/tactical-suite.yml'
+  pull_request:
+    paths:
+      - 'engine-core/**'
+      - 'engine-search/**'
+      - 'engine-bench/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/tactical-suite.yml'
+  workflow_dispatch:
+
+jobs:
+  tactical-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Produce tactical suite report
+        run: |
+          mkdir -p artifacts
+          cargo run --release -p engine-bench -- tactical > artifacts/tactical-suite.tsv
+      - name: Upload tactical suite report
+        uses: actions/upload-artifact@v4
+        with:
+          name: tactical-suite-tsv
+          path: artifacts/tactical-suite.tsv
