@@ -1751,10 +1751,11 @@ mod tests {
     use pyrrhic_rs::{Piece as TbPiece, WdlProbeResult};
 
     use super::{
-        Bound, ClockControl, OpeningBook, SearchLimits, Searcher, SyzygyTablebases, SyzygyWdl,
-        TaperedScore, TranspositionEntry, TranspositionTable, evaluate_position, late_move_reduction,
-        passed_pawn_extension, static_exchange_evaluation, threat_bonus, history_index,
-        promotion_from_tablebase, syzygy_wdl,
+        Bound, ClockControl, OpeningBook, SearchLimits, Searcher, SyzygyRootProbe,
+        SyzygyTablebases, SyzygyWdl, TaperedScore, TranspositionEntry, TranspositionTable,
+        evaluate_position, history_index, late_move_reduction, passed_pawn_extension,
+        promotion_from_tablebase, root_tablebase_search_result, static_exchange_evaluation,
+        syzygy_score, syzygy_wdl, threat_bonus,
     };
 
     #[test]
