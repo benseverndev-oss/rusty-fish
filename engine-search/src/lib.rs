@@ -476,7 +476,7 @@ impl Searcher {
         self.stopped = false;
         self.tt.begin_search();
         self.killer_moves.fill([None, None]);
-        self.history.clear();
+        self.history.fill(0);
 
         let max_depth = limits
             .depth
