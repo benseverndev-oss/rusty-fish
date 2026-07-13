@@ -1966,6 +1966,13 @@ mod tests {
     }
 
     #[test]
+    fn conservative_pruning_margins_increase_with_depth() {
+        assert!(razor_margin(2) > razor_margin(1));
+        assert!(reverse_futility_margin(3) > reverse_futility_margin(2));
+        assert!(late_move_pruning_limit(3) > late_move_pruning_limit(2));
+    }
+
+    #[test]
     fn syzygy_loader_reports_a_missing_tablebase_path_without_affecting_search() {
         assert!(SyzygyTablebases::load("missing-syzygy-tablebases").is_err());
     }
