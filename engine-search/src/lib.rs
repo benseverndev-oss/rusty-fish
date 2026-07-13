@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use engine_core::{Board, ChessMove, Color, GameStatus, Piece, PieceKind};
+use pyrrhic_rs::{Color as TbColor, EngineAdapter, TableBases, WdlProbeResult};
 
 const MATE_SCORE: i32 = 100_000;
 const MAX_KILLER_PLY: usize = 128;
@@ -119,6 +121,160 @@ impl OpeningBook {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyzygyWdl {
+    Loss,
+    Draw,
+    Win,
+}
+
+pub struct SyzygyTablebases {
+    tables: TableBases<RustyFishTablebaseAdapter>,
+}
+
+impl SyzygyTablebases {
+    pub fn load(path: &str) -> Result<Self, String> {
+        if path.split(';').any(|entry| !Path::new(entry).is_dir()) {
+            return Err(format!("Syzygy tablebase directory does not exist: {path}"));
+        }
+        TableBases::<RustyFishTablebaseAdapter>::new(path)
+            .map(|tables| Self { tables })
+            .map_err(|error| format!("could not load Syzygy tablebases: {error:?}"))
+    }
+
+    pub fn probe_wdl(&self, board: &Board) -> Option<SyzygyWdl> {
+        let white = board.occupancy(Color::White);
+        let black = board.occupancy(Color::Black);
+        if (white | black).count_ones() > self.tables.max_pieces() {
+            return None;
+        }
+        let ep = board.en_passant().map_or(0, |square| u32::from(square.0));
+        let result = self
+            .tables
+            .probe_wdl(
+                white,
+                black,
+                board.pieces(Color::White, PieceKind::King)
+                    | board.pieces(Color::Black, PieceKind::King),
+                board.pieces(Color::White, PieceKind::Queen)
+                    | board.pieces(Color::Black, PieceKind::Queen),
+                board.pieces(Color::White, PieceKind::Rook)
+                    | board.pieces(Color::Black, PieceKind::Rook),
+                board.pieces(Color::White, PieceKind::Bishop)
+                    | board.pieces(Color::Black, PieceKind::Bishop),
+                board.pieces(Color::White, PieceKind::Knight)
+                    | board.pieces(Color::Black, PieceKind::Knight),
+                board.pieces(Color::White, PieceKind::Pawn)
+                    | board.pieces(Color::Black, PieceKind::Pawn),
+                ep,
+                board.side_to_move == Color::White,
+            )
+            .ok()?;
+        match result {
+            WdlProbeResult::Win | WdlProbeResult::CursedWin => Some(SyzygyWdl::Win),
+            WdlProbeResult::Draw => Some(SyzygyWdl::Draw),
+            WdlProbeResult::Loss | WdlProbeResult::BlessedLoss => Some(SyzygyWdl::Loss),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RustyFishTablebaseAdapter;
+
+impl EngineAdapter for RustyFishTablebaseAdapter {
+    fn pawn_attacks(color: TbColor, square: u64) -> u64 {
+        let square = engine_core::Square(square as u8);
+        let rank_delta = if color == TbColor::White { 1 } else { -1 };
+        [(-1, rank_delta), (1, rank_delta)]
+            .iter()
+            .fold(0, |mask, &(file_delta, rank_delta)| {
+                square
+                    .offset(file_delta, rank_delta)
+                    .map_or(mask, |target| mask | (1_u64 << target.0))
+            })
+    }
+
+    fn knight_attacks(square: u64) -> u64 {
+        tablebase_attack_mask(
+            engine_core::Square(square as u8),
+            &[
+                (-2, -1),
+                (-2, 1),
+                (-1, -2),
+                (-1, 2),
+                (1, -2),
+                (1, 2),
+                (2, -1),
+                (2, 1),
+            ],
+        )
+    }
+
+    fn bishop_attacks(square: u64, occupied: u64) -> u64 {
+        tablebase_sliding_attacks(
+            engine_core::Square(square as u8),
+            occupied,
+            &[(-1, -1), (-1, 1), (1, -1), (1, 1)],
+        )
+    }
+
+    fn rook_attacks(square: u64, occupied: u64) -> u64 {
+        tablebase_sliding_attacks(
+            engine_core::Square(square as u8),
+            occupied,
+            &[(-1, 0), (1, 0), (0, -1), (0, 1)],
+        )
+    }
+
+    fn queen_attacks(square: u64, occupied: u64) -> u64 {
+        Self::bishop_attacks(square, occupied) | Self::rook_attacks(square, occupied)
+    }
+
+    fn king_attacks(square: u64) -> u64 {
+        tablebase_attack_mask(
+            engine_core::Square(square as u8),
+            &[
+                (-1, -1),
+                (-1, 0),
+                (-1, 1),
+                (0, -1),
+                (0, 1),
+                (1, -1),
+                (1, 0),
+                (1, 1),
+            ],
+        )
+    }
+}
+
+fn tablebase_attack_mask(square: engine_core::Square, deltas: &[(i8, i8)]) -> u64 {
+    deltas.iter().fold(0, |mask, &(file_delta, rank_delta)| {
+        square
+            .offset(file_delta, rank_delta)
+            .map_or(mask, |target| mask | (1_u64 << target.0))
+    })
+}
+
+fn tablebase_sliding_attacks(
+    square: engine_core::Square,
+    occupied: u64,
+    directions: &[(i8, i8)],
+) -> u64 {
+    let mut attacks = 0;
+    for &(file_delta, rank_delta) in directions {
+        let mut current = square;
+        while let Some(target) = current.offset(file_delta, rank_delta) {
+            let bit = 1_u64 << target.0;
+            attacks |= bit;
+            if occupied & bit != 0 {
+                break;
+            }
+            current = target;
+        }
+    }
+    attacks
+}
+
 pub struct Searcher {
     nodes: u64,
     start: Instant,
@@ -129,6 +285,7 @@ pub struct Searcher {
     history: HashMap<ChessMove, i32>,
     options: SearchOptions,
     opening_book: Option<OpeningBook>,
+    syzygy: Option<SyzygyTablebases>,
 }
 
 impl Default for Searcher {
@@ -143,6 +300,7 @@ impl Default for Searcher {
             history: HashMap::new(),
             options: SearchOptions::default(),
             opening_book: None,
+            syzygy: None,
         }
     }
 }
@@ -262,6 +420,10 @@ impl Searcher {
 
     pub fn set_opening_book(&mut self, opening_book: Option<OpeningBook>) {
         self.opening_book = opening_book;
+    }
+
+    pub fn set_syzygy_tablebases(&mut self, syzygy: Option<SyzygyTablebases>) {
+        self.syzygy = syzygy;
     }
 
     pub fn search(&mut self, board: &Board, limits: SearchLimits) -> SearchResult {
@@ -482,6 +644,14 @@ impl Searcher {
         match board.game_status() {
             GameStatus::Ongoing => {}
             _ => return (self.evaluate_terminal(board, ply), Vec::new()),
+        }
+
+        if let Some(wdl) = self
+            .syzygy
+            .as_ref()
+            .and_then(|syzygy| syzygy.probe_wdl(board))
+        {
+            return (syzygy_score(wdl, ply), Vec::new());
         }
 
         if depth == 0 {
@@ -802,6 +972,14 @@ impl Searcher {
 
 fn piece_value(piece: Piece) -> i32 {
     piece_kind_value(piece.kind)
+}
+
+fn syzygy_score(wdl: SyzygyWdl, ply: i32) -> i32 {
+    match wdl {
+        SyzygyWdl::Win => MATE_SCORE - 512 - ply,
+        SyzygyWdl::Draw => 0,
+        SyzygyWdl::Loss => -MATE_SCORE + 512 + ply,
+    }
 }
 
 fn static_exchange_evaluation(board: &Board, mv: ChessMove) -> i32 {
@@ -1263,9 +1441,9 @@ mod tests {
     use engine_core::{Board, Color};
 
     use super::{
-        Bound, ClockControl, OpeningBook, SearchLimits, Searcher, TranspositionEntry,
-        TranspositionTable, evaluate_position, late_move_reduction, static_exchange_evaluation,
-        threat_bonus,
+        Bound, ClockControl, OpeningBook, SearchLimits, Searcher, SyzygyTablebases,
+        TranspositionEntry, TranspositionTable, evaluate_position, late_move_reduction,
+        static_exchange_evaluation, threat_bonus,
     };
 
     #[test]
@@ -1368,6 +1546,11 @@ mod tests {
             Some("d2d4".to_string())
         );
         assert_eq!(result.depth, 0);
+    }
+
+    #[test]
+    fn syzygy_loader_reports_a_missing_tablebase_path_without_affecting_search() {
+        assert!(SyzygyTablebases::load("missing-syzygy-tablebases").is_err());
     }
 
     #[test]
