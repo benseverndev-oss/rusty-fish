@@ -840,6 +840,7 @@ fn evaluate_position(board: &Board) -> i32 {
     let mut black_pawn_files = [0u8; 8];
     let mut white_bishops = 0;
     let mut black_bishops = 0;
+    let endgame_phase = endgame_phase(board);
 
     for idx in 0..64 {
         let square = engine_core::Square(idx);
@@ -865,6 +866,12 @@ fn evaluate_position(board: &Board) -> i32 {
         }
 
         features.add(piece.color, activity_bonus(board, square, piece));
+        if piece.kind == PieceKind::King {
+            features.add(
+                piece.color,
+                king_endgame_activity(square) * endgame_phase / 24,
+            );
+        }
     }
 
     if white_bishops >= 2 {
@@ -899,9 +906,42 @@ fn evaluate_position(board: &Board) -> i32 {
         }
     }
 
-    features.add(Color::White, king_safety_bonus(board, Color::White));
-    features.add(Color::Black, king_safety_bonus(board, Color::Black));
+    let king_safety_scale = 24 - endgame_phase;
+    features.add(
+        Color::White,
+        king_safety_bonus(board, Color::White) * king_safety_scale / 24,
+    );
+    features.add(
+        Color::Black,
+        king_safety_bonus(board, Color::Black) * king_safety_scale / 24,
+    );
     features.net(board.side_to_move)
+}
+
+fn endgame_phase(board: &Board) -> i32 {
+    let mut remaining = 0;
+    for index in 0..64 {
+        let Some(piece) = board.piece_at(engine_core::Square(index)) else {
+            continue;
+        };
+        remaining += match piece.kind {
+            PieceKind::Knight | PieceKind::Bishop => 1,
+            PieceKind::Rook => 2,
+            PieceKind::Queen => 4,
+            PieceKind::Pawn | PieceKind::King => 0,
+        };
+    }
+    24 - remaining.min(24)
+}
+
+fn king_endgame_activity(square: engine_core::Square) -> i32 {
+    let file_distance = (square.file() as i32 - 3)
+        .abs()
+        .min((square.file() as i32 - 4).abs());
+    let rank_distance = (square.rank() as i32 - 3)
+        .abs()
+        .min((square.rank() as i32 - 4).abs());
+    24 - (file_distance + rank_distance) * 6
 }
 
 fn activity_bonus(board: &Board, square: engine_core::Square, piece: Piece) -> i32 {
@@ -1227,6 +1267,13 @@ mod tests {
         let black_edge = Board::from_fen("4k3/4bb2/8/8/3p4/8/8/4K3 b - - 0 1").unwrap();
         assert!(evaluate_position(&white_edge) > 0);
         assert!(evaluate_position(&black_edge) > 0);
+    }
+
+    #[test]
+    fn endgame_evaluation_rewards_an_active_king() {
+        let active = Board::from_fen("4k3/8/8/8/4K3/8/4P3/8 w - - 0 1").unwrap();
+        let passive = Board::from_fen("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1").unwrap();
+        assert!(evaluate_position(&active) > evaluate_position(&passive));
     }
 
     #[test]
