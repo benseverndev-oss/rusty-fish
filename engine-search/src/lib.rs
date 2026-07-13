@@ -818,6 +818,23 @@ impl Searcher {
             return (self.quiescence(board, alpha, beta), Vec::new());
         }
 
+        let can_static_prune = can_apply_static_pruning(
+            depth,
+            in_check,
+            alpha,
+            beta,
+            self.has_non_pawn_material(board, board.side_to_move),
+        );
+        if can_static_prune {
+            let static_eval = self.evaluate(board);
+            if depth == 1 && static_eval + razor_margin(depth) <= alpha {
+                return (self.quiescence(board, alpha, beta), Vec::new());
+            }
+            if static_eval - reverse_futility_margin(depth) >= beta {
+                return (static_eval, Vec::new());
+            }
+        }
+
         if !in_check && depth >= 3 && self.has_non_pawn_material(board, board.side_to_move) {
             let null_score = self.try_null_move(board, depth, ply, beta);
             if null_score >= beta {
@@ -843,6 +860,22 @@ impl Searcher {
         for (move_index, &mv) in moves.as_slice().iter().enumerate() {
             let is_quiet = self.is_quiet_move(board, mv);
             let pawn_extension = passed_pawn_extension(board, mv);
+            let is_priority_move = Some(mv) == tt_move
+                || self
+                    .killer_moves
+                    .get(ply as usize)
+                    .is_some_and(|killers| killers.contains(&Some(mv)))
+                || previous_move
+                    .and_then(|previous| self.counter_moves[history_index(previous)])
+                    == Some(mv);
+            if can_static_prune
+                && move_index >= late_move_pruning_limit(depth)
+                && is_quiet
+                && pawn_extension == 0
+                && !is_priority_move
+            {
+                break;
+            }
             let undo = board.make_move(mv).expect("generated move must be legal");
             let extension = u8::from(board.in_check(board.side_to_move)).max(pawn_extension);
             let next_depth = depth.saturating_sub(1) + extension.min(1);
@@ -1190,6 +1223,32 @@ fn syzygy_score(wdl: SyzygyWdl, ply: i32) -> i32 {
         SyzygyWdl::Draw => 0,
         SyzygyWdl::Loss => -MATE_SCORE + 512 + ply,
     }
+}
+
+fn razor_margin(depth: u8) -> i32 {
+    120 + 80 * i32::from(depth)
+}
+
+fn reverse_futility_margin(depth: u8) -> i32 {
+    100 + 90 * i32::from(depth)
+}
+
+fn late_move_pruning_limit(depth: u8) -> usize {
+    3 + usize::from(depth) * 2
+}
+
+fn can_apply_static_pruning(
+    depth: u8,
+    in_check: bool,
+    alpha: i32,
+    beta: i32,
+    has_non_pawn_material: bool,
+) -> bool {
+    depth <= 3
+        && !in_check
+        && has_non_pawn_material
+        && alpha.abs() < MATE_SCORE - 1_024
+        && beta.abs() < MATE_SCORE - 1_024
 }
 
 fn root_tablebase_search_result(root: SyzygyRootProbe) -> SearchResult {
@@ -1751,11 +1810,12 @@ mod tests {
     use pyrrhic_rs::{Piece as TbPiece, WdlProbeResult};
 
     use super::{
-        Bound, ClockControl, OpeningBook, SearchLimits, Searcher, SyzygyRootProbe,
+        Bound, ClockControl, MATE_SCORE, OpeningBook, SearchLimits, Searcher, SyzygyRootProbe,
         SyzygyTablebases, SyzygyWdl, TaperedScore, TranspositionEntry, TranspositionTable,
         evaluate_position, history_index, late_move_reduction, passed_pawn_extension,
         promotion_from_tablebase, root_tablebase_search_result, static_exchange_evaluation,
-        syzygy_score, syzygy_wdl, threat_bonus,
+        syzygy_score, syzygy_wdl, threat_bonus, late_move_pruning_limit, razor_margin,
+        reverse_futility_margin, can_apply_static_pruning,
     };
 
     #[test]
@@ -1963,6 +2023,26 @@ mod tests {
         assert_eq!(result.best_move, Some(root.best_move));
         assert_eq!(result.score_cp, syzygy_score(SyzygyWdl::Win, 0));
         assert_eq!(result.nodes, 0);
+    }
+
+    #[test]
+    fn conservative_pruning_margins_increase_with_depth() {
+        assert!(razor_margin(2) > razor_margin(1));
+        assert!(reverse_futility_margin(3) > reverse_futility_margin(2));
+        assert!(late_move_pruning_limit(3) > late_move_pruning_limit(2));
+    }
+
+    #[test]
+    fn pruning_policy_excludes_check_and_mate_windows() {
+        assert!(!can_apply_static_pruning(2, true, 0, 50, true));
+        assert!(!can_apply_static_pruning(
+            2,
+            false,
+            MATE_SCORE - 512,
+            MATE_SCORE,
+            true,
+        ));
+        assert!(can_apply_static_pruning(2, false, 0, 50, true));
     }
 
     #[test]
