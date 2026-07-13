@@ -1,16 +1,45 @@
 use std::io::{self, BufRead, Write};
+use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::Duration;
 
 use engine_core::{Board, CLASSIC_STARTPOS_FEN};
-use engine_search::{ClockControl, SearchInfo, SearchLimits, SearchOptions, Searcher};
+use engine_search::{ClockControl, SearchLimits, SearchOptions, SearchResult, Searcher};
 
 fn main() -> io::Result<()> {
-    let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut state = EngineState::default();
+    let (command_tx, command_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(line) => {
+                    if command_tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let mut active_search: Option<ActiveSearch> = None;
 
-    for line in stdin.lock().lines() {
-        let line = line?;
+    loop {
+        if let Some(search) = active_search.as_ref()
+            && let Ok(result) = search.result_rx.try_recv()
+        {
+            write_best_move(&mut stdout, result)?;
+            active_search = None;
+            stdout.flush()?;
+        }
+
+        let line = match command_rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(line) => line,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -21,34 +50,75 @@ fn main() -> io::Result<()> {
         } else if trimmed == "isready" {
             writeln!(stdout, "readyok")?;
         } else if trimmed == "ucinewgame" {
+            stop_active_search(&active_search);
+            active_search = None;
             state.board = Board::startpos();
         } else if trimmed.starts_with("position ") {
+            stop_active_search(&active_search);
+            active_search = None;
             if let Err(err) = apply_position(&mut state.board, trimmed) {
                 writeln!(stdout, "info string position error: {err}")?;
             }
         } else if trimmed.starts_with("setoption ") {
+            stop_active_search(&active_search);
+            active_search = None;
             if let Err(err) = apply_option(&mut state, trimmed) {
                 writeln!(stdout, "info string setoption error: {err}")?;
             }
         } else if trimmed.starts_with("go") {
-            let limits = parse_go(trimmed);
-            let result = state.searcher.search_with_callback(&state.board, limits, |info| {
-                print_info(info);
-            });
-            if let Some(best_move) = result.best_move {
-                writeln!(stdout, "bestmove {best_move}")?;
-            } else {
-                writeln!(stdout, "bestmove 0000")?;
-            }
+            stop_active_search(&active_search);
+            active_search = Some(start_search(
+                state.board.clone(),
+                state.options.clone(),
+                parse_go(trimmed),
+            ));
+        } else if trimmed == "stop" {
+            stop_active_search(&active_search);
         } else if trimmed == "d" {
             writeln!(stdout, "info string fen {}", state.board.to_fen())?;
         } else if trimmed == "quit" {
+            stop_active_search(&active_search);
             break;
         }
         stdout.flush()?;
     }
 
     Ok(())
+}
+
+struct ActiveSearch {
+    stop_signal: Arc<AtomicBool>,
+    result_rx: mpsc::Receiver<SearchResult>,
+}
+
+fn start_search(board: Board, options: SearchOptions, limits: SearchLimits) -> ActiveSearch {
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let worker_signal = Arc::clone(&stop_signal);
+    let (result_tx, result_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut searcher = Searcher::default();
+        searcher.set_options(options);
+        let result = searcher.search_with_stop_signal(&board, limits, worker_signal);
+        let _ = result_tx.send(result);
+    });
+    ActiveSearch {
+        stop_signal,
+        result_rx,
+    }
+}
+
+fn stop_active_search(active_search: &Option<ActiveSearch>) {
+    if let Some(search) = active_search {
+        search.stop_signal.store(true, Ordering::Relaxed);
+    }
+}
+
+fn write_best_move(mut stdout: impl Write, result: SearchResult) -> io::Result<()> {
+    if let Some(best_move) = result.best_move {
+        writeln!(stdout, "bestmove {best_move}")
+    } else {
+        writeln!(stdout, "bestmove 0000")
+    }
 }
 
 #[derive(Default)]
@@ -220,30 +290,15 @@ fn parse_millis(raw: &str) -> Option<u64> {
     raw.parse::<u64>().ok()
 }
 
-fn print_info(info: &SearchInfo) {
-    let pv = info
-        .pv
-        .iter()
-        .map(|mv| mv.to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
-    println!(
-        "info depth {} score cp {} nodes {} time {} pv {}",
-        info.depth,
-        info.score_cp,
-        info.nodes,
-        info.elapsed.as_millis(),
-        pv
-    );
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, mpsc};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use engine_search::ClockControl;
 
-    use super::{apply_option, parse_go, EngineState};
+    use super::{ActiveSearch, apply_option, parse_go, stop_active_search, EngineState};
 
     #[test]
     fn parse_go_supports_clock_controls() {
@@ -286,5 +341,19 @@ mod tests {
             moves_to_go: Some(30),
         };
         assert_eq!(clock.moves_to_go, Some(30));
+    }
+
+    #[test]
+    fn stop_command_signal_is_shared_with_active_search() {
+        let stop_signal = Arc::new(AtomicBool::new(false));
+        let (_result_tx, result_rx) = mpsc::channel();
+        let active = Some(ActiveSearch {
+            stop_signal: Arc::clone(&stop_signal),
+            result_rx,
+        });
+
+        stop_active_search(&active);
+
+        assert!(stop_signal.load(Ordering::Relaxed));
     }
 }
