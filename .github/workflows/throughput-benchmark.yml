@@ -1,0 +1,21 @@
+name: Throughput Benchmark
+
+on:
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Produce benchmark report
+        run: |
+          mkdir -p artifacts
+          cargo run --release -p engine-bench > artifacts/throughput.tsv
+      - name: Upload benchmark report
+        uses: actions/upload-artifact@v4
+        with:
+          name: throughput-tsv
+          path: artifacts/throughput.tsv
