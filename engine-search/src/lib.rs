@@ -1508,8 +1508,9 @@ fn king_safety_bonus(board: &Board, color: Color) -> i32 {
     }
 
     let shield_rank = match color {
-        Color::White => king_square.rank().checked_add(1),
-        Color::Black => king_square.rank().checked_sub(1),
+        Color::White if king_square.rank() < 7 => Some(king_square.rank() + 1),
+        Color::Black if king_square.rank() > 0 => Some(king_square.rank() - 1),
+        Color::White | Color::Black => None,
     };
     if let Some(shield_rank) = shield_rank {
         for file in king_square.file().saturating_sub(1)..=((king_square.file() + 1).min(7)) {
