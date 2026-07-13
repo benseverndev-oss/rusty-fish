@@ -30,6 +30,3 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Run engine-core test
         run: cargo test -p engine-core "${{ inputs.test_filter }}" -- --nocapture
-      - name: Print generated lockfile diff
-        if: always()
-        run: git diff -- Cargo.lock
