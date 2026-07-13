@@ -1391,6 +1391,9 @@ mod tests {
         for (fen, expected) in cases {
             for &(depth, nodes) in expected.iter() {
                 let mut board = Board::from_fen(fen).unwrap();
+                if depth == 1 && nodes == 44 {
+                    eprintln!("{fen}: {:?}", board.generate_legal_moves());
+                }
                 assert_eq!(board.perft(depth), nodes, "FEN {fen}, depth {depth}");
             }
         }
