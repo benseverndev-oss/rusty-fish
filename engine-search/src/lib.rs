@@ -578,8 +578,8 @@ impl Searcher {
             .tt
             .get(board.position_hash())
             .and_then(|entry| entry.best_move);
-        let mut moves = board.generate_legal_moves();
-        self.order_moves(board, &mut moves, 0, tt_move);
+        let mut moves = board.generate_legal_move_list();
+        self.order_moves(board, moves.as_mut_slice(), 0, tt_move);
         if moves.is_empty() {
             return (self.evaluate_terminal(board, 0), Vec::new());
         }
@@ -587,7 +587,7 @@ impl Searcher {
         let mut best_score = -MATE_SCORE;
         let mut best_line = Vec::new();
         let original_alpha = alpha;
-        for (move_index, mv) in moves.into_iter().enumerate() {
+        for (move_index, &mv) in moves.as_slice().iter().enumerate() {
             if self.should_stop() {
                 break;
             }
@@ -691,15 +691,15 @@ impl Searcher {
         }
 
         let tt_move = self.tt.get(tt_key).and_then(|entry| entry.best_move);
-        let mut moves = board.generate_legal_moves();
-        self.order_moves(board, &mut moves, ply as usize, tt_move);
+        let mut moves = board.generate_legal_move_list();
+        self.order_moves(board, moves.as_mut_slice(), ply as usize, tt_move);
         if moves.is_empty() {
             return (self.evaluate_terminal(board, ply), Vec::new());
         }
 
         let mut best_score = -MATE_SCORE;
         let mut best_line = Vec::new();
-        for (move_index, mv) in moves.into_iter().enumerate() {
+        for (move_index, &mv) in moves.as_slice().iter().enumerate() {
             let is_quiet = self.is_quiet_move(board, mv);
             let undo = board.make_move(mv).expect("generated move must be legal");
             let extension = u8::from(board.in_check(board.side_to_move));
@@ -769,16 +769,16 @@ impl Searcher {
 
         let in_check = board.in_check(board.side_to_move);
         if in_check {
-            let mut evasions = board.generate_legal_moves();
+            let mut evasions = board.generate_legal_move_list();
             let tt_move = self
                 .tt
                 .get(board.position_hash())
                 .and_then(|entry| entry.best_move);
-            self.order_moves(board, &mut evasions, 0, tt_move);
+            self.order_moves(board, evasions.as_mut_slice(), 0, tt_move);
             if evasions.is_empty() {
                 return self.evaluate_terminal(board, 0);
             }
-            for mv in evasions {
+            for &mv in evasions.as_slice() {
                 let undo = board.make_move(mv).expect("generated move must be legal");
                 let score = -self.quiescence(board, -beta, -alpha);
                 board.unmake_move(mv, undo);
@@ -796,9 +796,9 @@ impl Searcher {
         }
         alpha = alpha.max(stand_pat);
 
-        let mut moves = board.generate_capture_moves();
-        self.order_moves(board, &mut moves, 0, None);
-        for mv in moves {
+        let mut moves = board.generate_capture_move_list();
+        self.order_moves(board, moves.as_mut_slice(), 0, None);
+        for &mv in moves.as_slice() {
             if !self.is_promising_quiescence_capture(board, mv, stand_pat, alpha) {
                 continue;
             }

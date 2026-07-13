@@ -223,6 +223,49 @@ impl ChessMove {
     }
 }
 
+const MAX_LEGAL_MOVES: usize = 256;
+const EMPTY_CHESS_MOVE: ChessMove = ChessMove {
+    from: Square(0),
+    to: Square(0),
+    promotion: None,
+};
+
+#[derive(Clone, Debug)]
+pub struct MoveList {
+    moves: [ChessMove; MAX_LEGAL_MOVES],
+    len: usize,
+}
+
+impl MoveList {
+    fn new() -> Self {
+        Self {
+            moves: [EMPTY_CHESS_MOVE; MAX_LEGAL_MOVES],
+            len: 0,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[ChessMove] {
+        &self.moves[..self.len]
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [ChessMove] {
+        &mut self.moves[..self.len]
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn push(&mut self, mv: ChessMove) {
+        assert!(
+            self.len < MAX_LEGAL_MOVES,
+            "legal move count exceeds the chess maximum"
+        );
+        self.moves[self.len] = mv;
+        self.len += 1;
+    }
+}
+
 impl Display for ChessMove {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.to_uci())
@@ -612,10 +655,14 @@ impl Board {
     }
 
     pub fn generate_legal_moves(&mut self) -> Vec<ChessMove> {
+        self.generate_legal_move_list().as_slice().to_vec()
+    }
+
+    pub fn generate_legal_move_list(&mut self) -> MoveList {
         let side = self.side_to_move;
         let moves = self.generate_pseudo_legal_moves();
-        let mut legal = Vec::with_capacity(moves.len());
-        for mv in moves {
+        let mut legal = MoveList::new();
+        for &mv in moves.as_slice() {
             if let Ok(undo) = self.make_move(mv) {
                 if !self.in_check(side) {
                     legal.push(mv);
@@ -627,19 +674,26 @@ impl Board {
     }
 
     pub fn generate_capture_moves(&mut self) -> Vec<ChessMove> {
-        self.generate_legal_moves()
-            .into_iter()
-            .filter(|mv| {
-                self.piece_at(mv.to).is_some()
-                    || self.piece_at(mv.from).is_some_and(|piece| {
-                        piece.kind == PieceKind::Pawn && self.en_passant == Some(mv.to)
-                    })
-            })
-            .collect()
+        self.generate_capture_move_list().as_slice().to_vec()
     }
 
-    fn generate_pseudo_legal_moves(&self) -> Vec<ChessMove> {
-        let mut moves = Vec::new();
+    pub fn generate_capture_move_list(&mut self) -> MoveList {
+        let legal = self.generate_legal_move_list();
+        let mut captures = MoveList::new();
+        for &mv in legal.as_slice() {
+            if self.piece_at(mv.to).is_some()
+                || self.piece_at(mv.from).is_some_and(|piece| {
+                    piece.kind == PieceKind::Pawn && self.en_passant == Some(mv.to)
+                })
+            {
+                captures.push(mv);
+            }
+        }
+        captures
+    }
+
+    fn generate_pseudo_legal_moves(&self) -> MoveList {
+        let mut moves = MoveList::new();
         let color = self.side_to_move;
 
         self.generate_bitboard_pawn_moves(color, &mut moves);
@@ -685,7 +739,7 @@ impl Board {
         mut pieces: Bitboard,
         color: Color,
         attacks: fn(Square) -> Bitboard,
-        moves: &mut Vec<ChessMove>,
+        moves: &mut MoveList,
     ) {
         let own_occupancy = self.occupancy(color);
         while pieces != 0 {
@@ -697,7 +751,7 @@ impl Board {
         }
     }
 
-    fn generate_bitboard_pawn_moves(&self, color: Color, moves: &mut Vec<ChessMove>) {
+    fn generate_bitboard_pawn_moves(&self, color: Color, moves: &mut MoveList) {
         let pawns = self.pieces(color, PieceKind::Pawn);
         let occupied = self.occupancy(Color::White) | self.occupancy(Color::Black);
         let enemy_occupancy = self.occupancy(color.opposite());
@@ -752,7 +806,7 @@ impl Board {
         color: Color,
         occupied: Bitboard,
         attacks: fn(Square, Bitboard) -> Bitboard,
-        moves: &mut Vec<ChessMove>,
+        moves: &mut MoveList,
     ) {
         let own_occupancy = self.occupancy(color);
         while pieces != 0 {
@@ -764,7 +818,7 @@ impl Board {
         }
     }
 
-    fn generate_castling_moves(&self, from: Square, color: Color, moves: &mut Vec<ChessMove>) {
+    fn generate_castling_moves(&self, from: Square, color: Color, moves: &mut MoveList) {
         if self.in_check(color) {
             return;
         }
@@ -1152,12 +1206,12 @@ impl Board {
         if depth == 0 {
             return 1;
         }
-        let moves = self.generate_legal_moves();
+        let moves = self.generate_legal_move_list();
         if depth == 1 {
-            return moves.len() as u64;
+            return moves.as_slice().len() as u64;
         }
         let mut nodes = 0;
-        for mv in moves {
+        for &mv in moves.as_slice() {
             let undo = self.make_move(mv).expect("generated move must be legal");
             nodes += self.perft(depth - 1);
             self.unmake_move(mv, undo);
@@ -1196,7 +1250,7 @@ fn black_single_pawn_pushes(pawns: Bitboard, occupied: Bitboard) -> Bitboard {
     pawns >> 8 & !occupied
 }
 
-fn append_pawn_moves(mut targets: Bitboard, from_delta: i8, moves: &mut Vec<ChessMove>) {
+fn append_pawn_moves(mut targets: Bitboard, from_delta: i8, moves: &mut MoveList) {
     while targets != 0 {
         let to = pop_lsb(&mut targets);
         let from = Square((to.0 as i16 + from_delta as i16) as u8);
@@ -1204,7 +1258,7 @@ fn append_pawn_moves(mut targets: Bitboard, from_delta: i8, moves: &mut Vec<Ches
     }
 }
 
-fn append_pawn_promotions(mut targets: Bitboard, from_delta: i8, moves: &mut Vec<ChessMove>) {
+fn append_pawn_promotions(mut targets: Bitboard, from_delta: i8, moves: &mut MoveList) {
     while targets != 0 {
         let to = pop_lsb(&mut targets);
         let from = Square((to.0 as i16 + from_delta as i16) as u8);
