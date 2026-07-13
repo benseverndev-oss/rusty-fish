@@ -1200,13 +1200,6 @@ impl TaperedScore {
         )
     }
 
-    const fn subtract(self, other: Self) -> Self {
-        Self::new(
-            self.middlegame - other.middlegame,
-            self.endgame - other.endgame,
-        )
-    }
-
     fn interpolate(self, phase: i32) -> i32 {
         (self.middlegame * (24 - phase) + self.endgame * phase) / 24
     }
@@ -1266,20 +1259,21 @@ fn piece_square_bonus(piece: Piece, idx: u8) -> TaperedScore {
 
 #[derive(Default, Clone, Copy)]
 struct EvalFeatures {
-    white_score: TaperedScore,
-    black_score: TaperedScore,
+    white_score: i32,
+    black_score: i32,
 }
 
 impl EvalFeatures {
-    fn add(&mut self, color: Color, value: TaperedScore) {
+    fn add(&mut self, color: Color, value: TaperedScore, phase: i32) {
+        let value = value.interpolate(phase);
         match color {
-            Color::White => self.white_score = self.white_score.add(value),
-            Color::Black => self.black_score = self.black_score.add(value),
+            Color::White => self.white_score += value,
+            Color::Black => self.black_score += value,
         }
     }
 
-    fn net(self, side_to_move: Color, phase: i32) -> i32 {
-        let score = self.white_score.subtract(self.black_score).interpolate(phase);
+    fn net(self, side_to_move: Color) -> i32 {
+        let score = self.white_score - self.black_score;
         match side_to_move {
             Color::White => score,
             Color::Black => -score,
@@ -1303,6 +1297,7 @@ fn evaluate_position(board: &Board) -> i32 {
         features.add(
             piece.color,
             tapered_piece_value(piece).add(piece_square_bonus(piece, idx)),
+            endgame_phase,
         );
 
         if piece.kind == PieceKind::Pawn {
@@ -1321,20 +1316,22 @@ fn evaluate_position(board: &Board) -> i32 {
         features.add(
             piece.color,
             TaperedScore::equal(activity_bonus(board, square, piece)),
+            endgame_phase,
         );
         if piece.kind == PieceKind::King {
             features.add(
                 piece.color,
                 TaperedScore::endgame(king_endgame_activity(square)),
+                endgame_phase,
             );
         }
     }
 
     if white_bishops >= 2 {
-        features.add(Color::White, TaperedScore::equal(35));
+        features.add(Color::White, TaperedScore::equal(35), endgame_phase);
     }
     if black_bishops >= 2 {
-        features.add(Color::Black, TaperedScore::equal(35));
+        features.add(Color::Black, TaperedScore::equal(35), endgame_phase);
     }
 
     for idx in 0..64 {
@@ -1352,6 +1349,7 @@ fn evaluate_position(board: &Board) -> i32 {
                     &white_pawn_files,
                     &black_pawn_files,
                 )),
+                endgame_phase,
             );
         }
         if piece.kind == PieceKind::Rook {
@@ -1363,6 +1361,7 @@ fn evaluate_position(board: &Board) -> i32 {
                     &white_pawn_files,
                     &black_pawn_files,
                 )),
+                endgame_phase,
             );
         }
     }
@@ -1370,20 +1369,24 @@ fn evaluate_position(board: &Board) -> i32 {
     features.add(
         Color::White,
         TaperedScore::middlegame(king_safety_bonus(board, Color::White)),
+        endgame_phase,
     );
     features.add(
         Color::Black,
         TaperedScore::middlegame(king_safety_bonus(board, Color::Black)),
+        endgame_phase,
     );
     features.add(
         Color::White,
         TaperedScore::equal(threat_bonus(board, Color::White)),
+        endgame_phase,
     );
     features.add(
         Color::Black,
         TaperedScore::equal(threat_bonus(board, Color::Black)),
+        endgame_phase,
     );
-    features.net(board.side_to_move, endgame_phase)
+    features.net(board.side_to_move)
 }
 
 fn endgame_phase(board: &Board) -> i32 {
