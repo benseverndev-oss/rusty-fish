@@ -1,0 +1,20 @@
+name: Engine Core Perft
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_filter:
+        description: Cargo test filter
+        required: true
+        default: standard_perft_corpus_regression
+        type: string
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run engine-core test
+        run: cargo test -p engine-core "${{ inputs.test_filter }}" -- --nocapture
