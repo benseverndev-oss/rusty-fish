@@ -50,6 +50,9 @@ impl UciProcess {
 
     fn handshake(&mut self) {
         self.send("uci");
+        self.expect_line_matching(RESPONSE_TIMEOUT, |line| {
+            line == "option name SyzygyPath type string default"
+        });
         self.expect_line("uciok", RESPONSE_TIMEOUT);
         self.send("isready");
         self.expect_line("readyok", RESPONSE_TIMEOUT);

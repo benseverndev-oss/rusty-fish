@@ -332,6 +332,15 @@ mod tests {
     }
 
     #[test]
+    fn syzygy_path_keeps_the_previous_path_on_error() {
+        let mut state = EngineState::default();
+        apply_option(&mut state, "setoption name SyzygyPath value .").unwrap();
+        assert_eq!(state.syzygy_path.as_deref(), Some("."));
+        assert!(apply_option(&mut state, "setoption name SyzygyPath value missing-tables").is_err());
+        assert_eq!(state.syzygy_path.as_deref(), Some("."));
+    }
+
+    #[test]
     fn clock_control_type_is_constructible() {
         let clock = ClockControl {
             white_time: Duration::from_secs(60),
