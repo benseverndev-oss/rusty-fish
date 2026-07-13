@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
 
 use engine_core::{Board, ChessMove, Color, GameStatus, Piece, PieceKind};
@@ -296,6 +297,7 @@ pub struct Searcher {
     start: Instant,
     deadline: Option<Instant>,
     stopped: bool,
+    stop_signal: Option<Arc<AtomicBool>>,
     tt: TranspositionTable,
     killer_moves: Vec<[Option<ChessMove>; 2]>,
     history: Vec<i32>,
@@ -312,6 +314,7 @@ impl Default for Searcher {
             start: Instant::now(),
             deadline: None,
             stopped: false,
+            stop_signal: None,
             tt: TranspositionTable::new(tt_capacity_entries_for(SearchOptions::default().hash_mb)),
             killer_moves: vec![[None, None]; MAX_KILLER_PLY],
             history: vec![0; HISTORY_SIZE],
@@ -478,6 +481,28 @@ impl Searcher {
     where
         F: FnMut(&SearchInfo),
     {
+        self.search_with_callback_and_stop_signal(board, limits, None, callback)
+    }
+
+    pub fn search_with_stop_signal(
+        &mut self,
+        board: &Board,
+        limits: SearchLimits,
+        stop_signal: Arc<AtomicBool>,
+    ) -> SearchResult {
+        self.search_with_callback_and_stop_signal(board, limits, Some(stop_signal), |_info| {})
+    }
+
+    pub fn search_with_callback_and_stop_signal<F>(
+        &mut self,
+        board: &Board,
+        limits: SearchLimits,
+        stop_signal: Option<Arc<AtomicBool>>,
+        mut callback: F,
+    ) -> SearchResult
+    where
+        F: FnMut(&SearchInfo),
+    {
         if let Some(best_move) = self
             .opening_book
             .as_ref()
@@ -498,6 +523,7 @@ impl Searcher {
             .time_budget(board.side_to_move, &limits)
             .map(|limit| self.start + limit);
         self.stopped = false;
+        self.stop_signal = stop_signal;
         self.tt.begin_search();
         self.killer_moves.fill([None, None]);
         self.history.fill(0);
@@ -551,14 +577,16 @@ impl Searcher {
             }
         }
 
-        SearchResult {
+        let result = SearchResult {
             best_move,
             depth: reached_depth,
             score_cp: best_score,
             nodes: self.nodes,
             elapsed: self.start.elapsed(),
             pv: best_pv,
-        }
+        };
+        self.stop_signal = None;
+        result
     }
 
     fn aspiration_search(
@@ -1055,6 +1083,14 @@ impl Searcher {
         if self.stopped {
             return true;
         }
+        if self
+            .stop_signal
+            .as_ref()
+            .is_some_and(|signal| signal.load(Ordering::Relaxed))
+        {
+            self.stopped = true;
+            return true;
+        }
         if let Some(deadline) = self.deadline
             && Instant::now() >= deadline
         {
@@ -1532,6 +1568,8 @@ fn king_safety_bonus(board: &Board, color: Color) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, atomic::AtomicBool};
+
     use std::time::Duration;
 
     use engine_core::{Board, ChessMove, Color};
@@ -1607,6 +1645,22 @@ mod tests {
         assert!(!searcher.tt.is_empty());
         assert!(searcher.tt.contains_key(board.position_hash()));
         assert!(searcher.tt.values().any(|entry| entry.best_move.is_some()));
+    }
+
+    #[test]
+    fn external_stop_signal_cancels_search_before_a_root_move() {
+        let stop_signal = Arc::new(AtomicBool::new(true));
+        let mut searcher = Searcher::default();
+        let result = searcher.search_with_stop_signal(
+            &Board::startpos(),
+            SearchLimits {
+                infinite: true,
+                ..SearchLimits::default()
+            },
+            stop_signal,
+        );
+        assert_eq!(result.depth, 0);
+        assert!(result.best_move.is_none());
     }
 
     #[test]
