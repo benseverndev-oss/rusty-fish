@@ -1350,6 +1350,7 @@ mod tests {
         assert_eq!(board.perft(1), 20);
         assert_eq!(board.perft(2), 400);
         assert_eq!(board.perft(3), 8_902);
+        assert_eq!(board.perft(4), 197_281);
     }
 
     #[test]
@@ -1359,6 +1360,7 @@ mod tests {
                 .unwrap();
         assert_eq!(board.perft(1), 48);
         assert_eq!(board.perft(2), 2_039);
+        assert_eq!(board.perft(3), 97_862);
     }
 
     #[test]
@@ -1429,5 +1431,31 @@ mod tests {
             white_single_pawn_pushes(board.pieces(Color::White, PieceKind::Pawn), occupied),
             1_u64 << Square::from_str("d3").unwrap().0
         );
+    }
+
+    #[test]
+    fn randomized_legal_play_preserves_fen_and_hash_invariants() {
+        let mut seed = 0x9e37_79b9_u64;
+        for _game in 0..12 {
+            let mut board = Board::startpos();
+            for _ply in 0..80 {
+                let fen = board.to_fen();
+                let rebuilt = Board::from_fen(&fen).unwrap();
+                assert_eq!(rebuilt.to_fen(), fen);
+                assert_eq!(rebuilt.position_hash(), board.position_hash());
+
+                let moves = board.generate_legal_moves();
+                if moves.is_empty() {
+                    break;
+                }
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let mv = moves[(seed as usize) % moves.len()];
+                let initial_hash = board.position_hash();
+                let undo = board.make_move(mv).unwrap();
+                board.unmake_move(mv, undo);
+                assert_eq!(board.position_hash(), initial_hash);
+                board.make_move(mv).unwrap();
+            }
+        }
     }
 }
