@@ -16,5 +16,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: List position five reference moves
+        run: |
+          python -m pip install python-chess
+          python - <<'PY'
+          import chess
+
+          board = chess.Board("rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPPP1PPP/RNBQK1NR w KQ - 1 8")
+          print(sorted(move.uci() for move in board.legal_moves))
+          print(board.legal_moves.count())
+          PY
       - name: Run engine-core test
         run: cargo test -p engine-core "${{ inputs.test_filter }}" -- --nocapture
