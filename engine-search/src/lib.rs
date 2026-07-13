@@ -11,7 +11,6 @@ use pyrrhic_rs::{
 
 const MATE_SCORE: i32 = 100_000;
 const MAX_KILLER_PLY: usize = 128;
-const ASPIRATION_WINDOW: i32 = 50;
 const HISTORY_PROMOTION_STATES: usize = 5;
 const HISTORY_SIZE: usize = 64 * 64 * HISTORY_PROMOTION_STATES;
 const TT_CLUSTER_SIZE: usize = 4;
@@ -79,6 +78,36 @@ impl Default for SearchOptions {
             syzygy_probe_depth: 1,
             syzygy_probe_limit: 7,
             threads: 1,
+        }
+    }
+}
+
+/// Tunable scalar search parameters. `Default` reproduces the engine's
+/// hand-set constants exactly, so an untuned engine is unchanged. These are the
+/// knobs the SPSA tuner in `engine-bench` optimises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchParams {
+    pub aspiration_window: i32,
+    pub razor_margin_base: i32,
+    pub razor_margin_scale: i32,
+    pub reverse_futility_base: i32,
+    pub reverse_futility_scale: i32,
+    pub late_move_pruning_base: usize,
+    pub late_move_pruning_scale: usize,
+    pub null_move_reduction: u8,
+}
+
+impl Default for SearchParams {
+    fn default() -> Self {
+        Self {
+            aspiration_window: 50,
+            razor_margin_base: 120,
+            razor_margin_scale: 80,
+            reverse_futility_base: 100,
+            reverse_futility_scale: 90,
+            late_move_pruning_base: 3,
+            late_move_pruning_scale: 2,
+            null_move_reduction: 3,
         }
     }
 }
@@ -379,6 +408,7 @@ pub struct Searcher {
     history: Vec<i32>,
     counter_moves: Vec<Option<ChessMove>>,
     options: SearchOptions,
+    params: SearchParams,
     opening_book: Option<OpeningBook>,
     syzygy: Option<SyzygyTablebases>,
 }
@@ -398,6 +428,7 @@ impl Default for Searcher {
             history: vec![0; HISTORY_SIZE],
             counter_moves: vec![None; HISTORY_SIZE],
             options: SearchOptions::default(),
+            params: SearchParams::default(),
             opening_book: None,
             syzygy: None,
         }
@@ -622,6 +653,14 @@ impl Searcher {
         }
     }
 
+    pub fn search_params(&self) -> &SearchParams {
+        &self.params
+    }
+
+    pub fn set_search_params(&mut self, params: SearchParams) {
+        self.params = params;
+    }
+
     pub fn set_opening_book(&mut self, opening_book: Option<OpeningBook>) {
         self.opening_book = opening_book;
     }
@@ -634,7 +673,11 @@ impl Searcher {
     /// (via the `Arc`) but keeps its own killer/history/counter-move tables and
     /// never consults the opening book or Syzygy tablebases; the primary thread
     /// remains the single source of reported output.
-    fn helper(tt: Arc<SharedTranspositionTable>, options: SearchOptions) -> Self {
+    fn helper(
+        tt: Arc<SharedTranspositionTable>,
+        options: SearchOptions,
+        params: SearchParams,
+    ) -> Self {
         Self {
             nodes: 0,
             start: Instant::now(),
@@ -646,6 +689,7 @@ impl Searcher {
             history: vec![0; HISTORY_SIZE],
             counter_moves: vec![None; HISTORY_SIZE],
             options,
+            params,
             opening_book: None,
             syzygy: None,
         }
@@ -791,10 +835,11 @@ impl Searcher {
             for index in 1..threads {
                 let tt = Arc::clone(&self.tt);
                 let options = self.options.clone();
+                let params = self.params;
                 let helper_board = board.clone();
                 let stop = Arc::clone(&shared_stop);
                 helper_handles.push(thread::spawn(move || {
-                    Searcher::helper(tt, options).run_lazy_smp_helper(
+                    Searcher::helper(tt, options, params).run_lazy_smp_helper(
                         &helper_board,
                         max_depth,
                         deadline,
@@ -876,7 +921,7 @@ impl Searcher {
         depth: u8,
         previous_score: i32,
     ) -> (i32, Vec<ChessMove>) {
-        let mut window = ASPIRATION_WINDOW;
+        let mut window = self.params.aspiration_window;
         let mut alpha = (previous_score - window).max(-MATE_SCORE);
         let mut beta = (previous_score + window).min(MATE_SCORE);
 
@@ -1031,10 +1076,10 @@ impl Searcher {
         );
         if can_static_prune {
             let static_eval = self.evaluate(board);
-            if depth == 1 && static_eval + razor_margin(depth) <= alpha {
+            if depth == 1 && static_eval + razor_margin(&self.params, depth) <= alpha {
                 return (self.quiescence(board, alpha, beta), Vec::new());
             }
-            if static_eval - reverse_futility_margin(depth) >= beta {
+            if static_eval - reverse_futility_margin(&self.params, depth) >= beta {
                 return (static_eval, Vec::new());
             }
         }
@@ -1103,7 +1148,7 @@ impl Searcher {
                     .and_then(|previous| self.counter_moves[history_index(previous)])
                     == Some(mv);
             if can_static_prune
-                && move_index >= late_move_pruning_limit(depth)
+                && move_index >= late_move_pruning_limit(&self.params, depth)
                 && is_quiet
                 && pawn_extension == 0
                 && !is_priority_move
@@ -1351,7 +1396,7 @@ impl Searcher {
         -self
             .negamax(
                 &mut null_board,
-                depth.saturating_sub(3),
+                depth.saturating_sub(self.params.null_move_reduction),
                 ply + 1,
                 -beta,
                 -beta + 1,
@@ -1465,16 +1510,16 @@ fn syzygy_score(wdl: SyzygyWdl, ply: i32) -> i32 {
     }
 }
 
-fn razor_margin(depth: u8) -> i32 {
-    120 + 80 * i32::from(depth)
+fn razor_margin(params: &SearchParams, depth: u8) -> i32 {
+    params.razor_margin_base + params.razor_margin_scale * i32::from(depth)
 }
 
-fn reverse_futility_margin(depth: u8) -> i32 {
-    100 + 90 * i32::from(depth)
+fn reverse_futility_margin(params: &SearchParams, depth: u8) -> i32 {
+    params.reverse_futility_base + params.reverse_futility_scale * i32::from(depth)
 }
 
-fn late_move_pruning_limit(depth: u8) -> usize {
-    3 + usize::from(depth) * 2
+fn late_move_pruning_limit(params: &SearchParams, depth: u8) -> usize {
+    params.late_move_pruning_base + usize::from(depth) * params.late_move_pruning_scale
 }
 
 fn can_apply_static_pruning(
@@ -2070,8 +2115,8 @@ mod tests {
     use pyrrhic_rs::{Piece as TbPiece, WdlProbeResult};
 
     use super::{
-        Bound, ClockControl, MATE_SCORE, OpeningBook, SearchLimits, SearchOptions, Searcher,
-        SharedTranspositionTable, SyzygyRootProbe,
+        Bound, ClockControl, MATE_SCORE, OpeningBook, SearchLimits, SearchOptions, SearchParams,
+        Searcher, SharedTranspositionTable, SyzygyRootProbe,
         SyzygyTablebases, SyzygyWdl, TaperedScore, TranspositionEntry, TranspositionTable,
         evaluate_position, history_index, late_move_reduction, passed_pawn_extension,
         promotion_from_tablebase, root_tablebase_search_result, static_exchange_evaluation,
@@ -2350,9 +2395,31 @@ mod tests {
 
     #[test]
     fn conservative_pruning_margins_increase_with_depth() {
-        assert!(razor_margin(2) > razor_margin(1));
-        assert!(reverse_futility_margin(3) > reverse_futility_margin(2));
-        assert!(late_move_pruning_limit(3) > late_move_pruning_limit(2));
+        let params = SearchParams::default();
+        assert!(razor_margin(&params, 2) > razor_margin(&params, 1));
+        assert!(reverse_futility_margin(&params, 3) > reverse_futility_margin(&params, 2));
+        assert!(late_move_pruning_limit(&params, 3) > late_move_pruning_limit(&params, 2));
+    }
+
+    #[test]
+    fn default_search_params_match_the_original_constants() {
+        let params = SearchParams::default();
+        assert_eq!(params.aspiration_window, 50);
+        assert_eq!(razor_margin(&params, 1), 200);
+        assert_eq!(razor_margin(&params, 2), 280);
+        assert_eq!(reverse_futility_margin(&params, 1), 190);
+        assert_eq!(late_move_pruning_limit(&params, 3), 9);
+        assert_eq!(params.null_move_reduction, 3);
+    }
+
+    #[test]
+    fn custom_search_params_change_margin_scaling() {
+        let params = SearchParams {
+            razor_margin_base: 200,
+            razor_margin_scale: 100,
+            ..SearchParams::default()
+        };
+        assert_eq!(razor_margin(&params, 2), 400);
     }
 
     #[test]
