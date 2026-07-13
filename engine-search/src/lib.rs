@@ -1507,21 +1507,22 @@ fn king_safety_bonus(board: &Board, color: Color) -> i32 {
         score += 20;
     }
 
-    let shield_rank = if color == Color::White {
-        king_square.rank().saturating_add(1)
-    } else {
-        king_square.rank().saturating_sub(1)
+    let shield_rank = match color {
+        Color::White => king_square.rank().checked_add(1),
+        Color::Black => king_square.rank().checked_sub(1),
     };
-    for file in king_square.file().saturating_sub(1)..=((king_square.file() + 1).min(7)) {
-        if board.piece_at(engine_core::Square::from_file_rank(file, shield_rank).expect("valid"))
-            == Some(Piece {
-                color,
-                kind: PieceKind::Pawn,
-            })
-        {
-            score += 8;
-        } else {
-            score -= 10;
+    if let Some(shield_rank) = shield_rank {
+        for file in king_square.file().saturating_sub(1)..=((king_square.file() + 1).min(7)) {
+            if board.piece_at(engine_core::Square::from_file_rank(file, shield_rank).expect("in bounds"))
+                == Some(Piece {
+                    color,
+                    kind: PieceKind::Pawn,
+                })
+            {
+                score += 8;
+            } else {
+                score -= 10;
+            }
         }
     }
 
@@ -1731,6 +1732,12 @@ mod tests {
         let active = Board::from_fen("4k3/8/8/8/4K3/8/4P3/8 w - - 0 1").unwrap();
         let passive = Board::from_fen("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1").unwrap();
         assert!(evaluate_position(&active) > evaluate_position(&passive));
+    }
+
+    #[test]
+    fn king_safety_handles_a_king_on_the_board_edge() {
+        let board = Board::from_fen("6K1/8/8/8/8/8/8/4k3 w - - 0 1").unwrap();
+        let _ = evaluate_position(&board);
     }
 
     #[test]
