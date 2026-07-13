@@ -1,4 +1,7 @@
-use engine_bench::{measure_throughput, throughput_tsv_report};
+use engine_bench::{
+    DEFAULT_TACTICAL_SUITE, measure_throughput, run_tactical_suite, tactical_tsv_report,
+    throughput_tsv_report,
+};
 
 const BENCHMARKS: &[(&str, u8)] = &[
     (
@@ -12,6 +15,12 @@ const BENCHMARKS: &[(&str, u8)] = &[
 ];
 
 fn main() -> Result<(), String> {
+    if std::env::args().nth(1).as_deref() == Some("tactical") {
+        let results = run_tactical_suite(DEFAULT_TACTICAL_SUITE)?;
+        print!("{}", tactical_tsv_report(&results));
+        return Ok(());
+    }
+
     let samples = BENCHMARKS
         .iter()
         .map(|(fen, depth)| measure_throughput(fen, *depth))

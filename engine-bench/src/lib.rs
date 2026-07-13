@@ -51,6 +51,95 @@ pub fn throughput_tsv_report(samples: &[ThroughputSample]) -> String {
     report
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct TacticalCase {
+    pub name: &'static str,
+    pub fen: &'static str,
+    pub expected_move: &'static str,
+    pub depth: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TacticalResult {
+    pub name: &'static str,
+    pub expected_move: &'static str,
+    pub actual_move: Option<String>,
+    pub depth: u8,
+    pub solved: bool,
+}
+
+pub const DEFAULT_TACTICAL_SUITE: &[TacticalCase] = &[
+    TacticalCase {
+        name: "mate_in_one",
+        fen: "6k1/5ppp/8/8/8/5Q2/6PP/6K1 w - - 0 1",
+        expected_move: "f3a8",
+        depth: 2,
+    },
+    TacticalCase {
+        name: "hanging_queen",
+        fen: "4k3/8/8/8/4q3/8/4Q3/4K3 w - - 0 1",
+        expected_move: "e2e4",
+        depth: 2,
+    },
+    TacticalCase {
+        name: "check_evasion",
+        fen: "4k3/8/8/8/8/8/4q3/4K3 w - - 0 1",
+        expected_move: "e1e2",
+        depth: 2,
+    },
+];
+
+pub fn run_tactical_suite(cases: &[TacticalCase]) -> Result<Vec<TacticalResult>, String> {
+    cases
+        .iter()
+        .map(|case| {
+            let board = Board::from_fen(case.fen)?;
+            let mut searcher = Searcher::default();
+            let actual_move = searcher
+                .search(
+                    &board,
+                    SearchLimits {
+                        depth: Some(case.depth),
+                        ..SearchLimits::default()
+                    },
+                )
+                .best_move
+                .map(|mv| mv.to_uci());
+            Ok(TacticalResult {
+                name: case.name,
+                expected_move: case.expected_move,
+                solved: actual_move.as_deref() == Some(case.expected_move),
+                actual_move,
+                depth: case.depth,
+            })
+        })
+        .collect()
+}
+
+pub fn tactical_solve_rate(results: &[TacticalResult]) -> Option<f64> {
+    (!results.is_empty()).then(|| {
+        results.iter().filter(|result| result.solved).count() as f64 / results.len() as f64
+    })
+}
+
+pub fn tactical_tsv_report(results: &[TacticalResult]) -> String {
+    let solve_rate = tactical_solve_rate(results).unwrap_or(0.0);
+    let mut report =
+        "engine_version\tcase\tdepth\texpected_move\tactual_move\tsolved\tsolve_rate\n".to_string();
+    for result in results {
+        report.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{solve_rate:.6}\n",
+            env!("CARGO_PKG_VERSION"),
+            result.name,
+            result.depth,
+            result.expected_move,
+            result.actual_move.as_deref().unwrap_or(""),
+            result.solved,
+        ));
+    }
+    report
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MatchScore {
     pub wins: u32,
@@ -208,7 +297,10 @@ fn outcome_from_status(status: GameStatus, candidate_color: Color) -> GameOutcom
 
 #[cfg(test)]
 mod tests {
-    use super::{MatchScore, measure_throughput, throughput_tsv_report};
+    use super::{
+        DEFAULT_TACTICAL_SUITE, MatchScore, measure_throughput, run_tactical_suite,
+        tactical_solve_rate, tactical_tsv_report, throughput_tsv_report,
+    };
 
     #[test]
     fn balanced_score_has_zero_elo_difference() {
@@ -278,5 +370,17 @@ mod tests {
         let report = throughput_tsv_report(&[sample]);
         assert!(report.contains("nodes_per_second"));
         assert!(report.contains("\t2\t"));
+    }
+
+    #[test]
+    fn tactical_suite_reports_a_versioned_solve_rate() {
+        let results = run_tactical_suite(DEFAULT_TACTICAL_SUITE).unwrap();
+        assert_eq!(results.len(), DEFAULT_TACTICAL_SUITE.len());
+        assert_eq!(tactical_solve_rate(&results), Some(1.0));
+
+        let report = tactical_tsv_report(&results);
+        assert!(report.starts_with("engine_version\tcase\tdepth"));
+        assert!(report.contains("mate_in_one"));
+        assert!(report.contains("\t1.000000\n"));
     }
 }
