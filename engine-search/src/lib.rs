@@ -10,6 +10,7 @@ const MAX_KILLER_PLY: usize = 128;
 const ASPIRATION_WINDOW: i32 = 50;
 const HISTORY_PROMOTION_STATES: usize = 5;
 const HISTORY_SIZE: usize = 64 * 64 * HISTORY_PROMOTION_STATES;
+const TT_CLUSTER_SIZE: usize = 4;
 
 fn tt_capacity_entries_for(hash_mb: usize) -> usize {
     let bytes = hash_mb.max(1) * 1024 * 1024;
@@ -344,14 +345,15 @@ struct TranspositionSlot {
 
 #[derive(Debug)]
 struct TranspositionTable {
-    slots: Vec<Option<TranspositionSlot>>,
+    clusters: Vec<[Option<TranspositionSlot>; TT_CLUSTER_SIZE]>,
     generation: u8,
 }
 
 impl TranspositionTable {
     fn new(capacity: usize) -> Self {
+        let cluster_count = capacity.max(TT_CLUSTER_SIZE).div_ceil(TT_CLUSTER_SIZE);
         Self {
-            slots: vec![None; capacity.max(1)],
+            clusters: vec![[None; TT_CLUSTER_SIZE]; cluster_count],
             generation: 0,
         }
     }
@@ -365,9 +367,10 @@ impl TranspositionTable {
     }
 
     fn get(&self, key: u64) -> Option<&TranspositionEntry> {
-        self.slots[self.index(key)]
-            .as_ref()
-            .filter(|slot| slot.key == key)
+        self.clusters[self.index(key)]
+            .iter()
+            .flatten()
+            .find(|slot| slot.key == key)
             .map(|slot| &slot.entry)
     }
 
@@ -379,19 +382,35 @@ impl TranspositionTable {
             entry,
         };
 
-        match self.slots[index] {
-            None => self.slots[index] = Some(replacement),
-            Some(current) if current.key == key => {
-                if entry.depth >= current.entry.depth || entry.bound == Bound::Exact {
-                    self.slots[index] = Some(replacement);
-                }
+        let cluster = &mut self.clusters[index];
+        if let Some(slot) = cluster
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|slot| slot.key == key))
+        {
+            let current = (*slot).expect("matching slot must contain an entry");
+            if entry.depth >= current.entry.depth || entry.bound == Bound::Exact {
+                *slot = Some(replacement);
             }
-            Some(current)
-                if current.generation != self.generation || entry.depth > current.entry.depth =>
-            {
-                self.slots[index] = Some(replacement);
-            }
-            Some(_) => {}
+            return;
+        }
+
+        if let Some(slot) = cluster.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(replacement);
+            return;
+        }
+
+        let victim_index = cluster
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, slot)| {
+                let slot = (*slot).expect("full cluster must contain entries");
+                (u8::from(slot.generation == self.generation), slot.entry.depth)
+            })
+            .map(|(index, _)| index)
+            .expect("transposition table cluster cannot be empty");
+        let victim = cluster[victim_index].expect("full cluster must contain entries");
+        if victim.generation != self.generation || entry.depth > victim.entry.depth {
+            cluster[victim_index] = Some(replacement);
         }
     }
 
@@ -402,21 +421,24 @@ impl TranspositionTable {
 
     #[cfg(test)]
     fn is_empty(&self) -> bool {
-        self.slots.iter().all(Option::is_none)
+        self.clusters.iter().flatten().all(Option::is_none)
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.slots.iter().flatten().count()
+        self.clusters.iter().flatten().flatten().count()
     }
 
     #[cfg(test)]
     fn values(&self) -> impl Iterator<Item = &TranspositionEntry> {
-        self.slots.iter().flatten().map(|slot| &slot.entry)
+        self.clusters
+            .iter()
+            .flat_map(|cluster| cluster.iter().flatten())
+            .map(|slot| &slot.entry)
     }
 
     fn index(&self, key: u64) -> usize {
-        (key as usize) % self.slots.len()
+        (key as usize) % self.clusters.len()
     }
 }
 
@@ -1526,8 +1548,8 @@ mod tests {
     }
 
     #[test]
-    fn transposition_table_replaces_a_shallower_collision_without_growing() {
-        let mut table = TranspositionTable::new(2);
+    fn transposition_table_keeps_collisions_until_a_cluster_is_full() {
+        let mut table = TranspositionTable::new(4);
         table.begin_search();
         table.store(
             1,
@@ -1539,7 +1561,39 @@ mod tests {
             },
         );
         table.store(
+            2,
+            TranspositionEntry {
+                depth: 3,
+                score: 15,
+                bound: Bound::Exact,
+                best_move: None,
+            },
+        );
+        table.store(
             3,
+            TranspositionEntry {
+                depth: 3,
+                score: 18,
+                bound: Bound::Exact,
+                best_move: None,
+            },
+        );
+        table.store(
+            4,
+            TranspositionEntry {
+                depth: 3,
+                score: 19,
+                bound: Bound::Exact,
+                best_move: None,
+            },
+        );
+
+        assert_eq!(table.len(), 4);
+        assert_eq!(table.get(1).map(|entry| entry.score), Some(10));
+        assert_eq!(table.get(4).map(|entry| entry.score), Some(19));
+
+        table.store(
+            5,
             TranspositionEntry {
                 depth: 4,
                 score: 20,
@@ -1548,9 +1602,10 @@ mod tests {
             },
         );
 
-        assert_eq!(table.len(), 1);
+        assert_eq!(table.len(), 4);
         assert!(table.get(1).is_none());
-        assert_eq!(table.get(3).map(|entry| entry.score), Some(20));
+        assert_eq!(table.get(2).map(|entry| entry.score), Some(15));
+        assert_eq!(table.get(5).map(|entry| entry.score), Some(20));
     }
 
     #[test]
