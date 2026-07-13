@@ -1222,10 +1222,10 @@ struct EvalParams {
 }
 
 const EVAL_PARAMS: EvalParams = EvalParams {
-    pawn: TaperedScore::new(100, 120),
-    knight: TaperedScore::new(320, 300),
-    bishop: TaperedScore::new(330, 340),
-    rook: TaperedScore::new(500, 520),
+    pawn: TaperedScore::equal(100),
+    knight: TaperedScore::equal(320),
+    bishop: TaperedScore::equal(330),
+    rook: TaperedScore::equal(500),
     queen: TaperedScore::equal(900),
 };
 
@@ -1251,21 +1251,17 @@ fn piece_square_bonus(piece: Piece, idx: u8) -> TaperedScore {
             .min((4_i32 - (7 - rank) as i32).abs()),
     };
     let centrality = 6 - (centered_file + centered_rank);
-    let pawn_advancement = match piece.color {
-        Color::White => rank as i32,
-        Color::Black => (7 - rank) as i32,
+    let value = match piece.kind {
+        PieceKind::Pawn => {
+            centrality * 2 + rank as i32 * if piece.color == Color::White { 3 } else { -3 }
+        }
+        PieceKind::Knight => centrality * 8,
+        PieceKind::Bishop => centrality * 5,
+        PieceKind::Rook => centrality * 2,
+        PieceKind::Queen => centrality * 2,
+        PieceKind::King => -centrality * 4,
     };
-    match piece.kind {
-        PieceKind::Pawn => TaperedScore::new(
-            centrality * 2 + pawn_advancement * 3,
-            centrality + pawn_advancement * 6,
-        ),
-        PieceKind::Knight => TaperedScore::new(centrality * 8, centrality * 4),
-        PieceKind::Bishop => TaperedScore::new(centrality * 5, centrality * 6),
-        PieceKind::Rook => TaperedScore::new(centrality * 2, centrality * 4),
-        PieceKind::Queen => TaperedScore::equal(centrality * 2),
-        PieceKind::King => TaperedScore::new(-centrality * 4, centrality * 6),
-    }
+    TaperedScore::equal(value)
 }
 
 #[derive(Default, Clone, Copy)]

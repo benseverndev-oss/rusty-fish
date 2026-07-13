@@ -9,12 +9,14 @@ and search behavior at its boundary.
 ## Design
 
 `TaperedScore` stores centipawn components for middlegame and endgame. An
-`EvalParams` constant supplies separate piece values and piece-square weights.
-Existing scalar positional features are represented as equal components unless
-they are phase-specific: king safety contributes only to middlegame and king
-centralization only to endgame. At the end of evaluation, material phase in
-the existing 0..24 range linearly interpolates White-minus-Black and returns
-the result from the side-to-move perspective.
+`EvalParams` constant supplies the initial evaluation-only piece values while
+preserving the prior scalar numbers in both components; future tuning changes
+those pairs only after gauntlet evidence. Existing scalar positional features
+are represented as equal components unless they are phase-specific: king
+safety contributes only to middlegame and king centralization only to endgame.
+At the end of evaluation, material phase in the existing 0..24 range linearly
+interpolates White-minus-Black and returns the result from the side-to-move
+perspective.
 
 ## Alternatives considered
 
