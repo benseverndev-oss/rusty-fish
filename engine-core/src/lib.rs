@@ -1335,6 +1335,21 @@ pub fn piece_unicode(piece: Piece) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shakmaty::{fen::Fen as ReferenceFen, CastlingMode, Chess as ReferenceChess, Position};
+
+    fn reference_legal_moves(fen: &str) -> Vec<String> {
+        let reference = ReferenceFen::from_ascii(fen.as_bytes())
+            .unwrap()
+            .into_position::<ReferenceChess>(CastlingMode::Standard)
+            .unwrap();
+        let mut moves = reference
+            .legal_moves()
+            .iter()
+            .map(|mv| mv.to_uci(reference.castles().mode()).to_string())
+            .collect::<Vec<_>>();
+        moves.sort();
+        moves
+    }
 
     #[test]
     fn startpos_round_trip() {
@@ -1487,6 +1502,34 @@ mod tests {
                 let undo = board.make_move(mv).unwrap();
                 board.unmake_move(mv, undo);
                 assert_eq!(board.position_hash(), initial_hash);
+                board.make_move(mv).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn randomized_positions_match_independent_legal_move_reference() {
+        let mut seed = 0xd1b5_4a32_d192_ed03_u64;
+        for game in 0..16 {
+            let mut board = Board::startpos();
+            for ply in 0..96 {
+                let fen = board.to_fen();
+                let reference_fen = ReferenceFen::from_ascii(fen.as_bytes()).unwrap();
+                assert_eq!(reference_fen.to_string(), fen, "game {game}, ply {ply}");
+
+                let mut actual = board
+                    .generate_legal_moves()
+                    .into_iter()
+                    .map(ChessMove::to_uci)
+                    .collect::<Vec<_>>();
+                actual.sort();
+                assert_eq!(actual, reference_legal_moves(&fen), "game {game}, ply {ply}: {fen}");
+
+                if actual.is_empty() {
+                    break;
+                }
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let mv = board.parse_uci_move(&actual[(seed as usize) % actual.len()]).unwrap();
                 board.make_move(mv).unwrap();
             }
         }
