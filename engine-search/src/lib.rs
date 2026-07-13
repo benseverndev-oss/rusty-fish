@@ -2144,7 +2144,7 @@ mod tests {
             return;
         };
         let tables = SyzygyTablebases::load(&path, 3).expect("load checksummed KQvK corpus");
-        let board = Board::from_fen("7k/8/6K1/7Q/8/8/8/8 w - - 0 1").unwrap();
+        let board = Board::from_fen("7k/5Q2/6K1/8/8/8/8/8 w - - 0 1").unwrap();
         let root = tables.probe_root(&board).expect("KQvK root probe");
         assert_eq!(root.wdl, SyzygyWdl::Win);
         assert_eq!(root.dtz, 1);
