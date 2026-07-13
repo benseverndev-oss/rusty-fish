@@ -767,8 +767,9 @@ impl Searcher {
         let mut best_line = Vec::new();
         for (move_index, &mv) in moves.as_slice().iter().enumerate() {
             let is_quiet = self.is_quiet_move(board, mv);
+            let pawn_extension = passed_pawn_extension(board, mv);
             let undo = board.make_move(mv).expect("generated move must be legal");
-            let extension = u8::from(board.in_check(board.side_to_move));
+            let extension = u8::from(board.in_check(board.side_to_move)).max(pawn_extension);
             let next_depth = depth.saturating_sub(1) + extension.min(1);
             let reduction = late_move_reduction(depth, move_index, is_quiet && extension == 0);
             let search_depth = next_depth.saturating_sub(reduction);
@@ -1427,6 +1428,42 @@ fn count_slider_targets(
     count
 }
 
+fn is_passed_pawn(board: &Board, square: engine_core::Square, color: Color) -> bool {
+    let ranks = match color {
+        Color::White => square.rank() + 1..8,
+        Color::Black => 0..square.rank(),
+    };
+    for file in square.file().saturating_sub(1)..=((square.file() + 1).min(7)) {
+        for rank in ranks.clone() {
+            if board.piece_at(
+                engine_core::Square::from_file_rank(file, rank).expect("in bounds"),
+            ) == Some(Piece {
+                color: color.opposite(),
+                kind: PieceKind::Pawn,
+            }) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn passed_pawn_extension(board: &Board, mv: ChessMove) -> u8 {
+    let Some(piece) = board.piece_at(mv.from) else {
+        return 0;
+    };
+    let advanced = match piece.color {
+        Color::White => mv.to.rank() == 6,
+        Color::Black => mv.to.rank() == 1,
+    };
+    u8::from(
+        piece.kind == PieceKind::Pawn
+            && mv.promotion.is_none()
+            && advanced
+            && is_passed_pawn(board, mv.from, piece.color),
+    )
+}
+
 fn pawn_structure_bonus(
     board: &Board,
     square: engine_core::Square,
@@ -1455,49 +1492,7 @@ fn pawn_structure_bonus(
         score -= 18;
     }
 
-    let files = file.saturating_sub(1)..=((file + 1).min(7));
-    let is_passed = match color {
-        Color::White => {
-            let mut blocked = false;
-            for enemy_file in files {
-                for rank in (square.rank() + 1)..8 {
-                    if board.piece_at(
-                        engine_core::Square::from_file_rank(enemy_file as u8, rank).expect("valid"),
-                    ) == Some(Piece {
-                        color: Color::Black,
-                        kind: PieceKind::Pawn,
-                    }) {
-                        blocked = true;
-                        break;
-                    }
-                }
-                if blocked {
-                    break;
-                }
-            }
-            !blocked
-        }
-        Color::Black => {
-            let mut blocked = false;
-            for enemy_file in file.saturating_sub(1)..=((file + 1).min(7)) {
-                for rank in 0..square.rank() {
-                    if board.piece_at(
-                        engine_core::Square::from_file_rank(enemy_file as u8, rank).expect("valid"),
-                    ) == Some(Piece {
-                        color: Color::White,
-                        kind: PieceKind::Pawn,
-                    }) {
-                        blocked = true;
-                        break;
-                    }
-                }
-                if blocked {
-                    break;
-                }
-            }
-            !blocked
-        }
-    };
+    let is_passed = is_passed_pawn(board, square, color);
     if is_passed {
         let advancement = match color {
             Color::White => square.rank() as i32,
@@ -1581,7 +1576,7 @@ mod tests {
     use super::{
         Bound, ClockControl, OpeningBook, SearchLimits, Searcher, SyzygyTablebases,
         TranspositionEntry, TranspositionTable, evaluate_position, late_move_reduction,
-        static_exchange_evaluation, threat_bonus, history_index,
+        passed_pawn_extension, static_exchange_evaluation, threat_bonus, history_index,
     };
 
     #[test]
@@ -1784,6 +1779,33 @@ mod tests {
         let black_edge = Board::from_fen("4k3/4bb2/8/8/3p4/8/8/4K3 b - - 0 1").unwrap();
         assert!(evaluate_position(&white_edge) > 0);
         assert!(evaluate_position(&black_edge) > 0);
+    }
+
+    #[test]
+    fn passed_pawn_extension_requires_an_advanced_unblocked_pawn_push() {
+        let white = Board::from_fen("4k3/8/3P4/8/8/8/8/4K3 w - - 0 1").unwrap();
+        assert_eq!(
+            passed_pawn_extension(&white, white.parse_uci_move("d6d7").unwrap()),
+            1
+        );
+
+        let black = Board::from_fen("4k3/8/8/8/8/3p4/8/4K3 b - - 0 1").unwrap();
+        assert_eq!(
+            passed_pawn_extension(&black, black.parse_uci_move("d3d2").unwrap()),
+            1
+        );
+
+        let blocked = Board::from_fen("4k3/2p5/3P4/8/8/8/8/4K3 w - - 0 1").unwrap();
+        assert_eq!(
+            passed_pawn_extension(&blocked, blocked.parse_uci_move("d6d7").unwrap()),
+            0
+        );
+
+        let promotion = Board::from_fen("4k3/3P4/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        assert_eq!(
+            passed_pawn_extension(&promotion, promotion.parse_uci_move("d7d8q").unwrap()),
+            0
+        );
     }
 
     #[test]
