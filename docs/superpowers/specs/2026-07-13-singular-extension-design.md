@@ -9,8 +9,10 @@ interior node, improving tactical depth without broadening speculative search.
 
 `Searcher::negamax` will accept an optional excluded move used only by a
 verification search. A singular candidate requires an exact TT entry with a
-move at least two plies deeper than the current verification depth, depth at
-least six, no check, no mate-adjacent TT score, and non-pawn material.
+move that is close enough to the requested depth to order the node, but still
+shallower than that depth so the existing TT cutoff has not already resolved
+the node. It also requires depth at least six, no check, no mate-adjacent TT
+score, and non-pawn material.
 
 Before searching that TT move normally, the engine searches all *other* moves
 at `depth / 2` with a null window below `tt_score - 32`. If no alternative

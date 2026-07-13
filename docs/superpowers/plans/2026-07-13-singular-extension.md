@@ -25,10 +25,10 @@
 
 ```rust
 #[test]
-fn singular_extension_requires_a_deep_exact_non_mate_tt_entry() {
-    let entry = TranspositionEntry { depth: 8, score: 40, bound: Bound::Exact, best_move: Some(ChessMove::from_uci("e2e4").unwrap()) };
+fn singular_extension_requires_an_unresolved_exact_non_mate_tt_entry() {
+    let entry = TranspositionEntry { depth: 5, score: 40, bound: Bound::Exact, best_move: Some(ChessMove::from_uci("e2e4").unwrap()) };
     assert!(can_try_singular_extension(6, false, true, entry));
-    assert!(!can_try_singular_extension(5, false, true, entry));
+    assert!(!can_try_singular_extension(6, false, true, TranspositionEntry { depth: 6, ..entry }));
     assert!(!can_try_singular_extension(6, true, true, entry));
 }
 ```

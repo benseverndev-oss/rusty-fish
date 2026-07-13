@@ -1266,6 +1266,10 @@ fn can_try_singular_extension(
         && entry.score.abs() < MATE_SCORE - 1_024
 }
 
+fn singular_verification_beta(tt_score: i32) -> i32 {
+    tt_score - 32
+}
+
 fn root_tablebase_search_result(root: SyzygyRootProbe) -> SearchResult {
     SearchResult {
         best_move: Some(root.best_move),
@@ -2061,15 +2065,20 @@ mod tests {
     }
 
     #[test]
-    fn singular_extension_requires_a_deep_exact_non_mate_tt_entry() {
+    fn singular_extension_requires_an_unresolved_exact_non_mate_tt_entry() {
         let entry = TranspositionEntry {
-            depth: 8,
+            depth: 5,
             score: 40,
             bound: Bound::Exact,
             best_move: Some(ChessMove::from_uci("e2e4").unwrap()),
         };
         assert!(can_try_singular_extension(6, false, true, entry));
-        assert!(!can_try_singular_extension(5, false, true, entry));
+        assert!(!can_try_singular_extension(
+            6,
+            false,
+            true,
+            TranspositionEntry { depth: 6, ..entry },
+        ));
         assert!(!can_try_singular_extension(6, true, true, entry));
     }
 
