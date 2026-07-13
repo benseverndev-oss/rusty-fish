@@ -1836,6 +1836,7 @@ mod tests {
         promotion_from_tablebase, root_tablebase_search_result, static_exchange_evaluation,
         syzygy_score, syzygy_wdl, threat_bonus, late_move_pruning_limit, razor_margin,
         reverse_futility_margin, can_apply_static_pruning, can_try_singular_extension,
+        singular_verification_beta,
     };
 
     #[test]
