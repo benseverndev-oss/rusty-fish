@@ -8,6 +8,8 @@ use pyrrhic_rs::{Color as TbColor, EngineAdapter, TableBases, WdlProbeResult};
 const MATE_SCORE: i32 = 100_000;
 const MAX_KILLER_PLY: usize = 128;
 const ASPIRATION_WINDOW: i32 = 50;
+const HISTORY_PROMOTION_STATES: usize = 5;
+const HISTORY_SIZE: usize = 64 * 64 * HISTORY_PROMOTION_STATES;
 
 fn tt_capacity_entries_for(hash_mb: usize) -> usize {
     let bytes = hash_mb.max(1) * 1024 * 1024;
@@ -20,6 +22,19 @@ fn late_move_reduction(depth: u8, move_index: usize, is_quiet: bool) -> u8 {
         return 0;
     }
     1 + u8::from(depth >= 7 && move_index >= 8)
+}
+
+fn history_index(mv: ChessMove) -> usize {
+    let promotion = match mv.promotion {
+        None => 0,
+        Some(PieceKind::Knight) => 1,
+        Some(PieceKind::Bishop) => 2,
+        Some(PieceKind::Rook) => 3,
+        Some(PieceKind::Queen) => 4,
+        Some(PieceKind::Pawn | PieceKind::King) => 0,
+    };
+    ((usize::from(mv.from.0) * 64 + usize::from(mv.to.0)) * HISTORY_PROMOTION_STATES)
+        + promotion
 }
 
 #[derive(Clone, Debug, Default)]
@@ -282,7 +297,7 @@ pub struct Searcher {
     stopped: bool,
     tt: TranspositionTable,
     killer_moves: Vec<[Option<ChessMove>; 2]>,
-    history: HashMap<ChessMove, i32>,
+    history: Vec<i32>,
     options: SearchOptions,
     opening_book: Option<OpeningBook>,
     syzygy: Option<SyzygyTablebases>,
@@ -297,7 +312,7 @@ impl Default for Searcher {
             stopped: false,
             tt: TranspositionTable::new(tt_capacity_entries_for(SearchOptions::default().hash_mb)),
             killer_moves: vec![[None, None]; MAX_KILLER_PLY],
-            history: HashMap::new(),
+            history: vec![0; HISTORY_SIZE],
             options: SearchOptions::default(),
             opening_book: None,
             syzygy: None,
@@ -870,7 +885,7 @@ impl Searcher {
             }
         }
 
-        score + self.history.get(&mv).copied().unwrap_or_default()
+        score + self.history[history_index(mv)]
     }
 
     fn record_cutoff(&mut self, ply: usize, mv: ChessMove, depth: u8) {
@@ -881,7 +896,8 @@ impl Searcher {
                 entry[0] = Some(mv);
             }
         }
-        *self.history.entry(mv).or_insert(0) += i32::from(depth) * i32::from(depth) * 16;
+        let history = &mut self.history[history_index(mv)];
+        *history = history.saturating_add(i32::from(depth) * i32::from(depth) * 16);
     }
 
     fn store_tt(&mut self, key: u64, entry: TranspositionEntry) {
