@@ -1,0 +1,37 @@
+name: Fixed Opponent Gauntlet
+
+on:
+  push:
+    paths:
+      - 'engine-core/**'
+      - 'engine-search/**'
+      - 'engine-bench/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/fixed-opponent-gauntlet.yml'
+  pull_request:
+    paths:
+      - 'engine-core/**'
+      - 'engine-search/**'
+      - 'engine-bench/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/fixed-opponent-gauntlet.yml'
+  workflow_dispatch:
+
+jobs:
+  gauntlet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run fixed-opponent gauntlet
+        run: |
+          mkdir -p artifacts
+          cargo run --release -p engine-bench -- gauntlet > artifacts/fixed-opponent-sprt.tsv
+      - name: Upload gauntlet report
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixed-opponent-sprt-tsv
+          path: artifacts/fixed-opponent-sprt.tsv

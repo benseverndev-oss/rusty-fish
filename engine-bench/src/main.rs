@@ -1,6 +1,6 @@
 use engine_bench::{
-    DEFAULT_TACTICAL_SUITE, measure_throughput, run_tactical_suite, tactical_tsv_report,
-    throughput_tsv_report,
+    DEFAULT_TACTICAL_SUITE, MatchConfig, SprtConfig, measure_throughput, run_fixed_opponent_match,
+    run_tactical_suite, sprt_tsv_report, summarize, tactical_tsv_report, throughput_tsv_report,
 };
 
 const BENCHMARKS: &[(&str, u8)] = &[
@@ -14,10 +14,20 @@ const BENCHMARKS: &[(&str, u8)] = &[
     ),
 ];
 
+const GAUNTLET_POSITIONS: &[&str] = &[
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+];
+
 fn main() -> Result<(), String> {
     if std::env::args().nth(1).as_deref() == Some("tactical") {
         let results = run_tactical_suite(DEFAULT_TACTICAL_SUITE)?;
         print!("{}", tactical_tsv_report(&results));
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("gauntlet") {
+        let records = run_fixed_opponent_match(GAUNTLET_POSITIONS, MatchConfig::default())?;
+        print!("{}", sprt_tsv_report(summarize(&records), SprtConfig::default()));
         return Ok(());
     }
 
