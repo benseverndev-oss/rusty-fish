@@ -1379,7 +1379,7 @@ mod tests {
                 &[(1, 6), (2, 264), (3, 9_467), (4, 422_333)],
             ),
             (
-                "rnbqkb1r/pp1p1ppp/2p5/4P3/2B5/8/PPP1NnPP/RNBQK2R w KQkq - 0 6",
+                "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPPP1PPP/RNBQK1NR w KQ - 1 8",
                 &[(1, 44), (2, 1_486), (3, 62_379)],
             ),
             (
