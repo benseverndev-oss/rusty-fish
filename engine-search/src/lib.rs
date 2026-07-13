@@ -3,8 +3,10 @@ use std::path::Path;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
 
-use engine_core::{Board, ChessMove, Color, GameStatus, Piece, PieceKind};
-use pyrrhic_rs::{Color as TbColor, EngineAdapter, TableBases, WdlProbeResult};
+use engine_core::{Board, ChessMove, Color, GameStatus, Piece, PieceKind, Square};
+use pyrrhic_rs::{
+    Color as TbColor, DtzProbeValue, EngineAdapter, Piece as TbPiece, TableBases, WdlProbeResult,
+};
 
 const MATE_SCORE: i32 = 100_000;
 const MAX_KILLER_PLY: usize = 128;
@@ -145,6 +147,13 @@ pub enum SyzygyWdl {
     Win,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyzygyRootProbe {
+    pub best_move: ChessMove,
+    pub wdl: SyzygyWdl,
+    pub dtz: u16,
+}
+
 pub struct SyzygyTablebases {
     tables: TableBases<RustyFishTablebaseAdapter>,
 }
@@ -187,11 +196,69 @@ impl SyzygyTablebases {
                 board.side_to_move == Color::White,
             )
             .ok()?;
-        match result {
-            WdlProbeResult::Win | WdlProbeResult::CursedWin => Some(SyzygyWdl::Win),
-            WdlProbeResult::Draw => Some(SyzygyWdl::Draw),
-            WdlProbeResult::Loss | WdlProbeResult::BlessedLoss => Some(SyzygyWdl::Loss),
+        Some(syzygy_wdl(result))
+    }
+
+    pub fn probe_root(&self, board: &Board) -> Option<SyzygyRootProbe> {
+        let white = board.occupancy(Color::White);
+        let black = board.occupancy(Color::Black);
+        if (white | black).count_ones() > self.tables.max_pieces() {
+            return None;
         }
+        let ep = board.en_passant().map_or(0, |square| u32::from(square.0));
+        let result = self
+            .tables
+            .probe_root(
+                white,
+                black,
+                board.pieces(Color::White, PieceKind::King)
+                    | board.pieces(Color::Black, PieceKind::King),
+                board.pieces(Color::White, PieceKind::Queen)
+                    | board.pieces(Color::Black, PieceKind::Queen),
+                board.pieces(Color::White, PieceKind::Rook)
+                    | board.pieces(Color::Black, PieceKind::Rook),
+                board.pieces(Color::White, PieceKind::Bishop)
+                    | board.pieces(Color::Black, PieceKind::Bishop),
+                board.pieces(Color::White, PieceKind::Knight)
+                    | board.pieces(Color::Black, PieceKind::Knight),
+                board.pieces(Color::White, PieceKind::Pawn)
+                    | board.pieces(Color::Black, PieceKind::Pawn),
+                board.halfmove_clock(),
+                ep,
+                board.side_to_move == Color::White,
+            )
+            .ok()?;
+        let DtzProbeValue::DtzResult(root) = result.root else {
+            return None;
+        };
+        let candidate = ChessMove {
+            from: Square(root.from_square),
+            to: Square(root.to_square),
+            promotion: promotion_from_tablebase(root.promotion),
+        };
+        Some(SyzygyRootProbe {
+            best_move: board.parse_uci_move(&candidate.to_uci()).ok()?,
+            wdl: syzygy_wdl(root.wdl),
+            dtz: root.dtz,
+        })
+    }
+}
+
+fn syzygy_wdl(result: WdlProbeResult) -> SyzygyWdl {
+    match result {
+        WdlProbeResult::Win | WdlProbeResult::CursedWin => SyzygyWdl::Win,
+        WdlProbeResult::Draw => SyzygyWdl::Draw,
+        WdlProbeResult::Loss | WdlProbeResult::BlessedLoss => SyzygyWdl::Loss,
+    }
+}
+
+fn promotion_from_tablebase(piece: TbPiece) -> Option<PieceKind> {
+    match piece {
+        TbPiece::Queen => Some(PieceKind::Queen),
+        TbPiece::Rook => Some(PieceKind::Rook),
+        TbPiece::Bishop => Some(PieceKind::Bishop),
+        TbPiece::Knight => Some(PieceKind::Knight),
+        TbPiece::Pawn | TbPiece::King => None,
     }
 }
 
@@ -1665,7 +1732,7 @@ mod tests {
     use pyrrhic_rs::{Piece as TbPiece, WdlProbeResult};
 
     use super::{
-        Bound, ClockControl, OpeningBook, SearchLimits, Searcher, SyzygyTablebases,
+        Bound, ClockControl, OpeningBook, SearchLimits, Searcher, SyzygyTablebases, SyzygyWdl,
         TaperedScore, TranspositionEntry, TranspositionTable, evaluate_position, late_move_reduction,
         passed_pawn_extension, static_exchange_evaluation, threat_bonus, history_index,
         promotion_from_tablebase, syzygy_wdl,
