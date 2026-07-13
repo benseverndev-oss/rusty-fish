@@ -915,6 +915,8 @@ fn evaluate_position(board: &Board) -> i32 {
         Color::Black,
         king_safety_bonus(board, Color::Black) * king_safety_scale / 24,
     );
+    features.add(Color::White, threat_bonus(board, Color::White));
+    features.add(Color::Black, threat_bonus(board, Color::Black));
     features.net(board.side_to_move)
 }
 
@@ -942,6 +944,24 @@ fn king_endgame_activity(square: engine_core::Square) -> i32 {
         .abs()
         .min((square.rank() as i32 - 4).abs());
     24 - (file_distance + rank_distance) * 6
+}
+
+fn threat_bonus(board: &Board, attacker: Color) -> i32 {
+    let mut score = 0;
+    for index in 0..64 {
+        let square = engine_core::Square(index);
+        let Some(piece) = board.piece_at(square) else {
+            continue;
+        };
+        if piece.color != attacker.opposite()
+            || !board.is_square_attacked(square, attacker)
+            || board.is_square_attacked(square, piece.color)
+        {
+            continue;
+        }
+        score += piece_value(piece) / 24;
+    }
+    score
 }
 
 fn activity_bonus(board: &Board, square: engine_core::Square, piece: Piece) -> i32 {
@@ -1178,7 +1198,7 @@ mod tests {
 
     use super::{
         Bound, ClockControl, SearchLimits, Searcher, TranspositionEntry, TranspositionTable,
-        evaluate_position, late_move_reduction, static_exchange_evaluation,
+        evaluate_position, late_move_reduction, static_exchange_evaluation, threat_bonus,
     };
 
     #[test]
@@ -1274,6 +1294,14 @@ mod tests {
         let active = Board::from_fen("4k3/8/8/8/4K3/8/4P3/8 w - - 0 1").unwrap();
         let passive = Board::from_fen("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1").unwrap();
         assert!(evaluate_position(&active) > evaluate_position(&passive));
+    }
+
+    #[test]
+    fn evaluation_rewards_attacking_an_undefended_queen() {
+        let threatened = Board::from_fen("4k3/8/8/8/3q4/5N2/8/4K3 w - - 0 1").unwrap();
+        let safe = Board::from_fen("4k3/8/8/8/3q4/7N/8/4K3 w - - 0 1").unwrap();
+        assert!(threat_bonus(&threatened, Color::White) > 0);
+        assert_eq!(threat_bonus(&safe, Color::White), 0);
     }
 
     #[test]
