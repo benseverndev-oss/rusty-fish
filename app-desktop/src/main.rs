@@ -416,6 +416,7 @@ impl RustyFishApp {
             max_depth: self.max_depth,
             hash_mb: self.hash_mb,
             move_overhead: Duration::from_millis(self.move_overhead_ms),
+            ..SearchOptions::default()
         };
         let _ = self
             .engine_service
