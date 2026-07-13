@@ -1,6 +1,18 @@
 name: Engine Core Perft
 
 on:
+  push:
+    paths:
+      - 'engine-core/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/engine-core-perft.yml'
+  pull_request:
+    paths:
+      - 'engine-core/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/engine-core-perft.yml'
   workflow_dispatch:
     inputs:
       test_filter:
