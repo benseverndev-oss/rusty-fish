@@ -331,7 +331,9 @@ mod tests {
 
     use engine_search::ClockControl;
 
-    use super::{ActiveSearch, apply_option, parse_go, stop_active_search, EngineState};
+    use super::{
+        ActiveSearch, EngineState, apply_option, parse_go, stop_active_search, write_uci_header,
+    };
 
     #[test]
     fn parse_go_supports_clock_controls() {
@@ -371,6 +373,21 @@ mod tests {
         assert_eq!(state.syzygy_path.as_deref(), Some("."));
         assert!(apply_option(&mut state, "setoption name SyzygyPath value missing-tables").is_err());
         assert_eq!(state.syzygy_path.as_deref(), Some("."));
+    }
+
+    #[test]
+    fn syzygy_probe_options_are_advertised_and_clamped() {
+        let mut state = EngineState::default();
+        apply_option(&mut state, "setoption name SyzygyProbeDepth value 0").unwrap();
+        apply_option(&mut state, "setoption name SyzygyProbeLimit value 99").unwrap();
+        assert_eq!(state.options.syzygy_probe_depth, 1);
+        assert_eq!(state.options.syzygy_probe_limit, 7);
+
+        let mut header = Vec::new();
+        write_uci_header(&mut header, &state.options).unwrap();
+        let header = String::from_utf8(header).unwrap();
+        assert!(header.contains("option name SyzygyProbeDepth type spin default 1 min 1 max 64"));
+        assert!(header.contains("option name SyzygyProbeLimit type spin default 7 min 3 max 7"));
     }
 
     #[test]
