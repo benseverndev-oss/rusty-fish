@@ -1,0 +1,10 @@
+[package]
+name = "app-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eframe = "0.33"
+engine-core = { path = "../engine-core" }
+engine-search = { path = "../engine-search" }

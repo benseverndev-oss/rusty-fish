@@ -5,6 +5,7 @@ dist/
 build/
 .turbo/
 .vercel/
+target/
 
 .env
 .env.local
