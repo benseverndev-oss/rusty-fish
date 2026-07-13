@@ -1167,7 +1167,73 @@ fn piece_kind_value(kind: PieceKind) -> i32 {
     }
 }
 
-fn piece_square_bonus(piece: Piece, idx: u8) -> i32 {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TaperedScore {
+    middlegame: i32,
+    endgame: i32,
+}
+
+impl TaperedScore {
+    const fn new(middlegame: i32, endgame: i32) -> Self {
+        Self {
+            middlegame,
+            endgame,
+        }
+    }
+
+    const fn equal(value: i32) -> Self {
+        Self::new(value, value)
+    }
+
+    const fn middlegame(value: i32) -> Self {
+        Self::new(value, 0)
+    }
+
+    const fn endgame(value: i32) -> Self {
+        Self::new(0, value)
+    }
+
+    const fn add(self, other: Self) -> Self {
+        Self::new(
+            self.middlegame + other.middlegame,
+            self.endgame + other.endgame,
+        )
+    }
+
+    fn interpolate(self, phase: i32) -> i32 {
+        (self.middlegame * (24 - phase) + self.endgame * phase) / 24
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EvalParams {
+    pawn: TaperedScore,
+    knight: TaperedScore,
+    bishop: TaperedScore,
+    rook: TaperedScore,
+    queen: TaperedScore,
+}
+
+const EVAL_PARAMS: EvalParams = EvalParams {
+    pawn: TaperedScore::equal(100),
+    knight: TaperedScore::equal(320),
+    bishop: TaperedScore::equal(330),
+    rook: TaperedScore::equal(500),
+    queen: TaperedScore::equal(900),
+};
+
+fn tapered_piece_value(piece: Piece) -> TaperedScore {
+    match piece.kind {
+        PieceKind::Pawn => EVAL_PARAMS.pawn,
+        PieceKind::Knight => EVAL_PARAMS.knight,
+        PieceKind::Bishop => EVAL_PARAMS.bishop,
+        PieceKind::Rook => EVAL_PARAMS.rook,
+        PieceKind::Queen => EVAL_PARAMS.queen,
+        PieceKind::King => TaperedScore::equal(0),
+    }
+}
+
+fn piece_square_bonus(piece: Piece, idx: u8) -> TaperedScore {
     let rank = idx / 8;
     let file = idx % 8;
     let centered_file = (3_i32 - file as i32).abs().min((4_i32 - file as i32).abs());
@@ -1178,7 +1244,7 @@ fn piece_square_bonus(piece: Piece, idx: u8) -> i32 {
             .min((4_i32 - (7 - rank) as i32).abs()),
     };
     let centrality = 6 - (centered_file + centered_rank);
-    match piece.kind {
+    let value = match piece.kind {
         PieceKind::Pawn => {
             centrality * 2 + rank as i32 * if piece.color == Color::White { 3 } else { -3 }
         }
@@ -1187,7 +1253,8 @@ fn piece_square_bonus(piece: Piece, idx: u8) -> i32 {
         PieceKind::Rook => centrality * 2,
         PieceKind::Queen => centrality * 2,
         PieceKind::King => -centrality * 4,
-    }
+    };
+    TaperedScore::equal(value)
 }
 
 #[derive(Default, Clone, Copy)]
@@ -1197,7 +1264,8 @@ struct EvalFeatures {
 }
 
 impl EvalFeatures {
-    fn add(&mut self, color: Color, value: i32) {
+    fn add(&mut self, color: Color, value: TaperedScore, phase: i32) {
+        let value = value.interpolate(phase);
         match color {
             Color::White => self.white_score += value,
             Color::Black => self.black_score += value,
@@ -1228,7 +1296,8 @@ fn evaluate_position(board: &Board) -> i32 {
         };
         features.add(
             piece.color,
-            piece_value(piece) + piece_square_bonus(piece, idx),
+            tapered_piece_value(piece).add(piece_square_bonus(piece, idx)),
+            endgame_phase,
         );
 
         if piece.kind == PieceKind::Pawn {
@@ -1244,20 +1313,25 @@ fn evaluate_position(board: &Board) -> i32 {
             }
         }
 
-        features.add(piece.color, activity_bonus(board, square, piece));
+        features.add(
+            piece.color,
+            TaperedScore::equal(activity_bonus(board, square, piece)),
+            endgame_phase,
+        );
         if piece.kind == PieceKind::King {
             features.add(
                 piece.color,
-                king_endgame_activity(square) * endgame_phase / 24,
+                TaperedScore::endgame(king_endgame_activity(square)),
+                endgame_phase,
             );
         }
     }
 
     if white_bishops >= 2 {
-        features.add(Color::White, 35);
+        features.add(Color::White, TaperedScore::equal(35), endgame_phase);
     }
     if black_bishops >= 2 {
-        features.add(Color::Black, 35);
+        features.add(Color::Black, TaperedScore::equal(35), endgame_phase);
     }
 
     for idx in 0..64 {
@@ -1268,34 +1342,50 @@ fn evaluate_position(board: &Board) -> i32 {
         if piece.kind == PieceKind::Pawn {
             features.add(
                 piece.color,
-                pawn_structure_bonus(
+                TaperedScore::equal(pawn_structure_bonus(
                     board,
                     square,
                     piece.color,
                     &white_pawn_files,
                     &black_pawn_files,
-                ),
+                )),
+                endgame_phase,
             );
         }
         if piece.kind == PieceKind::Rook {
             features.add(
                 piece.color,
-                rook_file_bonus(square, piece.color, &white_pawn_files, &black_pawn_files),
+                TaperedScore::equal(rook_file_bonus(
+                    square,
+                    piece.color,
+                    &white_pawn_files,
+                    &black_pawn_files,
+                )),
+                endgame_phase,
             );
         }
     }
 
-    let king_safety_scale = 24 - endgame_phase;
     features.add(
         Color::White,
-        king_safety_bonus(board, Color::White) * king_safety_scale / 24,
+        TaperedScore::middlegame(king_safety_bonus(board, Color::White)),
+        endgame_phase,
     );
     features.add(
         Color::Black,
-        king_safety_bonus(board, Color::Black) * king_safety_scale / 24,
+        TaperedScore::middlegame(king_safety_bonus(board, Color::Black)),
+        endgame_phase,
     );
-    features.add(Color::White, threat_bonus(board, Color::White));
-    features.add(Color::Black, threat_bonus(board, Color::Black));
+    features.add(
+        Color::White,
+        TaperedScore::equal(threat_bonus(board, Color::White)),
+        endgame_phase,
+    );
+    features.add(
+        Color::Black,
+        TaperedScore::equal(threat_bonus(board, Color::Black)),
+        endgame_phase,
+    );
     features.net(board.side_to_move)
 }
 
@@ -1575,7 +1665,7 @@ mod tests {
 
     use super::{
         Bound, ClockControl, OpeningBook, SearchLimits, Searcher, SyzygyTablebases,
-        TranspositionEntry, TranspositionTable, evaluate_position, late_move_reduction,
+        TaperedScore, TranspositionEntry, TranspositionTable, evaluate_position, late_move_reduction,
         passed_pawn_extension, static_exchange_evaluation, threat_bonus, history_index,
     };
 
@@ -1588,6 +1678,15 @@ mod tests {
 
         assert_ne!(history_index(quiet), history_index(different_destination));
         assert_ne!(history_index(queen_promotion), history_index(knight_promotion));
+    }
+
+    #[test]
+    fn tapered_scores_interpolate_between_phase_endpoints() {
+        let score = TaperedScore::new(120, 40);
+        assert_eq!(score.interpolate(0), 120);
+        assert_eq!(score.interpolate(24), 40);
+        assert_eq!(score.interpolate(12), 80);
+        assert_eq!(TaperedScore::equal(17).interpolate(9), 17);
     }
 
     #[test]
