@@ -2046,6 +2046,19 @@ mod tests {
     }
 
     #[test]
+    fn singular_extension_requires_a_deep_exact_non_mate_tt_entry() {
+        let entry = TranspositionEntry {
+            depth: 8,
+            score: 40,
+            bound: Bound::Exact,
+            best_move: Some(ChessMove::from_uci("e2e4").unwrap()),
+        };
+        assert!(can_try_singular_extension(6, false, true, entry));
+        assert!(!can_try_singular_extension(5, false, true, entry));
+        assert!(!can_try_singular_extension(6, true, true, entry));
+    }
+
+    #[test]
     fn syzygy_loader_reports_a_missing_tablebase_path_without_affecting_search() {
         assert!(SyzygyTablebases::load("missing-syzygy-tablebases").is_err());
     }
