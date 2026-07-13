@@ -1,15 +1,23 @@
-name: Engine Core Perft
+name: Rusty Fish Tests
 
 on:
   push:
     paths:
       - 'engine-core/**'
+      - 'engine-search/**'
+      - 'engine-bench/**'
+      - 'engine-uci/**'
+      - 'app-desktop/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/engine-core-perft.yml'
   pull_request:
     paths:
       - 'engine-core/**'
+      - 'engine-search/**'
+      - 'engine-bench/**'
+      - 'engine-uci/**'
+      - 'app-desktop/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/engine-core-perft.yml'
@@ -22,11 +30,21 @@ on:
         type: string
 
 jobs:
-  test:
+  workspace:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run engine-core test
+      - name: Run workspace tests
+        run: cargo test --workspace
+  engine-core:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run targeted engine-core test
         run: cargo test -p engine-core "${{ inputs.test_filter }}" -- --nocapture
