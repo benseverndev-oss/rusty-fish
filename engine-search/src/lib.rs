@@ -1192,6 +1192,18 @@ fn syzygy_score(wdl: SyzygyWdl, ply: i32) -> i32 {
     }
 }
 
+fn razor_margin(depth: u8) -> i32 {
+    120 + 80 * i32::from(depth)
+}
+
+fn reverse_futility_margin(depth: u8) -> i32 {
+    100 + 90 * i32::from(depth)
+}
+
+fn late_move_pruning_limit(depth: u8) -> usize {
+    3 + usize::from(depth) * 2
+}
+
 fn root_tablebase_search_result(root: SyzygyRootProbe) -> SearchResult {
     SearchResult {
         best_move: Some(root.best_move),
@@ -1755,7 +1767,8 @@ mod tests {
         SyzygyTablebases, SyzygyWdl, TaperedScore, TranspositionEntry, TranspositionTable,
         evaluate_position, history_index, late_move_reduction, passed_pawn_extension,
         promotion_from_tablebase, root_tablebase_search_result, static_exchange_evaluation,
-        syzygy_score, syzygy_wdl, threat_bonus,
+        syzygy_score, syzygy_wdl, threat_bonus, late_move_pruning_limit, razor_margin,
+        reverse_futility_margin,
     };
 
     #[test]
