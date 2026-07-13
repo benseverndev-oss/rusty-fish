@@ -1986,6 +1986,19 @@ mod tests {
     }
 
     #[test]
+    fn pruning_policy_excludes_check_and_mate_windows() {
+        assert!(!can_apply_static_pruning(2, true, 0, 50, true));
+        assert!(!can_apply_static_pruning(
+            2,
+            false,
+            MATE_SCORE - 512,
+            MATE_SCORE,
+            true,
+        ));
+        assert!(can_apply_static_pruning(2, false, 0, 50, true));
+    }
+
+    #[test]
     fn syzygy_loader_reports_a_missing_tablebase_path_without_affecting_search() {
         assert!(SyzygyTablebases::load("missing-syzygy-tablebases").is_err());
     }
