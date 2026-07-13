@@ -107,9 +107,10 @@ fn start_search(
     let (result_tx, result_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
         let mut searcher = Searcher::default();
+        let syzygy_probe_limit = options.syzygy_probe_limit;
         searcher.set_options(options);
         searcher.set_syzygy_tablebases(
-            syzygy_path.and_then(|path| SyzygyTablebases::load(&path).ok()),
+            syzygy_path.and_then(|path| SyzygyTablebases::load(&path, syzygy_probe_limit).ok()),
         );
         let result = searcher.search_with_stop_signal(&board, limits, worker_signal);
         let _ = result_tx.send(result);
@@ -154,6 +155,8 @@ fn write_uci_header(mut stdout: impl Write, options: &SearchOptions) -> io::Resu
     writeln!(stdout, "id name Rusty Fish")?;
     writeln!(stdout, "id author Ben Severn + Codex")?;
     writeln!(stdout, "option name SyzygyPath type string default")?;
+    writeln!(stdout, "option name SyzygyProbeDepth type spin default {} min 1 max 64", options.syzygy_probe_depth)?;
+    writeln!(stdout, "option name SyzygyProbeLimit type spin default {} min 3 max 7", options.syzygy_probe_limit)?;
     writeln!(
         stdout,
         "option name Hash type spin default {} min 1 max 1024",
@@ -224,6 +227,14 @@ fn apply_option(state: &mut EngineState, command: &str) -> Result<(), String> {
                 return Err(format!("Syzygy tablebase directory does not exist: {path}"));
             }
             state.syzygy_path = (!path.is_empty()).then_some(path);
+        }
+        "SyzygyProbeDepth" => {
+            let value = value.ok_or_else(|| "missing option value".to_string())?;
+            state.options.syzygy_probe_depth = value.parse::<u8>().map_err(|_| format!("invalid SyzygyProbeDepth value: {value}"))?.clamp(1, 64);
+        }
+        "SyzygyProbeLimit" => {
+            let value = value.ok_or_else(|| "missing option value".to_string())?;
+            state.options.syzygy_probe_limit = value.parse::<u8>().map_err(|_| format!("invalid SyzygyProbeLimit value: {value}"))?.clamp(3, 7);
         }
         "Hash" => {
             let value = value.ok_or_else(|| "missing option value".to_string())?;

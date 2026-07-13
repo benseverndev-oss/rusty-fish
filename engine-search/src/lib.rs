@@ -63,6 +63,8 @@ pub struct SearchOptions {
     pub max_depth: u8,
     pub hash_mb: usize,
     pub move_overhead: Duration,
+    pub syzygy_probe_depth: u8,
+    pub syzygy_probe_limit: u8,
 }
 
 impl Default for SearchOptions {
@@ -71,6 +73,8 @@ impl Default for SearchOptions {
             max_depth: 16,
             hash_mb: 16,
             move_overhead: Duration::from_millis(25),
+            syzygy_probe_depth: 1,
+            syzygy_probe_limit: 7,
         }
     }
 }
@@ -156,22 +160,23 @@ pub struct SyzygyRootProbe {
 
 pub struct SyzygyTablebases {
     tables: TableBases<RustyFishTablebaseAdapter>,
+    probe_limit: u8,
 }
 
 impl SyzygyTablebases {
-    pub fn load(path: &str) -> Result<Self, String> {
+    pub fn load(path: &str, probe_limit: u8) -> Result<Self, String> {
         if path.split(';').any(|entry| !Path::new(entry).is_dir()) {
             return Err(format!("Syzygy tablebase directory does not exist: {path}"));
         }
         TableBases::<RustyFishTablebaseAdapter>::new(path)
-            .map(|tables| Self { tables })
+            .map(|tables| Self { tables, probe_limit: probe_limit.clamp(3, 7) })
             .map_err(|error| format!("could not load Syzygy tablebases: {error:?}"))
     }
 
-    pub fn probe_wdl(&self, board: &Board) -> Option<SyzygyWdl> {
+    pub fn probe_wdl(&self, board: &Board, depth: u8, probe_depth: u8) -> Option<SyzygyWdl> {
         let white = board.occupancy(Color::White);
         let black = board.occupancy(Color::Black);
-        if (white | black).count_ones() > self.tables.max_pieces() {
+        if depth < probe_depth || (white | black).count_ones() > self.tables.max_pieces().min(u32::from(self.probe_limit)) {
             return None;
         }
         let ep = board.en_passant().map_or(0, |square| u32::from(square.0));
@@ -202,7 +207,7 @@ impl SyzygyTablebases {
     pub fn probe_root(&self, board: &Board) -> Option<SyzygyRootProbe> {
         let white = board.occupancy(Color::White);
         let black = board.occupancy(Color::Black);
-        if (white | black).count_ones() > self.tables.max_pieces() {
+        if (white | black).count_ones() > self.tables.max_pieces().min(u32::from(self.probe_limit)) {
             return None;
         }
         let ep = board.en_passant().map_or(0, |square| u32::from(square.0));
@@ -811,7 +816,7 @@ impl Searcher {
         if let Some(wdl) = self
             .syzygy
             .as_ref()
-            .and_then(|syzygy| syzygy.probe_wdl(board))
+            .and_then(|syzygy| syzygy.probe_wdl(board, depth, self.options.syzygy_probe_depth))
         {
             return (syzygy_score(wdl, ply), Vec::new());
         }
@@ -2130,7 +2135,19 @@ mod tests {
 
     #[test]
     fn syzygy_loader_reports_a_missing_tablebase_path_without_affecting_search() {
-        assert!(SyzygyTablebases::load("missing-syzygy-tablebases").is_err());
+        assert!(SyzygyTablebases::load("missing-syzygy-tablebases", 7).is_err());
+    }
+
+    #[test]
+    fn checksummed_kqvk_corpus_returns_exact_win_and_dtz() {
+        let Ok(path) = std::env::var("RUSTY_FISH_SYZYGY_TEST_DIR") else {
+            return;
+        };
+        let tables = SyzygyTablebases::load(&path, 3).expect("load checksummed KQvK corpus");
+        let board = Board::from_fen("7k/8/6K1/7Q/8/8/8/8 w - - 0 1").unwrap();
+        let root = tables.probe_root(&board).expect("KQvK root probe");
+        assert_eq!(root.wdl, SyzygyWdl::Win);
+        assert_eq!(root.dtz, 1);
     }
 
     #[test]
