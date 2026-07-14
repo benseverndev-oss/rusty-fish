@@ -1,5 +1,6 @@
 import pathlib
 import struct
+import subprocess
 import sys
 
 import pytest
@@ -75,6 +76,36 @@ def test_halfka_ladder_does_not_train_later_width_after_failed_evaluation():
     assert app._run_ordered_ladder([128, 256], train, evaluate, stop_on_failure=True) == [(128, False)]
     assert trained == [128]
     assert evaluated == [(128, 128)]
+
+
+@pytest.mark.parametrize("output", ["16\t0", "16\t0\t0\t0", "16\t-1\t1", "16\tno\t0"])
+def test_screen_shard_parser_rejects_truncated_or_malformed_parseable_wdl(output):
+    import app
+
+    with pytest.raises(ValueError, match="screen shard"):
+        app._parse_screen_shard_wdl(output)
+
+
+def test_screen_rejects_truncated_aggregate_before_sprt_or_report_write(monkeypatch):
+    import app
+
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        if command[1] == "gen-openings":
+            return subprocess.CompletedProcess(command, 0, stdout="\n".join("opening" for _ in range(192)))
+        if command[1] == "gate-file":
+            return subprocess.CompletedProcess(command, 0, stdout="16\t0\t0\n")
+        raise AssertionError(f"unexpected subprocess invocation: {command}")
+
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    monkeypatch.setattr(app, "_write_gate_outcome", lambda **_kwargs: pytest.fail("screen report was written"))
+
+    with pytest.raises(RuntimeError, match="192 games, not 384"):
+        app.run_screen.local(b"candidate", "run", {}, {}, "manifest", "config")
+
+    assert all(command[1] != "sprt" for command in calls)
 
 
 def test_load_samples_rejects_mixed_schema_or_feature_dimension(tmp_path):

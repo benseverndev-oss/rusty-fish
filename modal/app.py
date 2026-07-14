@@ -117,6 +117,14 @@ def _write_gate_outcome(**kwargs) -> dict:
     return outcome
 
 
+def _parse_screen_shard_wdl(output: str) -> tuple[int, int, int]:
+    """Require a complete nonnegative W/D/L result from one screen shard."""
+    fields = output.strip().split("\t")
+    if len(fields) != 3 or any(not field.isascii() or not field.isdigit() for field in fields):
+        raise ValueError("screen shard must output exactly three nonnegative integer W/D/L fields")
+    return tuple(int(field) for field in fields)
+
+
 def _corpus_payload(directory: str) -> str:
     return json.dumps({split: pathlib.Path(directory, f"{split}.tsv").read_text(encoding="utf-8")
                        for split in ("train", "validation", "test")}, sort_keys=True)
@@ -234,9 +242,11 @@ def run_screen(net_bytes: bytes, run_id: str, candidate_report: dict, control_re
             opening_file = root / f"openings-{shard}.txt"
             opening_file.write_text("\n".join(openings[shard * openings_per_shard:(shard + 1) * openings_per_shard]), encoding="utf-8")
             result = subprocess.run([BIN, "gate-file", str(net), "5", str(opening_file), "100"], capture_output=True, text=True, check=True)
-            for index, value in enumerate(result.stdout.strip().split("\t")):
-                totals[index] += int(value)
+            for index, value in enumerate(_parse_screen_shard_wdl(result.stdout)):
+                totals[index] += value
     score = tuple(totals)
+    if sum(score) != 384:
+        raise RuntimeError(f"{run_id}: screen returned {sum(score)} games, not 384")
     sprt_text = subprocess.run(
         [BIN, "sprt", *(str(value) for value in score)], capture_output=True,
         text=True, check=True,
