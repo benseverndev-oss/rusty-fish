@@ -20,6 +20,12 @@ use engine_search::{
 /// magnitude so the regression stays well-conditioned.
 const TARGET_CLAMP: i32 = 10_000;
 
+/// Error magnitude (centipawns) beyond which the training gradient is clipped —
+/// a Huber-style robust loss. Large, high-variance deep-search targets otherwise
+/// produce exploding updates that make the network diverge; clipping keeps every
+/// gradient in the same well-behaved regime as small static-eval targets.
+const GRADIENT_ERROR_CLIP: f32 = 1_000.0;
+
 /// Divisor mirroring the quantised inference's `OUTPUT_SCALE`, so the float
 /// model and the exported integer model share the same output scaling.
 const OUTPUT_SCALE: f32 = 64.0;
@@ -172,8 +178,12 @@ impl FloatNet {
     fn sgd_step(&mut self, sample: &TrainingSample, learning_rate: f32) -> f32 {
         let (prediction, own, opp) = self.forward(sample);
         let error = prediction - sample.target;
-        // d(loss)/d(output) with loss = 0.5 * error^2 and output = pred * SCALE.
-        let grad_output = error / OUTPUT_SCALE;
+        // Clip the error that drives the gradient (Huber-style): beyond the clip
+        // the loss is linear, so a huge tactical target cannot explode the step.
+        // The reported loss below still uses the true squared error.
+        let clipped_error = error.clamp(-GRADIENT_ERROR_CLIP, GRADIENT_ERROR_CLIP);
+        // d(loss)/d(output) with output = pred * SCALE.
+        let grad_output = clipped_error / OUTPUT_SCALE;
 
         self.output_bias -= learning_rate * grad_output;
         for i in 0..self.hidden {
@@ -344,6 +354,27 @@ mod tests {
                 .zip(&search_samples)
                 .any(|(a, b)| (a.target - b.target).abs() > f32::EPSILON),
             "deep-search labels should differ from static labels on some positions",
+        );
+    }
+
+    #[test]
+    fn deep_search_labels_do_not_diverge() {
+        // Depth-labelled targets are large and high-variance; before gradient
+        // clipping they made SGD diverge (loss increasing). Training must now
+        // reduce the loss on them.
+        let samples = generate_training_samples(SEEDS, 8, 11, Some(2)).expect("samples");
+        let config = TrainConfig {
+            hidden: 32,
+            epochs: 30,
+            learning_rate: 0.01,
+            seed: 4_242,
+        };
+        let (_net, report) = train_nnue(&samples, config).expect("training succeeds");
+        assert!(
+            report.final_loss < report.initial_loss,
+            "deep-search training should reduce loss, not diverge: {} -> {}",
+            report.initial_loss,
+            report.final_loss
         );
     }
 
