@@ -254,6 +254,9 @@ fn dataset_build() -> Result<(), String> {
     {
         return Err("dataset-build requires counts 400000 400000 200000; --smoke permits a total of at most 1000".to_string());
     }
+    if out_dir.exists() {
+        return Err(format!("refusing to modify existing dataset output {}", out_dir.display()));
+    }
 
     let mut records = Vec::with_capacity(total);
     append_records(&mut records, "random", random_count, 8, seed);
@@ -303,8 +306,6 @@ fn dataset_build() -> Result<(), String> {
         dataset_sha256: sha256_hex(&dataset_bytes),
         stockfish_config_sha256: None,
     };
-    std::fs::write(out_dir.join("positions.tsv"), &dataset_bytes)
-        .map_err(|error| format!("failed to write aggregate positions artifact: {error}"))?;
     write_manifest(&out_dir.join("manifest.tsv"), &manifest)
 }
 

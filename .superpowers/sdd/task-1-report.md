@@ -51,3 +51,10 @@
 - The build writes `positions.tsv` as the aggregate artifact used to bind the dataset bytes.
 - Source generation now dispatches separate random-walk, opening-derived, and quiet-walk paths; quiet paths choose only non-capture, non-promotion moves and exclude positions leaving the side to move in check.
 - Re-ran `cargo test -p engine-bench dataset::tests` (5 passed) and the smoke dataset build (passed).
+
+## Corpus immutability and integrity follow-up
+
+- The CLI now refuses an existing output directory before it creates any artifact, so reruns cannot modify a manifest-bound corpus.
+- Artifact verification now validates the manifest before shard indexing and recomputes source counts from shard records in addition to split counts and digests.
+- Removed the unbound `positions.tsv` aggregate output; the manifest contract is the three fixed split shards and their aggregate digest.
+- Focused tests and a fresh smoke build passed.

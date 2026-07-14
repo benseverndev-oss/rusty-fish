@@ -230,6 +230,7 @@ pub fn read_manifest(path: &Path) -> Result<DatasetManifest, String> {
             .ok_or_else(|| "manifest is missing dataset_sha256".to_string())?,
         stockfish_config_sha256,
     };
+    validate_manifest(&manifest)?;
     verify_manifest_artifacts(path, &manifest)?;
     Ok(manifest)
 }
@@ -241,14 +242,21 @@ fn verify_manifest_artifacts(path: &Path, manifest: &DatasetManifest) -> Result<
     if artifact_paths.iter().all(|artifact| !artifact.exists()) { return Ok(()); }
     if artifact_paths.iter().any(|artifact| !artifact.exists()) { return Err("manifest shard set is incomplete".into()); }
     let mut all_bytes = Vec::new();
+    let mut source_counts = BTreeMap::new();
     for (index, artifact) in artifact_paths.iter().enumerate() {
         let bytes = fs::read(artifact).map_err(|error| format!("failed to read {}: {error}", artifact.display()))?;
         if sha256_hex(&bytes) != manifest.shard_sha256[index] { return Err(format!("shard digest mismatch: {}", artifact.display())); }
-        let rows = std::str::from_utf8(&bytes).map_err(|_| "shard is not UTF-8")?.lines().skip(1).count();
+        let text = std::str::from_utf8(&bytes).map_err(|_| "shard is not UTF-8")?;
+        let rows = text.lines().skip(1).count();
         if rows != *manifest.split_counts.get(names[index]).unwrap_or(&usize::MAX) { return Err("shard count mismatch".into()); }
+        for row in text.lines().skip(1) {
+            let (_, source) = row.split_once('\t').ok_or_else(|| "invalid shard record".to_string())?;
+            *source_counts.entry(source.to_string()).or_insert(0_usize) += 1;
+        }
         all_bytes.extend_from_slice(&bytes);
     }
     if sha256_hex(&all_bytes) != manifest.dataset_sha256 { return Err("dataset digest mismatch".into()); }
+    if source_counts != manifest.source_counts { return Err("source count mismatch".into()); }
     Ok(())
 }
 
