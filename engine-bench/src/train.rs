@@ -12,7 +12,13 @@
 //! that exceeds it.
 
 use engine_core::{Board, Color};
-use engine_search::{active_features, hand_crafted_evaluation, Nnue, INPUT_DIMENSION};
+use engine_search::{
+    active_features, hand_crafted_evaluation, Nnue, SearchLimits, Searcher, INPUT_DIMENSION,
+};
+
+/// Search scores can reach mate values; training targets are clamped to this
+/// magnitude so the regression stays well-conditioned.
+const TARGET_CLAMP: i32 = 10_000;
 
 /// Divisor mirroring the quantised inference's `OUTPUT_SCALE`, so the float
 /// model and the exported integer model share the same output scaling.
@@ -37,23 +43,43 @@ pub struct TrainingSample {
 }
 
 /// Generates training samples by walking a random (seeded) legal game from each
-/// seed position, recording every position labelled with the hand-crafted
-/// evaluation.
+/// seed position, recording every position with a teacher label.
+///
+/// When `label_depth` is `None` the label is the static hand-crafted
+/// evaluation. When it is `Some(depth)` the label is a depth-`depth` search
+/// score (with the hand-crafted evaluation at the leaves), which distils search
+/// knowledge into the static network and is a stronger teacher than the static
+/// evaluation alone.
 pub fn generate_training_samples(
     seeds: &[&str],
     plies: u32,
     seed: u64,
+    label_depth: Option<u8>,
 ) -> Result<Vec<TrainingSample>, String> {
     let mut rng = Lcg::new(seed);
+    let mut labeler = Searcher::default();
     let mut samples = Vec::new();
     for fen in seeds {
         let mut board = Board::from_fen(fen)?;
         for _ in 0..plies {
             let stm = board.side_to_move;
+            let target = match label_depth {
+                None => hand_crafted_evaluation(&board),
+                Some(depth) => labeler
+                    .search(
+                        &board,
+                        SearchLimits {
+                            depth: Some(depth),
+                            ..SearchLimits::default()
+                        },
+                    )
+                    .score_cp
+                    .clamp(-TARGET_CLAMP, TARGET_CLAMP),
+            };
             samples.push(TrainingSample {
                 own: active_features(&board, stm),
                 opp: active_features(&board, opposite(stm)),
-                target: hand_crafted_evaluation(&board) as f32,
+                target: target as f32,
             });
             let moves = board.generate_legal_move_list();
             if moves.is_empty() {
@@ -299,15 +325,31 @@ mod tests {
 
     #[test]
     fn training_generates_labelled_samples() {
-        let samples = generate_training_samples(SEEDS, 8, 1).expect("samples");
+        let samples = generate_training_samples(SEEDS, 8, 1, None).expect("samples");
         assert!(!samples.is_empty());
         // Every sample records the pieces on the board from both perspectives.
         assert!(samples.iter().all(|sample| !sample.own.is_empty() && !sample.opp.is_empty()));
     }
 
     #[test]
+    fn deep_search_labels_differ_from_the_static_evaluation() {
+        let static_samples = generate_training_samples(SEEDS, 6, 3, None).expect("static");
+        let search_samples = generate_training_samples(SEEDS, 6, 3, Some(3)).expect("search");
+        assert_eq!(static_samples.len(), search_samples.len());
+        // Same positions (identical features), but the depth-3 search labels
+        // reflect tactics the static evaluation misses, so some targets differ.
+        assert!(
+            static_samples
+                .iter()
+                .zip(&search_samples)
+                .any(|(a, b)| (a.target - b.target).abs() > f32::EPSILON),
+            "deep-search labels should differ from static labels on some positions",
+        );
+    }
+
+    #[test]
     fn training_reduces_loss_and_beats_a_zero_predictor() {
-        let samples = generate_training_samples(SEEDS, 12, 7).expect("samples");
+        let samples = generate_training_samples(SEEDS, 12, 7, None).expect("samples");
         let zero_loss: f32 = samples
             .iter()
             .map(|sample| 0.5 * sample.target * sample.target)
