@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use engine_bench::{
-    DEFAULT_TACTICAL_SUITE, ExternalMatchConfig, MatchConfig, SpsaConfig, SprtConfig,
-    external_tsv_report, measure_throughput, run_external_opponent_match, run_fixed_opponent_match,
-    run_nnue_gauntlet, run_spsa_campaign, run_tactical_suite, spsa_tsv_report, sprt, sprt_tsv_report,
-    summarize, tactical_tsv_report, throughput_tsv_report,
+    DEFAULT_TACTICAL_SUITE, ExternalMatchConfig, MatchConfig, MatchScore, SpsaConfig, SprtConfig,
+    external_tsv_report, measure_throughput, random_opening_fens, run_external_opponent_match,
+    run_fixed_opponent_match, run_nnue_gauntlet, run_spsa_campaign, run_tactical_suite,
+    spsa_tsv_report, sprt, sprt_tsv_report, summarize, tactical_tsv_report, throughput_tsv_report,
 };
 use engine_bench::train::{generate_training_samples, train_nnue, TrainConfig};
 use engine_search::{Nnue, SearchParams};
@@ -141,10 +141,93 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
 
+    // --- Sharded primitives for parallel (e.g. Modal) orchestration ---
+    if std::env::args().nth(1).as_deref() == Some("gen-data") {
+        // gen-data <plies> <label_depth> <seed>: emit labelled samples as TSV
+        // (target, own-feature CSV, opp-feature CSV) for an external trainer.
+        let plies = arg_u32(2).unwrap_or(48);
+        let label_depth = arg_u32(3).and_then(|d| u8::try_from(d).ok()).filter(|d| *d > 0);
+        let seed = arg_u64(4).unwrap_or(1);
+        let samples = generate_training_samples(EXTERNAL_SPRT_POSITIONS, plies, seed, label_depth)?;
+        for sample in &samples {
+            println!(
+                "{}\t{}\t{}",
+                sample.target,
+                join_usize(&sample.own),
+                join_usize(&sample.opp)
+            );
+        }
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("gen-openings") {
+        // gen-openings <count> <plies> <seed>: emit random opening FENs.
+        let count = arg_u32(2).unwrap_or(64) as usize;
+        let plies = arg_u32(3).unwrap_or(8);
+        let seed = arg_u64(4).unwrap_or(1);
+        for fen in random_opening_fens(count, plies, seed) {
+            println!("{fen}");
+        }
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("gate-file") {
+        // gate-file <net> <depth> <openings_file>: play NNUE candidate vs
+        // hand-crafted baseline over the file's openings; emit "W\tD\tL".
+        let path = std::env::args()
+            .nth(2)
+            .ok_or_else(|| "usage: gate-file <net> <depth> <openings_file>".to_string())?;
+        let depth = arg_u32(3).and_then(|d| u8::try_from(d).ok()).unwrap_or(4);
+        let openings_path = std::env::args()
+            .nth(4)
+            .ok_or_else(|| "usage: gate-file <net> <depth> <openings_file>".to_string())?;
+        let net = Nnue::from_file(&path)?;
+        let contents = std::fs::read_to_string(&openings_path)
+            .map_err(|error| format!("failed to read openings {openings_path}: {error}"))?;
+        let fens: Vec<&str> = contents.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let config = MatchConfig {
+            candidate_depth: depth,
+            baseline_depth: depth,
+            max_plies: 160,
+        };
+        let records = run_nnue_gauntlet(&fens, std::sync::Arc::new(net), config)?;
+        let score = summarize(&records);
+        println!("{}\t{}\t{}", score.wins, score.draws, score.losses);
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("sprt") {
+        // sprt <wins> <draws> <losses>: SPRT verdict from aggregated counts.
+        let wins = arg_u32(2).unwrap_or(0);
+        let draws = arg_u32(3).unwrap_or(0);
+        let losses = arg_u32(4).unwrap_or(0);
+        let score = MatchScore { wins, draws, losses };
+        print!("{}", sprt_tsv_report(score, SprtConfig::default()));
+        let decision = sprt(score, SprtConfig::default()).map(|result| result.decision);
+        eprintln!(
+            "sprt: {wins}W {draws}D {losses}L; elo {}; decision = {decision:?}",
+            score.elo_difference().map_or_else(|| "n/a".to_string(), |elo| format!("{elo:.1}")),
+        );
+        return Ok(());
+    }
+
     let samples = BENCHMARKS
         .iter()
         .map(|(fen, depth)| measure_throughput(fen, *depth))
         .collect::<Result<Vec<_>, _>>()?;
     print!("{}", throughput_tsv_report(&samples));
     Ok(())
+}
+
+fn arg_u32(index: usize) -> Option<u32> {
+    std::env::args().nth(index).and_then(|arg| arg.parse::<u32>().ok())
+}
+
+fn arg_u64(index: usize) -> Option<u64> {
+    std::env::args().nth(index).and_then(|arg| arg.parse::<u64>().ok())
+}
+
+fn join_usize(values: &[usize]) -> String {
+    values
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }

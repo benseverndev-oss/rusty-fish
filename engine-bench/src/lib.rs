@@ -356,6 +356,49 @@ pub fn run_nnue_gauntlet(
     Ok(records)
 }
 
+/// Generates `count` distinct opening positions by walking random legal moves
+/// from the start position. Used to give a parallel SPRT gate enough opening
+/// diversity for a decisive verdict (the engines are deterministic, so each
+/// opening yields one game per colour).
+pub fn random_opening_fens(count: usize, plies: u32, seed: u64) -> Vec<String> {
+    let mut fens = Vec::with_capacity(count);
+    for index in 0..count {
+        let mut rng = SplitMix64::new(seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut board = Board::startpos();
+        for _ in 0..plies {
+            let moves = board.generate_legal_move_list();
+            if moves.is_empty() {
+                break;
+            }
+            let choice = (rng.next_u64() % moves.as_slice().len() as u64) as usize;
+            let mv = moves.as_slice()[choice];
+            if board.make_move(mv).is_err() {
+                break;
+            }
+        }
+        fens.push(board.to_fen());
+    }
+    fens
+}
+
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+}
+
 fn play_nnue_game(
     fen: &str,
     candidate_color: Color,
@@ -918,11 +961,23 @@ mod tests {
         SpsaConfig, SpsaRng, external_match_game_count, external_tsv_report, measure_throughput,
         run_spsa_campaign, run_tactical_suite, search_params_to_vector, spsa_tsv_report,
         spsa_update, sprt, tactical_solve_rate, tactical_tsv_report, throughput_tsv_report,
-        vector_to_search_params, MatchConfig, SprtConfig, SprtDecision, run_nnue_gauntlet,
-        summarize,
+        vector_to_search_params, MatchConfig, SprtConfig, SprtDecision, random_opening_fens,
+        run_nnue_gauntlet, summarize,
     };
     use engine_search::{Nnue, SearchParams};
     use std::sync::Arc;
+
+    #[test]
+    fn random_openings_are_legal_and_varied() {
+        let fens = random_opening_fens(8, 6, 42);
+        assert_eq!(fens.len(), 8);
+        for fen in &fens {
+            assert!(engine_core::Board::from_fen(fen).is_ok(), "opening FEN parses: {fen}");
+        }
+        // The walks diverge, so not every opening is identical.
+        let unique: std::collections::HashSet<&String> = fens.iter().collect();
+        assert!(unique.len() > 1, "openings should vary");
+    }
 
     #[test]
     fn nnue_gauntlet_plays_both_colours_for_each_position() {
