@@ -13,6 +13,7 @@ use engine_bench::dataset::{
     canonical_fen, deduplicate_and_split, sha256_hex, write_manifest,
 };
 use engine_search::{Nnue, SearchParams};
+use engine_core::Board;
 
 const BENCHMARKS: &[(&str, u8)] = &[
     (
@@ -302,6 +303,8 @@ fn dataset_build() -> Result<(), String> {
         dataset_sha256: sha256_hex(&dataset_bytes),
         stockfish_config_sha256: None,
     };
+    std::fs::write(out_dir.join("positions.tsv"), &dataset_bytes)
+        .map_err(|error| format!("failed to write aggregate positions artifact: {error}"))?;
     write_manifest(&out_dir.join("manifest.tsv"), &manifest)
 }
 
@@ -311,7 +314,7 @@ fn append_records(records: &mut Vec<PositionRecord>, source: &str, count: usize,
     let mut batch = 0_u64;
     while records.len() < target_len {
         let remaining = target_len - records.len();
-        for fen in random_opening_fens(remaining.saturating_mul(2).max(16), plies, seed.wrapping_add(batch)) {
+        for fen in source_fens(source, remaining.saturating_mul(2).max(16), plies, seed.wrapping_add(batch)) {
             if let Ok(fen) = canonical_fen(&fen)
                 && seen.insert(fen.clone())
             {
@@ -326,6 +329,35 @@ fn append_records(records: &mut Vec<PositionRecord>, source: &str, count: usize,
         }
         batch = batch.wrapping_add(1);
     }
+}
+
+fn source_fens(source: &str, count: usize, plies: u32, seed: u64) -> Vec<String> {
+    match source {
+        // Random samples use varying legal-walk lengths; opening samples deliberately use the
+        // established opening generator; quiet samples are admitted only after a quiet move.
+        "random" => random_opening_fens(count, (seed as u32 % plies.max(1)).max(1), seed),
+        "opening" => random_opening_fens(count, plies.max(12), seed),
+        "quiet" => quiet_walk_fens(count, plies, seed),
+        _ => Vec::new(),
+    }
+}
+
+fn quiet_walk_fens(count: usize, plies: u32, mut seed: u64) -> Vec<String> {
+    let mut output = Vec::with_capacity(count);
+    for _ in 0..count.saturating_mul(4).max(16) {
+        let mut board = Board::startpos();
+        for _ in 0..plies.max(1) {
+            let moves = board.generate_legal_move_list();
+            let quiet: Vec<_> = moves.as_slice().iter().copied().filter(|mv| board.piece_at(mv.to).is_none() && mv.promotion.is_none()).collect();
+            if quiet.is_empty() { break; }
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let mv = quiet[(seed as usize) % quiet.len()];
+            if board.make_move(mv).is_err() { break; }
+        }
+        if !board.in_check(board.side_to_move) { output.push(board.to_fen()); }
+        if output.len() == count { break; }
+    }
+    output
 }
 
 fn arg_u32(index: usize) -> Option<u32> {

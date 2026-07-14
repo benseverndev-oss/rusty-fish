@@ -221,7 +221,7 @@ pub fn read_manifest(path: &Path) -> Result<DatasetManifest, String> {
             _ => return Err(format!("invalid dataset manifest line: {line}")),
         }
     }
-    Ok(DatasetManifest {
+    let manifest = DatasetManifest {
         run_id: run_id.ok_or_else(|| "manifest is missing run_id".to_string())?,
         source_counts,
         split_counts,
@@ -229,7 +229,27 @@ pub fn read_manifest(path: &Path) -> Result<DatasetManifest, String> {
         dataset_sha256: dataset_sha256
             .ok_or_else(|| "manifest is missing dataset_sha256".to_string())?,
         stockfish_config_sha256,
-    })
+    };
+    verify_manifest_artifacts(path, &manifest)?;
+    Ok(manifest)
+}
+
+fn verify_manifest_artifacts(path: &Path, manifest: &DatasetManifest) -> Result<(), String> {
+    let directory = path.parent().ok_or_else(|| "manifest has no parent directory".to_string())?;
+    let names = [TRAIN_SPLIT, VALIDATION_SPLIT, TEST_SPLIT];
+    let artifact_paths: Vec<_> = names.iter().map(|name| directory.join(format!("{name}.tsv"))).collect();
+    if artifact_paths.iter().all(|artifact| !artifact.exists()) { return Ok(()); }
+    if artifact_paths.iter().any(|artifact| !artifact.exists()) { return Err("manifest shard set is incomplete".into()); }
+    let mut all_bytes = Vec::new();
+    for (index, artifact) in artifact_paths.iter().enumerate() {
+        let bytes = fs::read(artifact).map_err(|error| format!("failed to read {}: {error}", artifact.display()))?;
+        if sha256_hex(&bytes) != manifest.shard_sha256[index] { return Err(format!("shard digest mismatch: {}", artifact.display())); }
+        let rows = std::str::from_utf8(&bytes).map_err(|_| "shard is not UTF-8")?.lines().skip(1).count();
+        if rows != *manifest.split_counts.get(names[index]).unwrap_or(&usize::MAX) { return Err("shard count mismatch".into()); }
+        all_bytes.extend_from_slice(&bytes);
+    }
+    if sha256_hex(&all_bytes) != manifest.dataset_sha256 { return Err("dataset digest mismatch".into()); }
+    Ok(())
 }
 
 fn validate_manifest(manifest: &DatasetManifest) -> Result<(), String> {

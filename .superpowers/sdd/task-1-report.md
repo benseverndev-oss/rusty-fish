@@ -44,3 +44,10 @@
 - Added manifest immutability, SHA-256 syntax validation, and duplicate singleton/map-field rejection.
 - Corpus construction now keeps a cross-source canonical-FEN set while replenishing each requested source, then asserts the post-dedup source and total counts before writing shards.
 - Focused verification: `cargo test -p engine-bench dataset::tests` (5 passed) and the smoke `dataset-build` command (passed).
+
+## Final reviewer follow-up
+
+- `read_manifest` now recomputes and verifies each present train/validation/test shard digest, split count, and aggregate dataset digest from artifact bytes.
+- The build writes `positions.tsv` as the aggregate artifact used to bind the dataset bytes.
+- Source generation now dispatches separate random-walk, opening-derived, and quiet-walk paths; quiet paths choose only non-capture, non-promotion moves and exclude positions leaving the side to move in check.
+- Re-ran `cargo test -p engine-bench dataset::tests` (5 passed) and the smoke dataset build (passed).
