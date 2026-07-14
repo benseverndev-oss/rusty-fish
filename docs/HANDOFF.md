@@ -68,6 +68,8 @@ null-move reduction) and are optimised by the SPSA tuner.
   only if it **passes**.
 - **Shardable sub-commands** (for parallel orchestration):
   `gen-data`, `gen-openings`, `gate-file`, `sprt`, plus `train` and `nnue-sprt`.
+  `gate-file` bounds each search to 100 ms by default (or an explicit final
+  `move_time_ms` argument), so one pathological position cannot stall a shard.
 
 ## Parallel pipeline
 
@@ -133,28 +135,32 @@ Other workflows: `engine-core-perft`, `external-stockfish-sprt`,
    container restart (it happened repeatedly), and Modal's gRPC can't leave the
    sandbox. GitHub Actions is the reliable cloud lever from here.
 
-## Current experiment (open)
+## Campaign result (2026-07-14)
 
-**Does a properly-trained (WDL) NNUE net beat the hand-crafted baseline?**
+**No: the first properly-trained WDL NNUE did not beat the hand-crafted
+baseline.**
 
-- The MSE-loss nets lost clearly (best ~−364 Elo, 0 wins).
-- The **WDL** net trains to a near-zero win-probability loss; the first
-  **decisive** gate is the `nnue-campaign.yml` run (12 shards, ~2,304 games).
-  Read its `verdict` job output / `sprt.tsv` + `net.rfnn` artifacts for the
-  answer. If it **passes**, adopt it as the default (next section). If not, the
-  aggregate W/D/L says how far off.
+- Decisive GitHub Actions campaign:
+  [`29342974072`](https://github.com/benseverndev-oss/rusty-fish/actions/runs/29342974072)
+  (64 plies, depth-6 labels, 150 epochs, depth-4 gate, 12 shards × 96
+  openings × two colours).
+- Training fit 1,024 samples from WDL loss 0.06 to 0.00, but the 2,304-game
+  gate scored **23W / 435D / 1846L**, estimated **−373.40 Elo**, with SPRT
+  **AcceptH0** (LLR −32.636; threshold ±2.944). Do **not** adopt this net.
+- All twelve gate shards completed in about two minutes after the bounded
+  search-time fix in PR #38, so this is a valid verdict rather than the old
+  stalled campaign.
 
 ## Next steps (prioritised)
 
-1. **Read the campaign verdict.** If the WDL net passes SPRT vs the baseline,
-   **adopt it as the default**: embed the `RFNN` via `include_bytes!` and load it
-   in `Searcher::default()` / the UCI binary, behind a clean toggle, gated on the
-   pass. This is the step that finally makes the engine measurably stronger.
-2. **If it doesn't pass**, raise capacity/teacher quality, in order of leverage:
+1. **Raise NNUE capacity and teacher quality.** The WDL objective is working,
+   but the current net is decisively weak. In order of leverage, try:
    a larger hidden layer (256+), **HalfKA king-bucketed** features, and stronger
    teachers — WDL game-outcome labels and **external Stockfish** labels (the UCI
    match harness already exists). Run these on a GPU via Modal (from your
-   machine) for turnaround.
+   machine) for turnaround, then repeat the same decisive gate.
+2. **Only after an SPRT pass**, embed the `RFNN` via `include_bytes!` and load it
+   in `Searcher::default()` / the UCI binary behind a clean toggle.
 3. **Engine wins independent of NNUE**: aggregate node reporting + `nps` across
    Lazy SMP threads; a **lockless atomic** TT (replaces the sharded-mutex one)
    for better scaling; **Ponder** and **MultiPV** UCI options; an SPSA campaign
@@ -170,13 +176,16 @@ Other workflows: `engine-core-perft`, `external-stockfish-sprt`,
   it (`git checkout Cargo.lock`) — it is not a real change.
 - **Modal auth**: needs your account/token and a network that permits Modal's
   gRPC; if you ever pass a token where it could be logged, rotate it afterward.
+- **Gate liveness**: keep the bounded `gate-file` move time enabled. The original
+  2,304-game run stalled because a depth-only search could take arbitrarily long;
+  PR #38 fixes that with a 100 ms default.
 - One harmless pre-existing warning: `mut callback` at `engine-search/src/lib.rs`
   (predates this work).
 
 ## Merged this session
 
-PRs **#29–#36** on `main`: Lazy SMP; SPSA tuning; NNUE foundation; incremental
+PRs **#29–#38** on `main`: Lazy SMP; SPSA tuning; NNUE foundation; incremental
 accumulator + bootstrap trainer; deep-search training target; NNUE-vs-baseline
 SPRT gate; trainer gradient-clipping fix; configurable epochs/LR; WDL sigmoid
-loss; and the Modal + Actions parallel pipeline. Design specs and plans for each
-are under `docs/superpowers/`.
+loss; the Modal + Actions parallel pipeline; and bounded gate search time. Design
+specs and plans for each are under `docs/superpowers/`.
