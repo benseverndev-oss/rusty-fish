@@ -90,6 +90,23 @@ modal run --write-result stockfish-config.tsv modal/app.py::calibrate_run --run-
   confirms the global `--write-result` option; function help for
   `modal/app.py::calibrate_run` confirms `--run-id` and `--smoke`.
 
+## Early Stockfish completion remediation
+
+Real Stockfish accepted `go nodes 25000` and returned a valid score and
+`bestmove` after 6,624 nodes, which is legitimate when search finishes early.
+The labeler incorrectly rejected that response for being below the requested
+limit. The requested `go nodes` commands (25k/100k/400k during calibration)
+are unchanged; the recorded label now retains Stockfish's actual reported node
+count without treating an early valid completion as an error.
+
+- RED: `cargo test -p engine-bench stockfish::tests::fake_transport_accepts_valid_early_completion_and_records_reported_nodes`
+  failed because the shared reported-node parser and label finalizer did not exist.
+- GREEN: the same test passed, accepting a score/bestmove at 6,624 nodes after
+  `go nodes 25000` and recording `nodes == 6624`.
+- Focused/full verification: `cargo fmt --check -p engine-bench`; `cargo test -p engine-bench`
+  (42 passed); and `C:\Users\bsevern\AppData\Local\Programs\Python\Python312\python.exe -m pytest modal/test_train_nnue.py -q`
+  (18 passed, 2 existing local-execution warnings).
+
 ## Modal image-path remediation
 
 Real Modal image construction exposed a path collision: the Stockfish archive

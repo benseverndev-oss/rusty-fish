@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod tests {
-    use super::{calibration_candidates, choose_budget, parse_info_score, StockfishLabel, MATE_LABEL_CP};
+    use super::{
+        MATE_LABEL_CP, StockfishLabel, calibration_candidates, choose_budget, parse_info_score,
+    };
     use std::collections::VecDeque;
 
     trait UciTransport {
@@ -38,6 +40,7 @@ mod tests {
         transport.send(&format!("position fen {fen}"))?;
         transport.send(&format!("go nodes {nodes}"))?;
         let mut score = None;
+        let mut reported_nodes = None;
         loop {
             let line = transport.next_line()?;
             if line.starts_with("child-error") {
@@ -46,14 +49,11 @@ mod tests {
             if let Some(value) = super::parse_info_score_checked(&line)? {
                 score = Some(value);
             }
-            if line.starts_with("bestmove ") {
-                return score
-                    .map(|score_cp| super::StockfishLabel {
-                        fen: fen.to_string(),
-                        score_cp,
-                        nodes,
-                    })
-                    .ok_or_else(|| "missing score".to_string());
+            if let Some(value) = super::parse_info_nodes(&line) {
+                reported_nodes = Some(value);
+            }
+            if let Some(bestmove) = line.strip_prefix("bestmove ") {
+                return super::finish_stockfish_label(fen, score, reported_nodes, bestmove);
             }
         }
     }
@@ -83,8 +83,17 @@ mod tests {
 
     #[test]
     fn calibration_compares_each_lower_budget_to_the_400k_reference() {
-        let labels = |score_cp| vec![StockfishLabel { fen: "fen".to_string(), score_cp, nodes: 1 }];
-        assert_eq!(calibration_candidates(&labels(0), &labels(100), &labels(10)), [(25_000, 10), (100_000, 90)]);
+        let labels = |score_cp| {
+            vec![StockfishLabel {
+                fen: "fen".to_string(),
+                score_cp,
+                nodes: 1,
+            }]
+        };
+        assert_eq!(
+            calibration_candidates(&labels(0), &labels(100), &labels(10)),
+            [(25_000, 10), (100_000, 90)]
+        );
     }
 
     #[test]
@@ -107,6 +116,26 @@ mod tests {
                 "position fen fen",
                 "go nodes 25000"
             ]
+        );
+    }
+
+    #[test]
+    fn fake_transport_accepts_valid_early_completion_and_records_reported_nodes() {
+        let mut transport = FakeUci {
+            commands: Vec::new(),
+            replies: VecDeque::from([
+                Ok("readyok".to_string()),
+                Ok("info depth 7 score cp 31 nodes 6624".to_string()),
+                Ok("bestmove e2e4".to_string()),
+            ]),
+        };
+
+        let label = evaluate_one_with_transport(&mut transport, "fen", 25_000).unwrap();
+        assert_eq!(label.score_cp, 31);
+        assert_eq!(label.nodes, 6_624);
+        assert_eq!(
+            transport.commands.last(),
+            Some(&"go nodes 25000".to_string())
         );
     }
 
@@ -184,17 +213,52 @@ fn parse_info_score_checked(line: &str) -> Result<Option<i32>, String> {
     let Some(index) = fields.iter().position(|field| *field == "score") else {
         return Ok(None);
     };
-    let score = fields.get(index..index + 3)
+    let score = fields
+        .get(index..index + 3)
         .ok_or_else(|| format!("malformed Stockfish score output: {line}"))?;
     match score {
-        ["score", "cp", value] => value.parse().map(Some).map_err(|_| format!("malformed Stockfish centipawn score: {line}")),
-        ["score", "mate", value] => value.parse::<i32>().map(|mate| Some(if mate.is_negative() {
-            -MATE_LABEL_CP
-        } else {
-            MATE_LABEL_CP
-        })).map_err(|_| format!("malformed Stockfish mate score: {line}")),
+        ["score", "cp", value] => value
+            .parse()
+            .map(Some)
+            .map_err(|_| format!("malformed Stockfish centipawn score: {line}")),
+        ["score", "mate", value] => value
+            .parse::<i32>()
+            .map(|mate| {
+                Some(if mate.is_negative() {
+                    -MATE_LABEL_CP
+                } else {
+                    MATE_LABEL_CP
+                })
+            })
+            .map_err(|_| format!("malformed Stockfish mate score: {line}")),
         _ => Err(format!("malformed Stockfish score output: {line}")),
     }
+}
+
+fn parse_info_nodes(line: &str) -> Option<u64> {
+    let fields: Vec<_> = line.split_whitespace().collect();
+    fields
+        .windows(2)
+        .find(|window| window[0] == "nodes")
+        .and_then(|window| window[1].parse().ok())
+}
+
+fn finish_stockfish_label(
+    fen: &str,
+    score: Option<i32>,
+    nodes: Option<u64>,
+    bestmove: &str,
+) -> Result<StockfishLabel, String> {
+    if bestmove.split_whitespace().next().unwrap_or_default() == "0000" {
+        return Err("Stockfish returned no legal move".into());
+    }
+    Ok(StockfishLabel {
+        fen: fen.to_string(),
+        score_cp: score
+            .ok_or_else(|| "Stockfish returned bestmove without a parseable score".to_string())?,
+        nodes: nodes
+            .ok_or_else(|| "Stockfish returned bestmove without reported nodes".to_string())?,
+    })
 }
 
 fn choose_budget(samples: &[(u64, i32)]) -> Option<u64> {
@@ -241,7 +305,9 @@ fn calibration_candidates(
 }
 
 fn p95_score_delta(actual: &[StockfishLabel], reference: &[StockfishLabel]) -> i32 {
-    let mut errors: Vec<i32> = actual.iter().zip(reference)
+    let mut errors: Vec<i32> = actual
+        .iter()
+        .zip(reference)
         .map(|(actual, reference)| (actual.score_cp - reference.score_cp).abs())
         .collect();
     errors.sort_unstable();
@@ -359,7 +425,7 @@ impl UciProcess {
     fn wait_for_score_and_bestmove(
         &mut self,
         fen: &str,
-        requested_nodes: u64,
+        _requested_nodes: u64,
     ) -> Result<StockfishLabel, String> {
         let mut score = None;
         let mut reported_nodes = None;
@@ -369,30 +435,12 @@ impl UciProcess {
                 if let Some(value) = parse_info_score_checked(&line)? {
                     score = Some(value);
                 }
-                let fields: Vec<_> = line.split_whitespace().collect();
-                if let Some(value) = fields
-                    .windows(2)
-                    .find(|window| window[0] == "nodes")
-                    .and_then(|window| window[1].parse().ok())
-                {
+                if let Some(value) = parse_info_nodes(&line) {
                     reported_nodes = Some(value);
                 }
             }
             if let Some(bestmove) = line.strip_prefix("bestmove ") {
-                if bestmove.split_whitespace().next().unwrap_or_default() == "0000" {
-                    return Err("Stockfish returned no legal move".into());
-                }
-                let score = score.ok_or_else(|| {
-                    "Stockfish returned bestmove without a parseable score".to_string()
-                })?;
-                let nodes = reported_nodes.ok_or_else(|| {
-                    "Stockfish returned bestmove without reported nodes".to_string()
-                })?;
-                if nodes < requested_nodes {
-                    return Err(format!(
-                        "Stockfish reported {nodes} nodes, below requested {requested_nodes}"
-                    ));
-                }
+                let label = finish_stockfish_label(fen, score, reported_nodes, bestmove)?;
                 if let Some(status) = self
                     .child
                     .try_wait()
@@ -402,11 +450,7 @@ impl UciProcess {
                         return Err(format!("Stockfish exited unsuccessfully: {status}"));
                     }
                 }
-                return Ok(StockfishLabel {
-                    fen: fen.to_string(),
-                    score_cp: score,
-                    nodes,
-                });
+                return Ok(label);
             }
         }
     }
