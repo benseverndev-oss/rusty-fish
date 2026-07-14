@@ -60,3 +60,11 @@ this report. Existing Task 1/2 worktree modifications were left untouched.
 - Added feature-dimension and sealed-test prediction-delta tests. Focused
   verification after this change: `uv run --with pytest --with torch python -m
   pytest modal -q` passed (3 tests).
+
+## Stockfish 18 correction
+
+The remote image now downloads the same official Stockfish 18 Ubuntu x86-64
+archive as the external-SPRT workflow and verifies archive SHA-256
+`5c6f38b02a4da5f3ffe763f27da6c3e743eebefd92b50cb3661623b96696adff` before
+extracting and using it. This replaces the incorrect Stockfish 15.1-4 package
+pin; the label-stage executable digest check remains in place.

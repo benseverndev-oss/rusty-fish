@@ -13,12 +13,19 @@ BIN = "/repo/target/release/engine-bench"
 SCHEMA = "v1"
 INPUT_DIMENSION = 768
 LEARNING_RATE = 1e-3
-STOCKFISH_PACKAGE = "stockfish=15.1-4"
-REMOTE_STOCKFISH = "/usr/games/stockfish"
+STOCKFISH_18_URL = "https://github.com/official-stockfish/Stockfish/releases/download/sf_18/stockfish-ubuntu-x86-64.tar"
+STOCKFISH_18_ARCHIVE_SHA256 = "5c6f38b02a4da5f3ffe763f27da6c3e743eebefd92b50cb3661623b96696adff"
+REMOTE_STOCKFISH = "/opt/stockfish/stockfish"
 
 rust_image = (
     modal.Image.debian_slim()
-    .apt_install("curl", "build-essential", "pkg-config", STOCKFISH_PACKAGE)
+    .apt_install("curl", "build-essential", "pkg-config")
+    .run_commands(
+        f"curl --fail --location --retry 3 --output /tmp/stockfish-18.tar {STOCKFISH_18_URL}",
+        f"echo '{STOCKFISH_18_ARCHIVE_SHA256}  /tmp/stockfish-18.tar' | sha256sum --check --status",
+        "mkdir -p /opt/stockfish && tar --extract --file /tmp/stockfish-18.tar --directory /opt/stockfish",
+        "stockfish=$(find /opt/stockfish -type f -name stockfish-ubuntu-x86-64 -print -quit) && test -n \"$stockfish\" && chmod +x \"$stockfish\" && ln -s \"$stockfish\" /opt/stockfish/stockfish",
+    )
     .run_commands("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable")
     .add_local_dir(REPO_ROOT, remote_path="/repo", copy=True)
     .run_commands("cd /repo && $HOME/.cargo/bin/cargo build --release -p engine-bench")

@@ -10,11 +10,13 @@ artifact; a conflicting result at that address is rejected.
 ## Prerequisites
 
 - A Modal account and authenticated CLI (`pip install modal`, then `modal token new`).
-- A Stockfish configuration calibrated against Stockfish **15.1-4**. The Modal
-  image installs that pinned package at `/usr/games/stockfish`, verifies its
-  SHA-256 against `binary_sha256` in the supplied config, then rewrites only the
-  config's binary path for the remote container. This prevents a caller-local
-  path from silently selecting a different engine remotely.
+- A Stockfish configuration calibrated against the exact Stockfish **18**
+  Ubuntu x86-64 release artifact. The Modal image downloads
+  `stockfish-ubuntu-x86-64.tar`, verifies the pinned archive SHA-256
+  `5c6f38b02a4da5f3ffe763f27da6c3e743eebefd92b50cb3661623b96696adff`, and
+  verifies the extracted executable against `binary_sha256` in the supplied
+  config before rewriting only the caller-local binary path for the remote
+  container.
 - Run from the repository root so the Modal images can build `engine-bench`.
 
 ## Run
