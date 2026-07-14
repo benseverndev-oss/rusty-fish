@@ -1,0 +1,123 @@
+name: NNUE Campaign
+
+# Trains a WDL network and grades it against the hand-crafted baseline with a
+# large, matrix-parallel SPRT gate — the shardable engine-bench primitives make
+# the gate decisive by fanning many games across runners.
+
+on:
+  workflow_dispatch:
+    inputs:
+      plies:
+        description: Plies of self-play per seed position (training data)
+        required: true
+        default: "64"
+        type: string
+      label_depth:
+        description: Search depth for teacher labels (0 = static evaluation)
+        required: true
+        default: "6"
+        type: string
+      epochs:
+        description: Training epochs
+        required: true
+        default: "150"
+        type: string
+      gate_depth:
+        description: Search depth for both sides in the gate
+        required: true
+        default: "4"
+        type: string
+      openings_per_shard:
+        description: Openings per gate shard (games/shard = 2x this)
+        required: true
+        default: "96"
+        type: string
+      gate_plies:
+        description: Random plies per generated opening
+        required: true
+        default: "8"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build engine-bench
+        run: cargo build --release -p engine-bench
+      - name: Train a WDL network
+        run: |
+          ./target/release/engine-bench train net.rfnn \
+            "${{ inputs.plies }}" "${{ inputs.label_depth }}" "${{ inputs.epochs }}"
+      - name: Upload network and binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: campaign-net
+          path: |
+            net.rfnn
+            target/release/engine-bench
+
+  gate:
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    steps:
+      - name: Download network and binary
+        uses: actions/download-artifact@v4
+        with:
+          name: campaign-net
+      - name: Play gate shard
+        run: |
+          chmod +x target/release/engine-bench
+          # Distinct openings per shard (seed = shard index) for game diversity.
+          ./target/release/engine-bench gen-openings \
+            "${{ inputs.openings_per_shard }}" "${{ inputs.gate_plies }}" "${{ matrix.shard }}" \
+            > openings.txt
+          ./target/release/engine-bench gate-file net.rfnn "${{ inputs.gate_depth }}" openings.txt \
+            > "wdl-${{ matrix.shard }}.tsv"
+          cat "wdl-${{ matrix.shard }}.tsv"
+      - name: Upload shard result
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-shard-${{ matrix.shard }}
+          path: wdl-${{ matrix.shard }}.tsv
+
+  verdict:
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download network and binary
+        uses: actions/download-artifact@v4
+        with:
+          name: campaign-net
+      - name: Download all gate shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gate-shard-*
+          merge-multiple: true
+          path: shards
+      - name: Aggregate and run SPRT
+        run: |
+          chmod +x target/release/engine-bench
+          wins=0; draws=0; losses=0
+          for file in shards/*.tsv; do
+            IFS=$'\t' read -r w d l < "$file"
+            wins=$((wins + w)); draws=$((draws + d)); losses=$((losses + l))
+          done
+          echo "aggregate: ${wins}W ${draws}D ${losses}L over $((wins + draws + losses)) games"
+          ./target/release/engine-bench sprt "$wins" "$draws" "$losses" | tee sprt.tsv
+      - name: Upload SPRT verdict
+        uses: actions/upload-artifact@v4
+        with:
+          name: campaign-verdict
+          path: sprt.tsv
