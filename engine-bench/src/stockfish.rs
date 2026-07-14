@@ -43,7 +43,7 @@ mod tests {
             if line.starts_with("child-error") {
                 return Err(line);
             }
-            if let Some(value) = super::parse_info_score(&line) {
+            if let Some(value) = super::parse_info_score_checked(&line)? {
                 score = Some(value);
             }
             if line.starts_with("bestmove ") {
@@ -72,8 +72,13 @@ mod tests {
 
     #[test]
     fn calibration_chooses_lowest_budget_within_twenty_cp_p95() {
-        assert_eq!(choose_budget(&[(25_000, 18), (100_000, 9)]), 25_000);
-        assert_eq!(choose_budget(&[(25_000, 24), (100_000, 14)]), 100_000);
+        assert_eq!(choose_budget(&[(25_000, 18), (100_000, 9)]), Some(25_000));
+        assert_eq!(choose_budget(&[(25_000, 24), (100_000, 14)]), Some(100_000));
+    }
+
+    #[test]
+    fn calibration_uses_400k_when_no_lower_budget_meets_the_p95_limit() {
+        assert_eq!(choose_budget(&[(25_000, 21), (100_000, 22)]), Some(400_000));
     }
 
     #[test]
@@ -121,6 +126,20 @@ mod tests {
             assert!(evaluate_one_with_transport(&mut transport, "fen", 25_000).is_err());
         }
     }
+
+    #[test]
+    fn fake_transport_rejects_malformed_score_even_when_a_valid_score_follows() {
+        let mut transport = FakeUci {
+            commands: Vec::new(),
+            replies: VecDeque::from([
+                Ok("readyok".to_string()),
+                Ok("info depth 9 score cp nope nodes 25000".to_string()),
+                Ok("info depth 10 score cp 17 nodes 25000".to_string()),
+                Ok("bestmove e2e4".to_string()),
+            ]),
+        };
+        assert!(evaluate_one_with_transport(&mut transport, "fen", 25_000).is_err());
+    }
 }
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -151,28 +170,33 @@ pub struct StockfishLabel {
 }
 
 pub fn parse_info_score(line: &str) -> Option<i32> {
+    parse_info_score_checked(line).ok().flatten()
+}
+
+fn parse_info_score_checked(line: &str) -> Result<Option<i32>, String> {
     let fields: Vec<_> = line.split_whitespace().collect();
-    let score = fields.windows(3).find(|window| window[0] == "score")?;
+    let Some(index) = fields.iter().position(|field| *field == "score") else {
+        return Ok(None);
+    };
+    let score = fields.get(index..index + 3)
+        .ok_or_else(|| format!("malformed Stockfish score output: {line}"))?;
     match score {
-        ["score", "cp", value] => value.parse().ok(),
-        ["score", "mate", value] => value.parse::<i32>().ok().map(|mate| {
-            if mate.is_negative() {
-                -MATE_LABEL_CP
-            } else {
-                MATE_LABEL_CP
-            }
-        }),
-        _ => None,
+        ["score", "cp", value] => value.parse().map(Some).map_err(|_| format!("malformed Stockfish centipawn score: {line}")),
+        ["score", "mate", value] => value.parse::<i32>().map(|mate| Some(if mate.is_negative() {
+            -MATE_LABEL_CP
+        } else {
+            MATE_LABEL_CP
+        })).map_err(|_| format!("malformed Stockfish mate score: {line}")),
+        _ => Err(format!("malformed Stockfish score output: {line}")),
     }
 }
 
-fn choose_budget(samples: &[(u64, i32)]) -> u64 {
+fn choose_budget(samples: &[(u64, i32)]) -> Option<u64> {
     samples
         .iter()
         .find(|(_, p95_error)| *p95_error <= 20)
         .map(|(budget, _)| *budget)
-        .or_else(|| samples.last().map(|(budget, _)| *budget))
-        .unwrap_or(0)
+        .or(Some(400_000))
 }
 
 pub fn label_positions(
@@ -186,26 +210,28 @@ pub fn label_positions(
         .collect()
 }
 
-/// Determines the least standard node budget whose 95th-percentile deviation
-/// from a 400k-node reference is at most 20 centipawns.
+/// Evaluates 25k, 100k, and 400k exactly, choosing the lowest budget whose
+/// P95 deviation from its next higher budget is at most 20 centipawns.
 pub fn calibrate_node_budget(config: &StockfishConfig, fens: &[String]) -> Result<u64, String> {
     if fens.is_empty() {
         return Err("cannot calibrate Stockfish with no positions".into());
     }
-    let reference = label_at_budget(config, fens, 400_000)?;
-    let mut candidates = Vec::new();
-    for budget in [25_000, 100_000, 250_000] {
-        let labels = label_at_budget(config, fens, budget)?;
-        let mut errors: Vec<i32> = labels
-            .iter()
-            .zip(&reference)
-            .map(|(actual, expected)| (actual.score_cp - expected.score_cp).abs())
-            .collect();
-        errors.sort_unstable();
-        let p95 = errors[((errors.len() * 95).saturating_add(99) / 100).saturating_sub(1)];
-        candidates.push((budget, p95));
-    }
-    Ok(choose_budget(&candidates))
+    let labels_25k = label_at_budget(config, fens, 25_000)?;
+    let labels_100k = label_at_budget(config, fens, 100_000)?;
+    let labels_400k = label_at_budget(config, fens, 400_000)?;
+    let candidates = [
+        (25_000, p95_score_delta(&labels_25k, &labels_100k)),
+        (100_000, p95_score_delta(&labels_100k, &labels_400k)),
+    ];
+    Ok(choose_budget(&candidates).expect("400k fallback is always present"))
+}
+
+fn p95_score_delta(actual: &[StockfishLabel], next_budget: &[StockfishLabel]) -> i32 {
+    let mut errors: Vec<i32> = actual.iter().zip(next_budget)
+        .map(|(actual, next)| (actual.score_cp - next.score_cp).abs())
+        .collect();
+    errors.sort_unstable();
+    errors[((errors.len() * 95).saturating_add(99) / 100).saturating_sub(1)]
 }
 
 fn label_at_budget(
@@ -326,7 +352,7 @@ impl UciProcess {
         loop {
             let line = self.next_line()?;
             if line.starts_with("info ") {
-                if let Some(value) = parse_info_score(&line) {
+                if let Some(value) = parse_info_score_checked(&line)? {
                     score = Some(value);
                 }
                 let fields: Vec<_> = line.split_whitespace().collect();

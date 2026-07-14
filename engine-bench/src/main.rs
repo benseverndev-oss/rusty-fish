@@ -260,10 +260,11 @@ fn stockfish_label() -> Result<(), String> {
     let labels = label_positions(&config, &fens)?;
     let mut output = String::new();
     for label in labels {
-        let board = Board::from_fen(&label.fen)?;
+        let fen = canonical_label_fen(&label.fen)?;
+        let board = Board::from_fen(&fen)?;
         let own = join_usize(&active_features(&board, board.side_to_move));
         let opp = join_usize(&active_features(&board, board.side_to_move.opposite()));
-        output.push_str(&format!("{}\t{}\t{}\t{}\t{}\n", label.score_cp, own, opp, label.fen, label.nodes));
+        output.push_str(&format!("{}\t{}\t{}\t{}\t{}\n", label.score_cp, own, opp, fen, label.nodes));
     }
     let out = Path::new(&args[5]);
     if out.exists() { return Err(format!("refusing to overwrite label output {}", out.display())); }
@@ -301,6 +302,10 @@ fn read_stockfish_config(path: &Path) -> Result<StockfishConfig, String> {
         node_budget: values.remove("node_budget").ok_or_else(|| "Stockfish config missing node_budget".to_string())?.parse().map_err(|_| "invalid node_budget".to_string())?,
         response_timeout: Duration::from_millis(values.remove("response_timeout_ms").ok_or_else(|| "Stockfish config missing response_timeout_ms".to_string())?.parse().map_err(|_| "invalid response_timeout_ms".to_string())?),
     })
+}
+
+fn canonical_label_fen(fen: &str) -> Result<String, String> {
+    canonical_fen(fen)
 }
 
 fn dataset_build() -> Result<(), String> {
@@ -455,7 +460,7 @@ fn join_usize(values: &[usize]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_records, deduplicate_and_split, reserve_output_directory};
+    use super::{append_records, canonical_label_fen, deduplicate_and_split, reserve_output_directory};
 
     #[test]
     fn generated_dataset_records_exclude_terminal_positions() {
@@ -474,5 +479,12 @@ mod tests {
         reserve_output_directory(&path).unwrap();
         assert!(reserve_output_directory(&path).is_err());
         std::fs::remove_dir(path).unwrap();
+    }
+
+    #[test]
+    fn label_fens_are_canonicalized_and_validated() {
+        let canonical = canonical_label_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 00 01").unwrap();
+        assert_eq!(canonical, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        assert!(canonical_label_fen("8/8/8/8/8/8/8/4K3 w - - 0 1").is_err());
     }
 }

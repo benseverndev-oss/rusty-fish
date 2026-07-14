@@ -39,3 +39,26 @@
 
 - Live Stockfish was not available in this workspace, so process interaction is covered through portable fake-UCI tests rather than an executable integration test.
 - The project has an existing `engine-search` unused-mut warning; this task introduces no new warnings in `engine-bench`.
+
+## Review-fix addendum
+
+### Root cause
+
+- Calibration compared every lower budget to a 400k reference, included an unrequested 250k candidate, and its selector returned the final candidate when no candidate met the tolerance.
+- The public parser represented both an absent `score` field and malformed score values as `None`; the UCI loop treated both as ignorable.
+- The CLI feature extraction parsed the label FEN but wrote the original text instead of the Task 1 canonical form.
+
+### Corrections
+
+- Calibration now evaluates exactly 25,000, 100,000, and 400,000 nodes. It compares 25k to 100k, then 100k to 400k; it selects the first P95 error at or below 20 cp and otherwise returns 400k. A timeout/error in any run propagates, so no budget is selected after a timed-out evaluation.
+- Added an internal checked score parser. Absent scores remain ignorable info lines, while malformed `score cp`/`score mate` records produce an immediate labeling error, including when followed by a valid score.
+- `stockfish-label` now calls Task 1 `canonical_fen` before deriving features and writing each TSV row, rejecting invalid FENs and emitting the canonical representation.
+
+### Review-fix TDD and verification
+
+1. Changed the no-qualifying-budget expectation to 400k; focused test failed with `left: None`, `right: Some(400000)` before the calibration implementation changed.
+2. Added regression coverage for malformed score then valid score, and canonicalization/validation of label FENs. Before the implementation, the focused test build failed because the checked parser and canonical label helper were absent; after implementation, all passed.
+3. `cargo test -p engine-bench stockfish::tests` — passed: 6 tests.
+4. `cargo test -p engine-bench --bin engine-bench label_fens_are_canonicalized_and_validated` — passed: 1 test.
+5. `cargo test -p engine-bench` — passed: 35 tests total (32 library, 3 binary tests).
+6. `git diff --check` — passed.
