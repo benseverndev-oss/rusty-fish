@@ -1,8 +1,10 @@
 use engine_bench::{
-    DEFAULT_TACTICAL_SUITE, ExternalMatchConfig, MatchConfig, SprtConfig, external_tsv_report,
-    measure_throughput, run_external_opponent_match, run_fixed_opponent_match, run_tactical_suite,
-    sprt_tsv_report, summarize, tactical_tsv_report, throughput_tsv_report,
+    DEFAULT_TACTICAL_SUITE, ExternalMatchConfig, MatchConfig, SpsaConfig, SprtConfig,
+    external_tsv_report, measure_throughput, run_external_opponent_match, run_fixed_opponent_match,
+    run_spsa_campaign, run_tactical_suite, spsa_tsv_report, sprt_tsv_report, summarize,
+    tactical_tsv_report, throughput_tsv_report,
 };
+use engine_search::SearchParams;
 
 const BENCHMARKS: &[(&str, u8)] = &[
     (
@@ -55,6 +57,15 @@ fn main() -> Result<(), String> {
         let records = run_external_opponent_match(EXTERNAL_SPRT_POSITIONS, &config)?;
         eprint!("{}", external_tsv_report(&records, &config));
         print!("{}", sprt_tsv_report(summarize(&records), SprtConfig::default()));
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("spsa") {
+        let mut config = SpsaConfig::default();
+        if let Some(iterations) = std::env::args().nth(2).and_then(|arg| arg.parse::<usize>().ok()) {
+            config.iterations = iterations;
+        }
+        let report = run_spsa_campaign(EXTERNAL_SPRT_POSITIONS, SearchParams::default(), config)?;
+        print!("{}", spsa_tsv_report(&report));
         return Ok(());
     }
 
