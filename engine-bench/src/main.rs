@@ -1,11 +1,13 @@
+use std::sync::Arc;
+
 use engine_bench::{
     DEFAULT_TACTICAL_SUITE, ExternalMatchConfig, MatchConfig, SpsaConfig, SprtConfig,
     external_tsv_report, measure_throughput, run_external_opponent_match, run_fixed_opponent_match,
-    run_spsa_campaign, run_tactical_suite, spsa_tsv_report, sprt_tsv_report, summarize,
-    tactical_tsv_report, throughput_tsv_report,
+    run_nnue_gauntlet, run_spsa_campaign, run_tactical_suite, spsa_tsv_report, sprt, sprt_tsv_report,
+    summarize, tactical_tsv_report, throughput_tsv_report,
 };
 use engine_bench::train::{generate_training_samples, train_nnue, TrainConfig};
-use engine_search::SearchParams;
+use engine_search::{Nnue, SearchParams};
 
 const BENCHMARKS: &[(&str, u8)] = &[
     (
@@ -96,6 +98,31 @@ fn main() -> Result<(), String> {
         eprintln!(
             "trained on {} samples ({teacher} labels): loss {:.2} -> {:.2}; wrote {path}",
             report.samples, report.initial_loss, report.final_loss
+        );
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("nnue-sprt") {
+        let path = std::env::args()
+            .nth(2)
+            .ok_or_else(|| "usage: nnue-sprt <network> [depth]".to_string())?;
+        let depth = std::env::args()
+            .nth(3)
+            .and_then(|arg| arg.parse::<u8>().ok())
+            .unwrap_or(4);
+        let net = Nnue::from_file(&path)?;
+        let config = MatchConfig {
+            candidate_depth: depth,
+            baseline_depth: depth,
+            max_plies: 120,
+        };
+        let records = run_nnue_gauntlet(EXTERNAL_SPRT_POSITIONS, Arc::new(net), config)?;
+        let score = summarize(&records);
+        print!("{}", sprt_tsv_report(score, SprtConfig::default()));
+        let decision = sprt(score, SprtConfig::default()).map(|result| result.decision);
+        eprintln!(
+            "nnue-sprt: candidate (NNUE {path}) vs baseline (hand-crafted) at depth {depth}: \
+             {}W {}D {}L; decision = {decision:?}",
+            score.wins, score.draws, score.losses,
         );
         return Ok(());
     }

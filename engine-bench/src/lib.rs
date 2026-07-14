@@ -1,11 +1,12 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
 use engine_core::{Board, Color, GameStatus};
-use engine_search::{SearchLimits, SearchParams, Searcher};
+use engine_search::{Nnue, SearchLimits, SearchParams, Searcher};
 
 pub mod train;
 
@@ -336,6 +337,64 @@ pub fn run_fixed_opponent_match(
         }
     }
     Ok(records)
+}
+
+/// Plays the NNUE-equipped engine (candidate) against the hand-crafted-eval
+/// engine (baseline) over each position and both colours. This is the SPRT gate
+/// that decides whether a trained network actually beats the current engine.
+pub fn run_nnue_gauntlet(
+    positions: &[&str],
+    net: Arc<Nnue>,
+    config: MatchConfig,
+) -> Result<Vec<GameRecord>, String> {
+    let mut records = Vec::with_capacity(positions.len() * 2);
+    for fen in positions {
+        for candidate_color in [Color::White, Color::Black] {
+            records.push(play_nnue_game(fen, candidate_color, &net, config)?);
+        }
+    }
+    Ok(records)
+}
+
+fn play_nnue_game(
+    fen: &str,
+    candidate_color: Color,
+    net: &Arc<Nnue>,
+    config: MatchConfig,
+) -> Result<GameRecord, String> {
+    let mut board = Board::from_fen(fen)?;
+    let mut candidate = Searcher::default();
+    candidate.set_nnue(Some(Arc::clone(net)));
+    let mut baseline = Searcher::default(); // hand-crafted evaluation
+    for ply in 0..config.max_plies {
+        let (depth, searcher) = if board.side_to_move == candidate_color {
+            (config.candidate_depth, &mut candidate)
+        } else {
+            (config.baseline_depth, &mut baseline)
+        };
+        let result = searcher.search(
+            &board,
+            SearchLimits {
+                depth: Some(depth),
+                ..SearchLimits::default()
+            },
+        );
+        let Some(mv) = result.best_move else {
+            return Ok(GameRecord {
+                fen: fen.to_string(),
+                candidate_color,
+                outcome: outcome_from_status(board.game_status(), candidate_color),
+                plies: ply,
+            });
+        };
+        board.make_move(mv)?;
+    }
+    Ok(GameRecord {
+        fen: fen.to_string(),
+        candidate_color,
+        outcome: GameOutcome::Draw,
+        plies: config.max_plies,
+    })
 }
 
 pub fn run_external_opponent_match(
@@ -859,9 +918,29 @@ mod tests {
         SpsaConfig, SpsaRng, external_match_game_count, external_tsv_report, measure_throughput,
         run_spsa_campaign, run_tactical_suite, search_params_to_vector, spsa_tsv_report,
         spsa_update, sprt, tactical_solve_rate, tactical_tsv_report, throughput_tsv_report,
-        vector_to_search_params, MatchConfig, SprtConfig, SprtDecision,
+        vector_to_search_params, MatchConfig, SprtConfig, SprtDecision, run_nnue_gauntlet,
+        summarize,
     };
-    use engine_search::SearchParams;
+    use engine_search::{Nnue, SearchParams};
+    use std::sync::Arc;
+
+    #[test]
+    fn nnue_gauntlet_plays_both_colours_for_each_position() {
+        let net = Arc::new(Nnue::from_seed(1, 8));
+        let config = MatchConfig {
+            candidate_depth: 2,
+            baseline_depth: 2,
+            max_plies: 12,
+        };
+        let records = run_nnue_gauntlet(
+            &["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"],
+            net,
+            config,
+        )
+        .expect("gauntlet runs");
+        assert_eq!(records.len(), 2);
+        assert_eq!(summarize(&records).games(), 2);
+    }
 
     #[test]
     fn spsa_rng_is_reproducible_and_seed_sensitive() {
