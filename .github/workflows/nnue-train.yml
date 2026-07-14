@@ -6,12 +6,17 @@ on:
       plies:
         description: Plies of self-play per seed position
         required: true
-        default: "32"
+        default: "64"
         type: string
       label_depth:
         description: Search depth for teacher labels (0 = static evaluation)
         required: true
         default: "6"
+        type: string
+      epochs:
+        description: Training epochs
+        required: true
+        default: "150"
         type: string
 
 permissions:
@@ -28,7 +33,8 @@ jobs:
         run: |
           mkdir -p artifacts
           cargo run --release -p engine-bench -- \
-            train artifacts/rusty-fish.rfnn "${{ inputs.plies }}" "${{ inputs.label_depth }}"
+            train artifacts/rusty-fish.rfnn \
+            "${{ inputs.plies }}" "${{ inputs.label_depth }}" "${{ inputs.epochs }}"
       - name: Gate the network against the baseline (SPRT)
         run: |
           cargo run --release -p engine-bench -- nnue-sprt artifacts/rusty-fish.rfnn 5 \
