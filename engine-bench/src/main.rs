@@ -85,7 +85,17 @@ fn main() -> Result<(), String> {
             .nth(4)
             .and_then(|arg| arg.parse::<u8>().ok())
             .filter(|depth| *depth > 0);
-        let config = TrainConfig::default();
+        let mut config = TrainConfig::default();
+        // Optional 5th/6th args tune the campaign: epochs and learning rate.
+        if let Some(epochs) = std::env::args().nth(5).and_then(|arg| arg.parse::<usize>().ok()) {
+            config.epochs = epochs.max(1);
+        }
+        if let Some(learning_rate) = std::env::args().nth(6).and_then(|arg| arg.parse::<f32>().ok())
+        {
+            if learning_rate > 0.0 {
+                config.learning_rate = learning_rate;
+            }
+        }
         let samples =
             generate_training_samples(EXTERNAL_SPRT_POSITIONS, plies, config.seed, label_depth)?;
         let (network, report) = train_nnue(&samples, config)?;
@@ -96,8 +106,12 @@ fn main() -> Result<(), String> {
             None => "static eval".to_string(),
         };
         eprintln!(
-            "trained on {} samples ({teacher} labels): loss {:.2} -> {:.2}; wrote {path}",
-            report.samples, report.initial_loss, report.final_loss
+            "trained on {} samples ({teacher} labels, {} epochs, lr {}): loss {:.2} -> {:.2}; wrote {path}",
+            report.samples,
+            config.epochs,
+            config.learning_rate,
+            report.initial_loss,
+            report.final_loss
         );
         return Ok(());
     }
