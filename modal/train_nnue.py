@@ -34,18 +34,29 @@ EVAL_CLAMP = 20000       # inference clamps the centipawn score to +/- this
 WDL_SCALE = 400.0        # centipawns -> win-probability steepness
 
 
-def _load_samples(path: str):
-    """Yields (own_indices, opp_indices, target_cp) parsed from a gen-data TSV."""
+def _load_samples(path: str, expected_schema: str = "v1", input_dimension: int = INPUT_DIMENSION):
+    """Load schema-tagged labels, rejecting rows outside the manifest contract."""
     owns, opps, targets = [], [], []
     with open(path, "r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
+        for line_number, line in enumerate(handle, start=1):
+            line = line.rstrip("\r\n")
+            if not line.strip():
                 continue
-            target_str, own_str, opp_str = line.split("\t")
+            fields = line.split("\t")
+            if len(fields) < 4:
+                raise ValueError(f"invalid schema-tagged sample at line {line_number}")
+            schema, target_str, own_str, opp_str = fields[:4]
+            if schema != expected_schema:
+                raise ValueError(
+                    f"schema mismatch at line {line_number}: expected {expected_schema}, got {schema}"
+                )
+            own = [int(x) for x in own_str.split(",") if x != ""]
+            opp = [int(x) for x in opp_str.split(",") if x != ""]
+            if any(index < 0 or index >= input_dimension for index in own + opp):
+                raise ValueError(f"feature dimension mismatch at line {line_number}")
             targets.append(float(target_str))
-            owns.append([int(x) for x in own_str.split(",") if x != ""])
-            opps.append([int(x) for x in opp_str.split(",") if x != ""])
+            owns.append(own)
+            opps.append(opp)
     return owns, opps, targets
 
 
@@ -64,11 +75,12 @@ def _ragged_to_bag(rows):
     )
 
 
-def train(data_path: str, hidden: int, epochs: int, batch_size: int, lr: float, device: str):
+def train(data_path: str, hidden: int, epochs: int, batch_size: int, lr: float, device: str,
+          schema: str = "v1", input_dimension: int = INPUT_DIMENSION):
     import torch
     from torch import nn
 
-    owns, opps, targets = _load_samples(data_path)
+    owns, opps, targets = _load_samples(data_path, schema, input_dimension)
     if not owns:
         raise SystemExit(f"no training samples in {data_path}")
 
@@ -82,7 +94,7 @@ def train(data_path: str, hidden: int, epochs: int, batch_size: int, lr: float, 
             # weight[feature] is the hidden-vector added to the accumulator, which
             # is exactly the RFNN feature_weights row-major (feature*hidden + i)
             # layout. mode="sum" reproduces the accumulator's summed columns.
-            self.transformer = nn.EmbeddingBag(INPUT_DIMENSION, hidden, mode="sum")
+            self.transformer = nn.EmbeddingBag(input_dimension, hidden, mode="sum")
             self.feature_bias = nn.Parameter(torch.zeros(hidden))
             self.output = nn.Linear(2 * hidden, 1)
             nn.init.uniform_(self.transformer.weight, -0.1, 0.1)
@@ -127,7 +139,26 @@ def train(data_path: str, hidden: int, epochs: int, batch_size: int, lr: float, 
     return model
 
 
-def quantize_and_write(model, hidden: int, out_path: str):
+def wdl_loss(model, data_path: str, device: str, schema: str = "v1",
+             input_dimension: int = INPUT_DIMENSION) -> float:
+    """Compute the same WDL loss used for optimization on one manifest split."""
+    import torch
+
+    owns, opps, targets = _load_samples(data_path, schema, input_dimension)
+    if not owns:
+        raise ValueError(f"no evaluation samples in {data_path}")
+    own_values, own_offsets = _ragged_to_bag(owns)
+    opp_values, opp_offsets = _ragged_to_bag(opps)
+    with torch.no_grad():
+        prediction = model(
+            own_values.to(device), own_offsets.to(device),
+            opp_values.to(device), opp_offsets.to(device),
+        )
+        target = torch.tensor(targets, dtype=torch.float32, device=device)
+        return float(((torch.sigmoid(prediction / WDL_SCALE) - torch.sigmoid(target / WDL_SCALE)) ** 2).mean().item())
+
+
+def quantize_and_write(model, hidden: int, out_path: str) -> float:
     import torch
 
     with torch.no_grad():
@@ -136,7 +167,11 @@ def quantize_and_write(model, hidden: int, out_path: str):
         w2 = model.output.weight.detach().cpu().squeeze(0)    # [2*hidden]
         b2 = float(model.output.bias.detach().cpu().item())
 
+    maximum_error = 0.0
+
     def to_i16(t):
+        nonlocal maximum_error
+        maximum_error = max(maximum_error, float((t - torch.round(t)).abs().max().item()))
         return torch.clamp(torch.round(t), -32768, 32767).to(torch.int16)
 
     fw = to_i16(w1).reshape(-1).tolist()   # row-major feature*hidden + i
@@ -155,6 +190,7 @@ def quantize_and_write(model, hidden: int, out_path: str):
     with open(out_path, "wb") as handle:
         handle.write(blob)
     print(f"wrote {out_path} ({len(blob)} bytes, hidden={hidden})", file=sys.stderr)
+    return maximum_error
 
 
 def main():

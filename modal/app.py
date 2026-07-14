@@ -1,23 +1,7 @@
-"""Modal orchestration for the Rusty Fish NNUE train -> gate loop.
+"""Manifest-addressed Modal training and screening for v1 NNUE candidates."""
 
-Runs the two embarrassingly-parallel halves of the pipeline across many cloud
-containers and the training on a GPU:
-
-  1. Labeling   - fan out `engine-bench gen-data` shards (each a different seed)
-                  and concatenate the labelled samples.
-  2. Training   - one GPU container runs the PyTorch trainer (`train_nnue.py`),
-                  exporting a quantised RFNN network.
-  3. Gating     - generate many opening positions, shard them, run
-                  `engine-bench gate-file` per shard in parallel, sum the
-                  win/draw/loss counts, and take the SPRT verdict.
-
-This is scaffolding: it needs your own Modal account/token and cannot be run
-from the agent sandbox. See modal/README.md.
-
-    modal run modal/app.py                 # defaults
-    modal run modal/app.py --hidden 256 --epochs 60 --gate-openings 2048
-"""
-
+import hashlib
+import json
 import pathlib
 import subprocess
 import tempfile
@@ -26,124 +10,177 @@ import modal
 
 REPO_ROOT = str(pathlib.Path(__file__).resolve().parent.parent)
 BIN = "/repo/target/release/engine-bench"
+SCHEMA = "v1"
+INPUT_DIMENSION = 768
+LEARNING_RATE = 1e-3
 
-# Image A: builds the engine-bench release binary from the repo source.
 rust_image = (
     modal.Image.debian_slim()
     .apt_install("curl", "build-essential", "pkg-config")
-    .run_commands(
-        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs "
-        "| sh -s -- -y --default-toolchain stable"
-    )
+    .run_commands("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable")
     .add_local_dir(REPO_ROOT, remote_path="/repo", copy=True)
     .run_commands("cd /repo && $HOME/.cargo/bin/cargo build --release -p engine-bench")
 )
-
-# Image B: GPU training image with PyTorch and the trainer script.
-torch_image = (
-    modal.Image.debian_slim()
-    .pip_install("torch")
-    .add_local_file(str(pathlib.Path(__file__).parent / "train_nnue.py"), "/root/train_nnue.py")
+torch_image = modal.Image.debian_slim().pip_install("torch").add_local_file(
+    str(pathlib.Path(__file__).parent / "train_nnue.py"), "/root/train_nnue.py"
 )
-
 app = modal.App("rusty-fish-nnue")
+artifacts = modal.Volume.from_name("rusty-fish-nnue-artifacts", create_if_missing=True)
 
 
-@app.function(image=rust_image)
-def label_shard(seed: int, plies: int, label_depth: int) -> str:
-    """One labeling shard: emit gen-data TSV for a distinct random seed."""
-    result = subprocess.run(
-        [BIN, "gen-data", str(plies), str(label_depth), str(seed)],
-        capture_output=True, text=True, check=True,
-    )
-    return result.stdout
+def _sha256(text: str | bytes) -> str:
+    return hashlib.sha256(text.encode("utf-8") if isinstance(text, str) else text).hexdigest()
 
 
-@app.function(image=rust_image)
-def make_openings(count: int, plies: int, seed: int) -> str:
-    result = subprocess.run(
-        [BIN, "gen-openings", str(count), str(plies), str(seed)],
-        capture_output=True, text=True, check=True,
-    )
-    return result.stdout
+def _artifact_path(run_id: str, stage: str, input_hash: str, name: str = "artifact") -> str:
+    return f"/artifacts/runs/{run_id}/{stage}-{input_hash}/{name}"
 
 
-@app.function(image=rust_image)
-def gate_shard(net_bytes: bytes, depth: int, openings_text: str) -> tuple[int, int, int]:
-    """Play the NNUE candidate vs the hand-crafted baseline over one opening shard."""
+def _write_artifact(run_id: str, stage: str, input_text: str, contents: str | bytes,
+                    name: str = "artifact") -> str:
+    """Atomically make an immutable, input-addressed stage artifact."""
+    path = _artifact_path(run_id, stage, _sha256(input_text), name)
+    target = pathlib.Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    data = contents.encode("utf-8") if isinstance(contents, str) else contents
+    if target.exists():
+        if target.read_bytes() != data:
+            raise RuntimeError(f"refusing to overwrite {path} with different input result")
+        return path
+    target.write_bytes(data)
+    artifacts.commit()
+    return path
+
+
+def _corpus_payload(directory: str) -> str:
+    return json.dumps({split: pathlib.Path(directory, f"{split}.tsv").read_text(encoding="utf-8")
+                       for split in ("train", "validation", "test")}, sort_keys=True)
+
+
+@app.function(image=rust_image, volumes={"/artifacts": artifacts}, timeout=60 * 60)
+def build_corpus(run_id: str, smoke: bool) -> tuple[str, str]:
+    args = [BIN, "dataset-build", run_id, "/tmp/corpus", "400000", "400000", "200000", "1"]
+    if smoke:
+        # dataset-build deliberately caps smoke totals; preserve the same composition ratio.
+        args[4:7] = ["400", "400", "200"]
+        args.append("--smoke")
+    subprocess.run(args, check=True)
+    manifest = pathlib.Path("/tmp/corpus/manifest.tsv").read_text(encoding="utf-8")
+    positions = _corpus_payload("/tmp/corpus")
+    _write_artifact(run_id, "corpus-manifest", run_id, manifest)
+    _write_artifact(run_id, "corpus-positions", manifest, positions)
+    return manifest, positions
+
+
+@app.function(image=rust_image, volumes={"/artifacts": artifacts}, timeout=60 * 60)
+def label_manifest(run_id: str, manifest_text: str, stockfish_config_text: str) -> dict[str, str]:
+    """Label every immutable manifest split; return schema-tagged training rows."""
+    # The corpus is recovered by its manifest digest, never by hidden process state.
+    artifacts.reload()
+    positions_path = _artifact_path(run_id, "corpus-positions", _sha256(manifest_text))
+    payload = json.loads(pathlib.Path(positions_path).read_text(encoding="utf-8"))
     with tempfile.TemporaryDirectory() as directory:
-        net_path = f"{directory}/net.rfnn"
-        openings_path = f"{directory}/openings.txt"
-        with open(net_path, "wb") as handle:
-            handle.write(net_bytes)
-        with open(openings_path, "w", encoding="utf-8") as handle:
-            handle.write(openings_text)
-        result = subprocess.run(
-            [BIN, "gate-file", net_path, str(depth), openings_path],
-            capture_output=True, text=True, check=True,
-        )
-    wins, draws, losses = (int(x) for x in result.stdout.strip().split("\t"))
-    return wins, draws, losses
+        root = pathlib.Path(directory)
+        manifest_path = root / "manifest.tsv"
+        manifest_path.write_text(manifest_text, encoding="utf-8")
+        for split, content in payload.items():
+            (root / f"{split}.tsv").write_text(content, encoding="utf-8")
+        config = root / "stockfish-config.tsv"
+        config.write_text(stockfish_config_text, encoding="utf-8")
+        result = {}
+        for split in ("train", "validation", "test"):
+            output = root / f"{split}-labels.tsv"
+            subprocess.run([BIN, "stockfish-label", str(manifest_path), split, str(config), str(output)], check=True)
+            result[split] = "".join(f"{SCHEMA}\t{line}\n" for line in output.read_text(encoding="utf-8").splitlines())
+    _write_artifact(run_id, "labels", manifest_text + stockfish_config_text, json.dumps(result, sort_keys=True))
+    return result
 
 
-@app.function(image=rust_image)
-def sprt_verdict(wins: int, draws: int, losses: int) -> str:
-    result = subprocess.run(
-        [BIN, "sprt", str(wins), str(draws), str(losses)],
-        capture_output=True, text=True, check=True,
-    )
-    return result.stdout + result.stderr
-
-
-@app.function(image=torch_image, gpu="A10G", timeout=60 * 60)
-def train_net(data_text: str, hidden: int, epochs: int) -> bytes:
+@app.function(image=torch_image, gpu="A10G", volumes={"/artifacts": artifacts}, timeout=60 * 60)
+def train_net(data_text: str, schema: str, input_dimension: int, hidden: int, epochs: int, run_id: str) -> bytes:
     import train_nnue
 
+    splits = json.loads(data_text)
     with tempfile.TemporaryDirectory() as directory:
-        data_path = f"{directory}/data.tsv"
-        out_path = f"{directory}/net.rfnn"
-        with open(data_path, "w", encoding="utf-8") as handle:
-            handle.write(data_text)
-        model = train_nnue.train(data_path, hidden, epochs, batch_size=1024, lr=1e-3, device="cuda")
-        train_nnue.quantize_and_write(model, hidden, out_path)
-        with open(out_path, "rb") as handle:
-            return handle.read()
+        root = pathlib.Path(directory)
+        paths = {name: root / f"{name}.tsv" for name in ("train", "validation", "test")}
+        for name, path in paths.items():
+            path.write_text(splits[name], encoding="utf-8")
+        model = train_nnue.train(str(paths["train"]), hidden, epochs, 1024, LEARNING_RATE, "cuda", schema, input_dimension)
+        validation_loss = train_nnue.wdl_loss(model, str(paths["validation"]), "cuda", schema, input_dimension)
+        test_loss = train_nnue.wdl_loss(model, str(paths["test"]), "cuda", schema, input_dimension)
+        net = root / "net.rfnn"
+        quantization_error = train_nnue.quantize_and_write(model, hidden, str(net))
+        net_bytes = net.read_bytes()
+    report = {
+        "validation_wdl_loss": validation_loss, "test_wdl_loss": test_loss,
+        "model_sha256": _sha256(net_bytes), "input_dimension": input_dimension,
+        "schema": schema, "epochs": epochs, "learning_rate": LEARNING_RATE,
+        "quantization_max_error_cp": quantization_error,
+    }
+    input_hash = _sha256(data_text + f"{schema}:{input_dimension}:{hidden}:{epochs}")
+    _write_artifact(run_id, f"net-{hidden}", input_hash, net_bytes, "net.rfnn")
+    _write_artifact(run_id, f"report-{hidden}", input_hash, json.dumps(report, sort_keys=True, indent=2), "report.json")
+    return net_bytes
 
 
-def _chunks(lines, size):
-    for start in range(0, len(lines), size):
-        yield "\n".join(lines[start:start + size])
+@app.function(image=rust_image, timeout=60 * 60)
+def run_screen(net_bytes: bytes, openings_per_shard: int = 16) -> tuple[int, int, int]:
+    """Run exactly 12 deterministic, bounded opening shards (384 games)."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        net = root / "net.rfnn"
+        net.write_bytes(net_bytes)
+        openings = subprocess.run([BIN, "gen-openings", str(12 * openings_per_shard), "8", "1"], capture_output=True, text=True, check=True).stdout.splitlines()
+        totals = [0, 0, 0]
+        for shard in range(12):
+            opening_file = root / f"openings-{shard}.txt"
+            opening_file.write_text("\n".join(openings[shard * openings_per_shard:(shard + 1) * openings_per_shard]), encoding="utf-8")
+            result = subprocess.run([BIN, "gate-file", str(net), "5", str(opening_file), "100"], capture_output=True, text=True, check=True)
+            for index, value in enumerate(result.stdout.strip().split("\t")):
+                totals[index] += int(value)
+    return tuple(totals)
+
+
+def promotes(report: dict, control: dict, screen: tuple[int, int, int]) -> bool:
+    return (
+        report["validation_wdl_loss"] <= control["validation_wdl_loss"] * 0.98
+        and report["test_wdl_loss"] <= control["test_wdl_loss"] * 0.99
+        and report["quantization_max_error_cp"] <= 32
+        and screen[0] + 0.5 * screen[1] >= 192
+    )
+
+
+@app.function(volumes={"/artifacts": artifacts})
+def read_report(run_id: str, width: int, input_hash: str) -> dict:
+    artifacts.reload()
+    path = _artifact_path(run_id, f"report-{width}", input_hash, "report.json")
+    return json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
 
 
 @app.local_entrypoint()
-def run(
-    label_shards: int = 16,
-    plies: int = 64,
-    label_depth: int = 6,
-    hidden: int = 128,
-    epochs: int = 40,
-    gate_openings: int = 512,
-    gate_plies: int = 8,
-    gate_depth: int = 5,
-    gate_shard_size: int = 32,
-):
-    # 1. Parallel labeling across distinct seeds.
-    shards = label_shard.starmap([(seed, plies, label_depth) for seed in range(1, label_shards + 1)])
-    data_text = "".join(shards)
-    print(f"labeled {data_text.count(chr(10))} samples across {label_shards} shards")
-
-    # 2. GPU training -> RFNN bytes.
-    net_bytes = train_net.remote(data_text, hidden, epochs)
-    print(f"trained network: {len(net_bytes)} bytes")
-
-    # 3. Parallel SPRT gate over many openings.
-    openings = [line for line in make_openings.remote(gate_openings, gate_plies, 1).splitlines() if line]
-    shard_texts = list(_chunks(openings, gate_shard_size))
-    results = gate_shard.starmap([(net_bytes, gate_depth, text) for text in shard_texts])
-    wins = draws = losses = 0
-    for w, d, l in results:
-        wins += w
-        draws += d
-        losses += l
-    print(f"gate over {len(openings) * 2} games: {wins}W {draws}D {losses}L")
-    print(sprt_verdict.remote(wins, draws, losses))
+def run(run_id: str = "smoke-v1", smoke: bool = False, schema: str = SCHEMA,
+        widths: str = "128,256,512", epochs: int = 40, stockfish_config: str = "stockfish-config.tsv"):
+    if schema != SCHEMA:
+        raise ValueError(f"unsupported schema: {schema}")
+    config_text = pathlib.Path(stockfish_config).read_text(encoding="utf-8")
+    manifest, _ = build_corpus.remote(run_id, smoke)
+    labels = label_manifest.remote(run_id, manifest, config_text)
+    data_text = json.dumps(labels, sort_keys=True)
+    reports = []
+    for width in (int(value) for value in widths.split(",") if value):
+        net = train_net.remote(data_text, schema, INPUT_DIMENSION, width, epochs, run_id)
+        input_hash = _sha256(data_text + f"{schema}:{INPUT_DIMENSION}:{width}:{epochs}")
+        report = read_report.remote(run_id, width, input_hash)
+        reports.append((width, net, report))
+        print(f"manifest SHA {_sha256(manifest)}; width {width}: {json.dumps(report, sort_keys=True)}")
+    control = reports[0][2]
+    for width, net, report in reports:
+        offline_ok = (
+            report["validation_wdl_loss"] <= control["validation_wdl_loss"] * 0.98
+            and report["test_wdl_loss"] <= control["test_wdl_loss"] * 0.99
+            and report["quantization_max_error_cp"] <= 32
+        )
+        if offline_ok:
+            screen = run_screen.remote(net)
+            print(f"width {width} screen (384 games): {screen[0]}W {screen[1]}D {screen[2]}L")
