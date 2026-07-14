@@ -180,6 +180,12 @@ quantization maximum error; 384-game screen W/D/L; then (only if promoted) the
 failed branch. An `AcceptH1` authorizes a separate adoption design only; it does
 not embed the net automatically.
 
+The Modal volume is the immutable source record: each screen and full-gate
+outcome is stored as an input-addressed `report.json`, including its run ID,
+network/candidate/control/manifest/config checksums, W/D/L, Elo, raw SPRT TSV,
+parsed decision, and promotion decision. `AcceptH0` and `Continue` stay
+non-adoption outcomes.
+
 ## Gotchas
 
 - **`workspace` CI status** can show a combined "pending" because there are no

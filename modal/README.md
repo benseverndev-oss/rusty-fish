@@ -55,8 +55,10 @@ quantized networks in centipawns. A candidate screens only after
 it beats the 128-wide control by 2% validation and 1% test loss and stays within
 the quantization bound. The screen is 12 deterministic shards of 16 openings
 (384 games) with `gate-file ... 100`, and promotion additionally needs at least
-192 score points (`W + 0.5D`); the entrypoint prints the resulting promotion
-decision.
+192 score points (`W + 0.5D`). The screen and full gate each write an immutable,
+input-addressed `report.json` with the run ID, network/candidate/control/
+manifest/config checksums, W/D/L, Elo and SPRT evidence, and promotion decision.
+`AcceptH0` and `Continue` are recorded as non-adoption outcomes.
 
 Only a promoted HalfKA candidate runs the full 2,304-game gate: 12 shards of
 96 openings, depth 4, and `gate-file ... 100`. The GitHub Actions workflow is

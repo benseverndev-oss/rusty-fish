@@ -8,6 +8,75 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from train_nnue import _load_samples
 
 
+def test_gate_outcome_records_addressed_inputs_wdl_and_sprt_verdict():
+    import app
+
+    sprt = (
+        "engine_version\twins\tdraws\tlosses\telo_estimate\telo0\telo1\talpha\tbeta\tllr\tlower_bound\tupper_bound\tdecision\n"
+        "0.1\t120\t80\t40\t35.50\t0\t5\t0.05\t0.05\t3.2\t-2.9\t2.9\tAcceptH1\n"
+    )
+    inputs, outcome = app._gate_outcome(
+        stage="full-gate",
+        run_id="halfka-128",
+        net_bytes=b"candidate-net",
+        candidate_report={"model_sha256": "candidate"},
+        control_report={"model_sha256": "control"},
+        manifest_sha256="manifest",
+        config_sha256="config",
+        wins=120,
+        draws=80,
+        losses=40,
+        sprt_text=sprt,
+        promotion_decision="AcceptH1",
+    )
+
+    assert inputs["network_sha256"] == app._sha256(b"candidate-net")
+    assert inputs["manifest_sha256"] == "manifest"
+    assert outcome["run_id"] == "halfka-128"
+    assert outcome["wdl"] == {"wins": 120, "draws": 80, "losses": 40, "games": 240}
+    assert outcome["elo_estimate"] == "35.50"
+    assert outcome["sprt"]["decision"] == "AcceptH1"
+    assert outcome["promotion_decision"] == "AcceptH1"
+
+
+def test_outcome_artifact_rejects_conflicting_result_at_same_input_address(tmp_path, monkeypatch):
+    import app
+
+    class FakeVolume:
+        def commit(self):
+            pass
+
+    monkeypatch.setattr(app, "artifacts", FakeVolume())
+    monkeypatch.setattr(
+        app, "_artifact_path",
+        lambda _run_id, _stage, _input_hash, name="artifact": str(tmp_path / name),
+    )
+    path = app._write_artifact("run", "screen", "fixed-input", '{"wins": 1}', "report.json")
+    assert pathlib.Path(path).read_text(encoding="utf-8") == '{"wins": 1}'
+    with pytest.raises(RuntimeError, match="refusing to overwrite"):
+        app._write_artifact("run", "screen", "fixed-input", '{"wins": 2}', "report.json")
+
+
+def test_halfka_ladder_does_not_train_later_width_after_failed_evaluation():
+    import app
+
+    trained = []
+
+    def train(width):
+        trained.append(width)
+        return width
+
+    evaluated = []
+
+    def evaluate(width, net):
+        evaluated.append((width, net))
+        return False
+
+    assert app._run_ordered_ladder([128, 256], train, evaluate, stop_on_failure=True) == [(128, False)]
+    assert trained == [128]
+    assert evaluated == [(128, 128)]
+
+
 def test_load_samples_rejects_mixed_schema_or_feature_dimension(tmp_path):
     path = tmp_path / "mixed.tsv"
     path.write_text(

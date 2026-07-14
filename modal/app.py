@@ -63,6 +63,60 @@ def _write_artifact(run_id: str, stage: str, input_text: str, contents: str | by
     return path
 
 
+def _sprt_fields(sprt_text: str) -> dict[str, str | None]:
+    """Decode the engine's one-row SPRT TSV without losing its evidence fields."""
+    lines = [line for line in sprt_text.splitlines() if line]
+    if len(lines) != 2:
+        return {"raw": sprt_text, "elo_estimate": None, "llr": None, "decision": None}
+    names, values = lines
+    fields = dict(zip(names.split("\t"), values.split("\t"), strict=True))
+    return {
+        "raw": sprt_text,
+        "elo_estimate": fields.get("elo_estimate") or None,
+        "llr": fields.get("llr") or None,
+        "decision": fields.get("decision") or None,
+    }
+
+
+def _gate_outcome(*, stage: str, run_id: str, net_bytes: bytes, candidate_report: dict,
+                  control_report: dict, manifest_sha256: str, config_sha256: str,
+                  wins: int, draws: int, losses: int, sprt_text: str,
+                  promotion_decision: str) -> tuple[dict, dict]:
+    """Build the complete, content-addressed evidence record for a gate result."""
+    inputs = {
+        "stage": stage,
+        "run_id": run_id,
+        "network_sha256": _sha256(net_bytes),
+        "candidate_report_sha256": _sha256(json.dumps(candidate_report, sort_keys=True)),
+        "control_report_sha256": _sha256(json.dumps(control_report, sort_keys=True)),
+        "manifest_sha256": manifest_sha256,
+        "config_sha256": config_sha256,
+    }
+    sprt = _sprt_fields(sprt_text)
+    outcome = {
+        "run_id": run_id,
+        "stage": stage,
+        "inputs": inputs,
+        "wdl": {"wins": wins, "draws": draws, "losses": losses,
+                "games": wins + draws + losses},
+        "elo_estimate": sprt["elo_estimate"],
+        "sprt": sprt,
+        "promotion_decision": promotion_decision,
+    }
+    return inputs, outcome
+
+
+def _write_gate_outcome(**kwargs) -> dict:
+    """Persist one immutable candidate outcome report and return its contents."""
+    inputs, outcome = _gate_outcome(**kwargs)
+    _write_artifact(
+        kwargs["run_id"], f"{kwargs['stage']}-outcome",
+        json.dumps(inputs, sort_keys=True), json.dumps(outcome, sort_keys=True, indent=2),
+        "report.json",
+    )
+    return outcome
+
+
 def _corpus_payload(directory: str) -> str:
     return json.dumps({split: pathlib.Path(directory, f"{split}.tsv").read_text(encoding="utf-8")
                        for split in ("train", "validation", "test")}, sort_keys=True)
@@ -165,8 +219,10 @@ def train_net(data_text: str, schema: str, input_dimension: int, hidden: int, ep
     return net_bytes
 
 
-@app.function(image=rust_image, timeout=60 * 60)
-def run_screen(net_bytes: bytes, openings_per_shard: int = 16) -> tuple[int, int, int]:
+@app.function(image=rust_image, volumes={"/artifacts": artifacts}, timeout=60 * 60)
+def run_screen(net_bytes: bytes, run_id: str, candidate_report: dict, control_report: dict,
+               manifest_sha256: str, config_sha256: str,
+               openings_per_shard: int = 16) -> dict:
     """Run exactly 12 deterministic, bounded opening shards (384 games)."""
     with tempfile.TemporaryDirectory() as directory:
         root = pathlib.Path(directory)
@@ -180,7 +236,19 @@ def run_screen(net_bytes: bytes, openings_per_shard: int = 16) -> tuple[int, int
             result = subprocess.run([BIN, "gate-file", str(net), "5", str(opening_file), "100"], capture_output=True, text=True, check=True)
             for index, value in enumerate(result.stdout.strip().split("\t")):
                 totals[index] += int(value)
-    return tuple(totals)
+    score = tuple(totals)
+    sprt_text = subprocess.run(
+        [BIN, "sprt", *(str(value) for value in score)], capture_output=True,
+        text=True, check=True,
+    ).stdout.strip()
+    return _write_gate_outcome(
+        stage="screen", run_id=run_id, net_bytes=net_bytes,
+        candidate_report=candidate_report, control_report=control_report,
+        manifest_sha256=manifest_sha256, config_sha256=config_sha256,
+        wins=score[0], draws=score[1], losses=score[2], sprt_text=sprt_text,
+        promotion_decision=("screen-passed" if score[0] + 0.5 * score[1] >= 192
+                            else "screen-rejected"),
+    )
 
 
 @app.function(image=rust_image, timeout=60 * 60)
@@ -198,8 +266,9 @@ def rust_parity_check(net_bytes: bytes) -> None:
         subprocess.run([BIN, "gate-file", str(net), "4", str(openings), "100"], check=True)
 
 
-@app.function(image=rust_image, timeout=6 * 60 * 60)
-def run_full_gate(net_bytes: bytes, run_id: str) -> dict[str, int | str]:
+@app.function(image=rust_image, volumes={"/artifacts": artifacts}, timeout=6 * 60 * 60)
+def run_full_gate(net_bytes: bytes, run_id: str, candidate_report: dict, control_report: dict,
+                  manifest_sha256: str, config_sha256: str) -> dict:
     """Run the 2,304-game, depth-4 bounded promotion gate for one candidate."""
     with tempfile.TemporaryDirectory() as directory:
         root = pathlib.Path(directory)
@@ -219,8 +288,15 @@ def run_full_gate(net_bytes: bytes, run_id: str) -> dict[str, int | str]:
                                  capture_output=True, text=True, check=True).stdout.strip()
     if sum(totals) != 2304:
         raise RuntimeError(f"{run_id}: full gate returned {sum(totals)} games, not 2304")
-    return {"wins": totals[0], "draws": totals[1], "losses": totals[2], "games": 2304,
-            "sprt": verdict}
+    sprt = _sprt_fields(verdict)
+    return _write_gate_outcome(
+        stage="full-gate", run_id=run_id, net_bytes=net_bytes,
+        candidate_report=candidate_report, control_report=control_report,
+        manifest_sha256=manifest_sha256, config_sha256=config_sha256,
+        wins=totals[0], draws=totals[1], losses=totals[2], sprt_text=verdict,
+        promotion_decision=("adoption-design-required" if sprt["decision"] == "AcceptH1"
+                            else "not-promoted"),
+    )
 
 
 def promotes(report: dict, control: dict, screen: tuple[int, int, int]) -> bool:
@@ -239,6 +315,18 @@ def selected_halfka_widths(capacity_selection_report: dict[str, int]) -> list[in
         return {128: [128, 256], 256: [256, 512], 512: [512]}[int(selected)]
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("capacity selection report must name selected_width 128, 256, or 512") from error
+
+
+def _run_ordered_ladder(widths, train_candidate, evaluate_candidate, *, stop_on_failure: bool):
+    """Train and decide one width at a time; HalfKA cannot pre-start later widths."""
+    results = []
+    for width in widths:
+        candidate = train_candidate(width)
+        promoted = evaluate_candidate(width, candidate)
+        results.append((width, promoted))
+        if stop_on_failure and not promoted:
+            break
+    return results
 
 
 @app.function(volumes={"/artifacts": artifacts})
@@ -271,32 +359,40 @@ def run(run_id: str = "smoke-v1", smoke: bool = False, schema: str = SCHEMA,
     control_net = train_net.remote(control_data, SCHEMA, INPUT_DIMENSION, 128, epochs, run_id, seed)
     control_hash = _sha256(control_data + f"{SCHEMA}:{INPUT_DIMENSION}:128:{epochs}:{seed}")
     control = read_report.remote(run_id, 128, control_hash)
-    reports = []
-    for width in candidate_widths:
+    manifest_sha256 = _sha256(manifest)
+    config_sha256 = _sha256(config_text)
+    def train_candidate(width: int) -> tuple[bytes, dict]:
         net = control_net if schema == SCHEMA and width == 128 else train_net.remote(
             data_text, schema, input_dimension, width, epochs, run_id, seed)
         input_hash = _sha256(data_text + f"{schema}:{input_dimension}:{width}:{epochs}:{seed}")
         report = read_report.remote(run_id, width, input_hash)
-        reports.append((width, net, report))
-        print(f"manifest SHA {_sha256(manifest)}; seed {seed}; width {width}: {json.dumps(report, sort_keys=True)}")
-    for width, net, report in reports:
+        print(f"manifest SHA {manifest_sha256}; seed {seed}; width {width}: {json.dumps(report, sort_keys=True)}")
+        return net, report
+
+    def evaluate_candidate(width: int, candidate: tuple[bytes, dict]) -> bool:
+        net, report = candidate
         offline_ok = (
             report["validation_wdl_loss"] <= control["validation_wdl_loss"] * 0.98
             and report["test_wdl_loss"] <= control["test_wdl_loss"] * 0.99
             and report["quantization_max_error_cp"] <= 32
         )
-        if offline_ok:
-            rust_parity_check.remote(net)
-            screen = run_screen.remote(net)
-            print(f"width {width} screen (384 games): {screen[0]}W {screen[1]}D {screen[2]}L")
-            if promotes(report, control, screen):
-                verdict = run_full_gate.remote(net, run_id)
-                assert verdict["games"] == 2304
-                print(f"width {width} full gate: {json.dumps(verdict, sort_keys=True)}")
-            else:
-                print(f"width {width} promotion: rejected")
-                if schema == HALFKA_SCHEMA:
-                    break
-        elif schema == HALFKA_SCHEMA:
+        if not offline_ok:
             print(f"width {width} promotion: rejected before screen")
-            break
+            return False
+        rust_parity_check.remote(net)
+        screen = run_screen.remote(net, run_id, report, control, manifest_sha256, config_sha256)
+        screen_wdl = screen["wdl"]
+        print(f"width {width} screen (384 games): {screen_wdl['wins']}W {screen_wdl['draws']}D {screen_wdl['losses']}L")
+        screen_score = (screen_wdl["wins"], screen_wdl["draws"], screen_wdl["losses"])
+        if not promotes(report, control, screen_score):
+            print(f"width {width} promotion: rejected")
+            return False
+        verdict = run_full_gate.remote(net, run_id, report, control, manifest_sha256, config_sha256)
+        assert verdict["wdl"]["games"] == 2304
+        print(f"width {width} full gate: {json.dumps(verdict, sort_keys=True)}")
+        return verdict["promotion_decision"] == "adoption-design-required"
+
+    _run_ordered_ladder(
+        candidate_widths, train_candidate, evaluate_candidate,
+        stop_on_failure=(schema == HALFKA_SCHEMA),
+    )
