@@ -58,3 +58,8 @@
 - Artifact verification now validates the manifest before shard indexing and recomputes source counts from shard records in addition to split counts and digests.
 - Removed the unbound `positions.tsv` aggregate output; the manifest contract is the three fixed split shards and their aggregate digest.
 - Focused tests and a fresh smoke build passed.
+
+## Atomic output reservation
+
+- Replaced output existence probing with atomic `std::fs::create_dir` reservation. `AlreadyExists` now fails cleanly before any artifact write, preventing concurrent builders from sharing an output directory.
+- Added `output_directory_reservation_rejects_an_existing_path`; it passed along with dataset tests and a fresh smoke build.

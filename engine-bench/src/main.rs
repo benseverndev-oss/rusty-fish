@@ -254,9 +254,6 @@ fn dataset_build() -> Result<(), String> {
     {
         return Err("dataset-build requires counts 400000 400000 200000; --smoke permits a total of at most 1000".to_string());
     }
-    if out_dir.exists() {
-        return Err(format!("refusing to modify existing dataset output {}", out_dir.display()));
-    }
 
     let mut records = Vec::with_capacity(total);
     append_records(&mut records, "random", random_count, 8, seed);
@@ -275,8 +272,7 @@ fn dataset_build() -> Result<(), String> {
     if actual_source_counts != expected_source_counts || splits.values().map(Vec::len).sum::<usize>() != total {
         return Err("dataset generation did not preserve the requested unique source composition".into());
     }
-    std::fs::create_dir_all(out_dir)
-        .map_err(|error| format!("failed to create {}: {error}", out_dir.display()))?;
+    reserve_output_directory(out_dir)?;
 
     let mut source_counts = BTreeMap::new();
     let mut split_counts = BTreeMap::new();
@@ -307,6 +303,16 @@ fn dataset_build() -> Result<(), String> {
         stockfish_config_sha256: None,
     };
     write_manifest(&out_dir.join("manifest.tsv"), &manifest)
+}
+
+fn reserve_output_directory(path: &Path) -> Result<(), String> {
+    std::fs::create_dir(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            format!("refusing to modify existing or reserved dataset output {}", path.display())
+        } else {
+            format!("failed to reserve {}: {error}", path.display())
+        }
+    })
 }
 
 fn append_records(records: &mut Vec<PositionRecord>, source: &str, count: usize, plies: u32, seed: u64) {
@@ -379,7 +385,7 @@ fn join_usize(values: &[usize]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_records, deduplicate_and_split};
+    use super::{append_records, deduplicate_and_split, reserve_output_directory};
 
     #[test]
     fn generated_dataset_records_exclude_terminal_positions() {
@@ -389,5 +395,14 @@ mod tests {
         append_records(&mut records, "quiet", 200, 24, 1 ^ 0xD1B5_4A32_D192_ED03);
         assert_eq!(records.len(), 1_000);
         assert!(deduplicate_and_split(records).is_ok());
+    }
+
+    #[test]
+    fn output_directory_reservation_rejects_an_existing_path() {
+        let path = std::env::temp_dir().join(format!("rusty-fish-reservation-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        reserve_output_directory(&path).unwrap();
+        assert!(reserve_output_directory(&path).is_err());
+        std::fs::remove_dir(path).unwrap();
     }
 }
