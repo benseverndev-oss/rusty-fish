@@ -7,42 +7,24 @@ name: NNUE Campaign
 on:
   workflow_dispatch:
     inputs:
-      plies:
-        description: Plies of self-play per seed position (training data)
+      net_url:
+        description: HTTPS URL for the promoted RFNN artifact
         required: true
-        default: "64"
         type: string
-      label_depth:
-        description: Search depth for teacher labels (0 = static evaluation)
+      net_sha256:
+        description: SHA-256 of the RFNN artifact
         required: true
-        default: "6"
         type: string
-      epochs:
-        description: Training epochs
+      manifest_sha256:
+        description: Immutable corpus manifest SHA-256 used for training
         required: true
-        default: "150"
-        type: string
-      gate_depth:
-        description: Search depth for both sides in the gate
-        required: true
-        default: "4"
-        type: string
-      openings_per_shard:
-        description: Openings per gate shard (games/shard = 2x this)
-        required: true
-        default: "96"
-        type: string
-      gate_plies:
-        description: Random plies per generated opening
-        required: true
-        default: "8"
         type: string
 
 permissions:
   contents: read
 
 jobs:
-  train:
+  prepare:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -50,10 +32,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build engine-bench
         run: cargo build --release -p engine-bench
-      - name: Train a WDL network
+      - name: Download and verify promoted network
         run: |
-          ./target/release/engine-bench train net.rfnn \
-            "${{ inputs.plies }}" "${{ inputs.label_depth }}" "${{ inputs.epochs }}"
+          curl --fail --location --retry 3 "${{ inputs.net_url }}" --output net.rfnn
+          echo "${{ inputs.net_sha256 }}  net.rfnn" | sha256sum --check --status
+          echo "manifest_sha256=${{ inputs.manifest_sha256 }}"
       - name: Upload network and binary
         uses: actions/upload-artifact@v4
         with:
@@ -63,7 +46,7 @@ jobs:
             target/release/engine-bench
 
   gate:
-    needs: train
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
@@ -80,9 +63,9 @@ jobs:
           chmod +x target/release/engine-bench
           # Distinct openings per shard (seed = shard index) for game diversity.
           ./target/release/engine-bench gen-openings \
-            "${{ inputs.openings_per_shard }}" "${{ inputs.gate_plies }}" "${{ matrix.shard }}" \
+            "96" "8" "${{ matrix.shard }}" \
             > openings.txt
-          ./target/release/engine-bench gate-file net.rfnn "${{ inputs.gate_depth }}" openings.txt \
+          ./target/release/engine-bench gate-file net.rfnn 4 openings.txt 100 \
             > "wdl-${{ matrix.shard }}.tsv"
           cat "wdl-${{ matrix.shard }}.tsv"
       - name: Upload shard result
@@ -114,7 +97,10 @@ jobs:
             IFS=$'\t' read -r w d l < "$file"
             wins=$((wins + w)); draws=$((draws + d)); losses=$((losses + l))
           done
-          echo "aggregate: ${wins}W ${draws}D ${losses}L over $((wins + draws + losses)) games"
+          games=$((wins + draws + losses))
+          test "$games" -eq 2304
+          echo "aggregate: ${wins}W ${draws}D ${losses}L over ${games} games"
+          echo "manifest SHA: ${{ inputs.manifest_sha256 }}"
           ./target/release/engine-bench sprt "$wins" "$draws" "$losses" | tee sprt.tsv
       - name: Upload SPRT verdict
         uses: actions/upload-artifact@v4

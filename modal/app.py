@@ -1,4 +1,4 @@
-"""Manifest-addressed Modal training and screening for v1 NNUE candidates."""
+"""Manifest-addressed Modal training, HalfKA screening, and promotion gates."""
 
 import hashlib
 import json
@@ -12,6 +12,8 @@ REPO_ROOT = str(pathlib.Path(__file__).resolve().parent.parent)
 BIN = "/repo/target/release/engine-bench"
 SCHEMA = "v1"
 INPUT_DIMENSION = 768
+HALFKA_SCHEMA = "halfka-v2-64"
+HALFKA_INPUT_DIMENSION = 64 * 2 * 5 * 64
 LEARNING_RATE = 1e-3
 STOCKFISH_18_URL = "https://github.com/official-stockfish/Stockfish/releases/download/sf_18/stockfish-ubuntu-x86-64.tar"
 STOCKFISH_18_ARCHIVE_SHA256 = "5c6f38b02a4da5f3ffe763f27da6c3e743eebefd92b50cb3661623b96696adff"
@@ -101,7 +103,8 @@ def build_corpus(run_id: str, smoke: bool) -> tuple[str, str]:
 
 
 @app.function(image=rust_image, volumes={"/artifacts": artifacts}, timeout=60 * 60)
-def label_manifest(run_id: str, manifest_text: str, stockfish_config_text: str) -> dict[str, str]:
+def label_manifest(run_id: str, manifest_text: str, stockfish_config_text: str,
+                   schema: str = SCHEMA) -> dict[str, str]:
     """Label every immutable manifest split; return schema-tagged training rows."""
     # The corpus is recovered by its manifest digest, never by hidden process state.
     artifacts.reload()
@@ -118,9 +121,10 @@ def label_manifest(run_id: str, manifest_text: str, stockfish_config_text: str) 
         result = {}
         for split in ("train", "validation", "test"):
             output = root / f"{split}-labels.tsv"
-            subprocess.run([BIN, "stockfish-label", str(manifest_path), split, str(config), str(output)], check=True)
+            subprocess.run([BIN, "stockfish-label", str(manifest_path), split, str(config), str(output), schema], check=True)
             result[split] = output.read_text(encoding="utf-8")
-    _write_artifact(run_id, "labels", manifest_text + stockfish_config_text, json.dumps(result, sort_keys=True))
+    _write_artifact(run_id, f"labels-{schema}", manifest_text + stockfish_config_text + schema,
+                    json.dumps(result, sort_keys=True))
     return result
 
 
@@ -135,10 +139,9 @@ def train_net(data_text: str, schema: str, input_dimension: int, hidden: int, ep
         paths = {name: root / f"{name}.tsv" for name in ("train", "validation", "test")}
         for name, path in paths.items():
             path.write_text(splits[name], encoding="utf-8")
-        model = train_nnue.train(
-            str(paths["train"]), hidden, epochs, 1024, LEARNING_RATE, "cuda",
-            schema, input_dimension, seed,
-        )
+        buckets = 64 if schema == HALFKA_SCHEMA else 0
+        model = train_nnue.train(str(paths["train"]), schema, input_dimension, hidden,
+                                 epochs, 1024, LEARNING_RATE, "cuda", seed)
         train_loss = model.train_wdl_loss
         validation_loss = train_nnue.wdl_loss(model, str(paths["validation"]), "cuda", schema, input_dimension)
         test_loss = train_nnue.wdl_loss(model, str(paths["test"]), "cuda", schema, input_dimension)
@@ -146,13 +149,14 @@ def train_net(data_text: str, schema: str, input_dimension: int, hidden: int, ep
             model, str(paths["test"]), "cuda", schema, input_dimension,
         )
         net = root / "net.rfnn"
-        train_nnue.quantize_and_write(model, hidden, str(net))
+        train_nnue.quantize_and_write(model, schema, input_dimension, buckets, hidden, str(net))
         net_bytes = net.read_bytes()
     report = {
         "train_wdl_loss": train_loss, "validation_wdl_loss": validation_loss,
         "test_wdl_loss": test_loss,
         "model_sha256": _sha256(net_bytes), "input_dimension": input_dimension,
-        "schema": schema, "epochs": epochs, "learning_rate": LEARNING_RATE,
+        "schema": schema, "buckets": buckets, "hidden": hidden,
+        "epochs": epochs, "learning_rate": LEARNING_RATE,
         "quantization_max_error_cp": quantization_error, "seed": seed,
     }
     input_hash = _sha256(data_text + f"{schema}:{input_dimension}:{hidden}:{epochs}:{seed}")
@@ -179,6 +183,46 @@ def run_screen(net_bytes: bytes, openings_per_shard: int = 16) -> tuple[int, int
     return tuple(totals)
 
 
+@app.function(image=rust_image, timeout=60 * 60)
+def rust_parity_check(net_bytes: bytes) -> None:
+    """Load an exported candidate in Rust before spending screen resources."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        net = root / "net.rfnn"
+        net.write_bytes(net_bytes)
+        openings = root / "opening.txt"
+        openings.write_text(subprocess.run(
+            [BIN, "gen-openings", "1", "8", "1"], capture_output=True,
+            text=True, check=True,
+        ).stdout, encoding="utf-8")
+        subprocess.run([BIN, "gate-file", str(net), "4", str(openings), "100"], check=True)
+
+
+@app.function(image=rust_image, timeout=6 * 60 * 60)
+def run_full_gate(net_bytes: bytes, run_id: str) -> dict[str, int | str]:
+    """Run the 2,304-game, depth-4 bounded promotion gate for one candidate."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        net = root / "net.rfnn"
+        net.write_bytes(net_bytes)
+        openings = subprocess.run([BIN, "gen-openings", "1152", "8", "1"], capture_output=True,
+                                  text=True, check=True).stdout.splitlines()
+        totals = [0, 0, 0]
+        for shard in range(12):
+            opening_file = root / f"openings-{shard}.txt"
+            opening_file.write_text("\n".join(openings[shard * 96:(shard + 1) * 96]), encoding="utf-8")
+            result = subprocess.run([BIN, "gate-file", str(net), "4", str(opening_file), "100"],
+                                    capture_output=True, text=True, check=True)
+            for index, value in enumerate(result.stdout.strip().split("\t")):
+                totals[index] += int(value)
+        verdict = subprocess.run([BIN, "sprt", *(str(value) for value in totals)],
+                                 capture_output=True, text=True, check=True).stdout.strip()
+    if sum(totals) != 2304:
+        raise RuntimeError(f"{run_id}: full gate returned {sum(totals)} games, not 2304")
+    return {"wins": totals[0], "draws": totals[1], "losses": totals[2], "games": 2304,
+            "sprt": verdict}
+
+
 def promotes(report: dict, control: dict, screen: tuple[int, int, int]) -> bool:
     return (
         report["validation_wdl_loss"] <= control["validation_wdl_loss"] * 0.98
@@ -186,6 +230,15 @@ def promotes(report: dict, control: dict, screen: tuple[int, int, int]) -> bool:
         and report["quantization_max_error_cp"] <= 32
         and screen[0] + 0.5 * screen[1] >= 192
     )
+
+
+def selected_halfka_widths(capacity_selection_report: dict[str, int]) -> list[int]:
+    """Select the deterministic HalfKA ladder from the promoted v1 width."""
+    selected = capacity_selection_report.get("selected_width", capacity_selection_report.get("width"))
+    try:
+        return {128: [128, 256], 256: [256, 512], 512: [512]}[int(selected)]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("capacity selection report must name selected_width 128, 256, or 512") from error
 
 
 @app.function(volumes={"/artifacts": artifacts})
@@ -198,21 +251,34 @@ def read_report(run_id: str, width: int, input_hash: str) -> dict:
 @app.local_entrypoint()
 def run(run_id: str = "smoke-v1", smoke: bool = False, schema: str = SCHEMA,
         widths: str = "128,256,512", epochs: int = 40, stockfish_config: str = "stockfish-config.tsv",
-        seed: int = 1):
-    if schema != SCHEMA:
+        seed: int = 1, capacity_selection: str | None = None):
+    if schema not in (SCHEMA, HALFKA_SCHEMA):
         raise ValueError(f"unsupported schema: {schema}")
     config_text = pathlib.Path(stockfish_config).read_text(encoding="utf-8")
     manifest, _ = build_corpus.remote(run_id, smoke)
-    labels = label_manifest.remote(run_id, manifest, config_text)
+    control_labels = label_manifest.remote(run_id, manifest, config_text, SCHEMA)
+    control_data = json.dumps(control_labels, sort_keys=True)
+    labels = control_labels if schema == SCHEMA else label_manifest.remote(run_id, manifest, config_text, schema)
     data_text = json.dumps(labels, sort_keys=True)
+    input_dimension = INPUT_DIMENSION if schema == SCHEMA else HALFKA_INPUT_DIMENSION
+    if schema == HALFKA_SCHEMA:
+        if not capacity_selection:
+            raise ValueError("--capacity-selection is required for HalfKA")
+        selected = json.loads(pathlib.Path(capacity_selection).read_text(encoding="utf-8"))
+        candidate_widths = selected_halfka_widths(selected)
+    else:
+        candidate_widths = [int(value) for value in widths.split(",") if value]
+    control_net = train_net.remote(control_data, SCHEMA, INPUT_DIMENSION, 128, epochs, run_id, seed)
+    control_hash = _sha256(control_data + f"{SCHEMA}:{INPUT_DIMENSION}:128:{epochs}:{seed}")
+    control = read_report.remote(run_id, 128, control_hash)
     reports = []
-    for width in (int(value) for value in widths.split(",") if value):
-        net = train_net.remote(data_text, schema, INPUT_DIMENSION, width, epochs, run_id, seed)
-        input_hash = _sha256(data_text + f"{schema}:{INPUT_DIMENSION}:{width}:{epochs}:{seed}")
+    for width in candidate_widths:
+        net = control_net if schema == SCHEMA and width == 128 else train_net.remote(
+            data_text, schema, input_dimension, width, epochs, run_id, seed)
+        input_hash = _sha256(data_text + f"{schema}:{input_dimension}:{width}:{epochs}:{seed}")
         report = read_report.remote(run_id, width, input_hash)
         reports.append((width, net, report))
         print(f"manifest SHA {_sha256(manifest)}; seed {seed}; width {width}: {json.dumps(report, sort_keys=True)}")
-    control = reports[0][2]
     for width, net, report in reports:
         offline_ok = (
             report["validation_wdl_loss"] <= control["validation_wdl_loss"] * 0.98
@@ -220,6 +286,17 @@ def run(run_id: str = "smoke-v1", smoke: bool = False, schema: str = SCHEMA,
             and report["quantization_max_error_cp"] <= 32
         )
         if offline_ok:
+            rust_parity_check.remote(net)
             screen = run_screen.remote(net)
             print(f"width {width} screen (384 games): {screen[0]}W {screen[1]}D {screen[2]}L")
-            print(f"width {width} promotion: {'promoted' if promotes(report, control, screen) else 'rejected'}")
+            if promotes(report, control, screen):
+                verdict = run_full_gate.remote(net, run_id)
+                assert verdict["games"] == 2304
+                print(f"width {width} full gate: {json.dumps(verdict, sort_keys=True)}")
+            else:
+                print(f"width {width} promotion: rejected")
+                if schema == HALFKA_SCHEMA:
+                    break
+        elif schema == HALFKA_SCHEMA:
+            print(f"width {width} promotion: rejected before screen")
+            break

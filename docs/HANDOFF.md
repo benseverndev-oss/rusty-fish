@@ -166,6 +166,20 @@ baseline.**
    for better scaling; **Ponder** and **MultiPV** UCI options; an SPSA campaign
    to tune `SearchParams`; time-management tuning.
 
+## HalfKA promotion records (2026-07-14)
+
+No HalfKA campaign has been run from this checkout. The reproducible promotion
+path is now `modal run modal/app.py --run-id <id> --schema halfka-v2-64
+--capacity-selection <capacity-selection.json>` with the same calibrated
+Stockfish configuration used by its v1-128 control.
+
+For every real run, append: run ID; corpus and Stockfish-config hashes;
+`halfka-v2-64` architecture and attempted widths; model checksum and
+quantization maximum error; 384-game screen W/D/L; then (only if promoted) the
+2,304-game W/D/L, Elo, LLR, SPRT decision, and campaign URL. An `AcceptH0` is a
+failed branch. An `AcceptH1` authorizes a separate adoption design only; it does
+not embed the net automatically.
+
 ## Gotchas
 
 - **`workspace` CI status** can show a combined "pending" because there are no

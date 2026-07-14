@@ -90,24 +90,31 @@ def _ragged_to_bag(rows):
     )
 
 
-def train(data_path: str, hidden: int, epochs: int, batch_size: int, lr: float, device: str,
-          schema: str = "v1", input_dimension: int = INPUT_DIMENSION, seed: int = 1):
+def _bucket_count(schema: str, buckets: int | None = None) -> int:
+    """Return and validate the HalfKA bucket count encoded by ``schema``."""
+    if schema == "v1":
+        if buckets not in (None, 0):
+            raise ValueError("v1 does not have king buckets")
+        return 0
+    prefix = "halfka-v2-"
+    if not schema.startswith(prefix):
+        raise ValueError(f"unsupported RFNN schema: {schema}")
+    try:
+        parsed = int(schema[len(prefix):])
+    except ValueError as error:
+        raise ValueError(f"invalid HalfKA schema: {schema}") from error
+    if parsed != 64 or (buckets is not None and buckets != parsed):
+        raise ValueError("HalfKA v2 requires exactly 64 king buckets")
+    return parsed
+
+
+def tiny_model(schema: str, input_dimension: int, hidden: int):
+    """Build the RFNN-shaped PyTorch module used by training and export tests."""
     import torch
     from torch import nn
 
-    torch.manual_seed(seed)
-    if device.startswith("cuda"):
-        torch.cuda.manual_seed_all(seed)
-    owns, opps, targets = _load_samples(data_path, schema, input_dimension)
-    if not owns:
-        raise SystemExit(f"no training samples in {data_path}")
-
-    own_values, own_offsets = _ragged_to_bag(owns)
-    opp_values, opp_offsets = _ragged_to_bag(opps)
-    target = torch.tensor(targets, dtype=torch.float32)
-
     class Nnue(nn.Module):
-        def __init__(self, hidden: int):
+        def __init__(self):
             super().__init__()
             # weight[feature] is the hidden-vector added to the accumulator, which
             # is exactly the RFNN feature_weights row-major (feature*hidden + i)
@@ -128,7 +135,27 @@ def train(data_path: str, hidden: int, epochs: int, batch_size: int, lr: float, 
             # pred is centipawns (inference divides the integer output by 64).
             return self.output(features).squeeze(1) / OUTPUT_SCALE
 
-    model = Nnue(hidden).to(device)
+    _bucket_count(schema)
+    if input_dimension <= 0 or hidden <= 0:
+        raise ValueError("input dimension and hidden size must be positive")
+    return Nnue()
+
+
+def train(data_path: str, schema: str, input_dimension: int, hidden: int, epochs: int,
+          batch_size: int, lr: float, device: str, seed: int = 1):
+    import torch
+
+    torch.manual_seed(seed)
+    if device.startswith("cuda"):
+        torch.cuda.manual_seed_all(seed)
+    owns, opps, targets = _load_samples(data_path, schema, input_dimension)
+    if not owns:
+        raise SystemExit(f"no training samples in {data_path}")
+
+    own_values, own_offsets = _ragged_to_bag(owns)
+    opp_values, opp_offsets = _ragged_to_bag(opps)
+    target = torch.tensor(targets, dtype=torch.float32)
+    model = tiny_model(schema, input_dimension, hidden).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     own_values, own_offsets = own_values.to(device), own_offsets.to(device)
@@ -203,8 +230,18 @@ def quantization_max_error_cp(model, data_path: str, device: str, schema: str = 
         return float((float_prediction - quantized_prediction).abs().max().item())
 
 
-def quantize_and_write(model, hidden: int, out_path: str) -> None:
+def quantize_and_write(model, schema: str, input_dimension: int, buckets: int,
+                       hidden: int, out_path: str) -> None:
+    """Write the exact Rust RFNN v1/v2 binary contract.
+
+    v1 deliberately retains its historical layout.  v2 writes the schema tag,
+    64 bucket count, and explicit input dimension before the hidden width.
+    """
     import torch
+
+    parsed_buckets = _bucket_count(schema, buckets)
+    if model.transformer.weight.shape != (input_dimension, hidden):
+        raise ValueError("model dimensions do not match RFNN export arguments")
 
     with torch.no_grad():
         w1 = model.transformer.weight.detach().cpu()          # [INPUT, hidden]
@@ -222,7 +259,13 @@ def quantize_and_write(model, hidden: int, out_path: str) -> None:
 
     blob = bytearray()
     blob += MAGIC
-    blob += struct.pack("<I", FORMAT_VERSION)
+    if schema == "v1":
+        blob += struct.pack("<I", FORMAT_VERSION)
+    else:
+        blob += struct.pack("<I", 2)
+        blob += struct.pack("<B", 1)  # Rust HALFKA_SCHEMA_TAG
+        blob += struct.pack("<B", parsed_buckets)
+        blob += struct.pack("<I", input_dimension)
     blob += struct.pack("<I", hidden)
     blob += struct.pack(f"<{len(fw)}h", *fw)
     blob += struct.pack(f"<{len(fb)}h", *fb)
@@ -230,7 +273,7 @@ def quantize_and_write(model, hidden: int, out_path: str) -> None:
     blob += struct.pack("<i", ob)
     with open(out_path, "wb") as handle:
         handle.write(blob)
-    print(f"wrote {out_path} ({len(blob)} bytes, hidden={hidden})", file=sys.stderr)
+    print(f"wrote {out_path} ({len(blob)} bytes, schema={schema}, hidden={hidden})", file=sys.stderr)
 
 
 def main():
@@ -242,13 +285,18 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--schema", default="v1")
+    parser.add_argument("--input-dimension", type=int, default=INPUT_DIMENSION)
+    parser.add_argument("--buckets", type=int, default=0)
     args = parser.parse_args()
 
     import torch
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model = train(args.data, args.hidden, args.epochs, args.batch_size, args.lr, device)
-    quantize_and_write(model, args.hidden, args.out)
+    model = train(args.data, args.schema, args.input_dimension, args.hidden,
+                  args.epochs, args.batch_size, args.lr, device)
+    quantize_and_write(model, args.schema, args.input_dimension, args.buckets,
+                       args.hidden, args.out)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,9 @@
 # Manifest-backed Modal NNUE experiments
 
-This is the v1 NNUE capacity ladder: a reproducible corpus is built first,
-labelled against an explicit Stockfish configuration, then the same manifest is
-used to train 128, 256, and 512-wide `EmbeddingBag(..., mode="sum")` networks.
+This pipeline first runs the v1 NNUE capacity ladder, then trains eligible
+64-bucket HalfKA v2 candidates from the same reproducible corpus. Positions are
+labelled against an explicit Stockfish configuration, and the v1 ladder trains
+128, 256, and 512-wide `EmbeddingBag(..., mode="sum")` networks.
 Each stage is immutable and stored in the Modal Volume as
 `runs/<run-id>/<stage>-<sha256>`. Repeating the identical input reuses its
 artifact; a conflicting result at that address is rejected.
@@ -26,6 +27,21 @@ modal run modal/app.py --run-id smoke-v1 --smoke --schema v1 --widths 128,256,51
   --stockfish-config stockfish-config.tsv --seed 1
 ```
 
+After a capacity selection report names `selected_width` (`128`, `256`, or
+`512`), run HalfKA with its deterministic ladder:
+
+```bash
+modal run modal/app.py --run-id smoke-halfka --smoke --schema halfka-v2-64 \
+  --capacity-selection runs/smoke-v1/capacity-selection.json \
+  --stockfish-config stockfish-config.tsv --seed 1
+```
+
+The mapping is `128 -> [128, 256]`, `256 -> [256, 512]`, and `512 -> [512]`.
+The first HalfKA candidate that fails promotion stops the ladder. Exported v2
+networks carry RFNN version 2, schema tag 1, bucket count 64, and input
+dimension 40,960; a Rust one-opening gate confirms the file loads before the
+384-game screen.
+
 `--smoke` creates a 1,000-position corpus; omit it for the 1,000,000-position
 corpus. The manifest and its split shards are passed explicitly between every
 stage—there is no module-level run state.
@@ -42,6 +58,13 @@ the quantization bound. The screen is 12 deterministic shards of 16 openings
 192 score points (`W + 0.5D`); the entrypoint prints the resulting promotion
 decision.
 
+Only a promoted HalfKA candidate runs the full 2,304-game gate: 12 shards of
+96 openings, depth 4, and `gate-file ... 100`. The GitHub Actions workflow is
+dispatch-only: provide the immutable network URL, its SHA-256, and the corpus
+manifest SHA-256. It verifies the network before playing the same 12-shard gate
+and prints aggregate W/D/L plus the engine SPRT (Elo, LLR, and decision).
+`AcceptH0` is a failed branch; `AcceptH1` requires a separate adoption design.
+
 ## Local checks
 
 ```bash
@@ -49,6 +72,7 @@ python -m pytest modal -q
 ```
 
 The Python test verifies that a mixed schema (or out-of-range feature index) is
-rejected before GPU training. Modal execution requires valid Modal credentials,
+rejected before GPU training and that the HalfKA RFNN v2 header matches Rust's
+contract. Modal execution requires valid Modal credentials,
 the configured Stockfish binary, and an available GPU; it is intentionally not
 part of a local unit-test run.
