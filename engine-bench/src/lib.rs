@@ -962,10 +962,10 @@ mod tests {
         run_spsa_campaign, run_tactical_suite, search_params_to_vector, spsa_tsv_report,
         spsa_update, sprt, tactical_solve_rate, tactical_tsv_report, throughput_tsv_report,
         vector_to_search_params, MatchConfig, SprtConfig, SprtDecision, random_opening_fens,
-        run_nnue_gauntlet, summarize,
+        run_nnue_gauntlet, run_nnue_gauntlet_with_move_time, summarize,
     };
     use engine_search::{Nnue, SearchParams};
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     #[test]
     fn random_openings_are_legal_and_varied() {
@@ -995,6 +995,24 @@ mod tests {
         .expect("gauntlet runs");
         assert_eq!(records.len(), 2);
         assert_eq!(summarize(&records).games(), 2);
+    }
+
+    #[test]
+    fn timed_nnue_gauntlet_stops_each_search_at_its_move_budget() {
+        let records = run_nnue_gauntlet_with_move_time(
+            &["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"],
+            Arc::new(Nnue::from_seed(1, 8)),
+            MatchConfig {
+                candidate_depth: 4,
+                baseline_depth: 4,
+                max_plies: 160,
+            },
+            Duration::ZERO,
+        )
+        .expect("timed gauntlet runs");
+
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| record.plies == 0));
     }
 
     #[test]
