@@ -12,7 +12,8 @@ use engine_bench::dataset::{
     DatasetManifest, PositionRecord, TEST_SPLIT, TRAIN_SPLIT, VALIDATION_SPLIT,
     canonical_fen, deduplicate_and_split, sha256_hex, write_manifest,
 };
-use engine_search::{Nnue, SearchParams};
+use engine_bench::stockfish::{StockfishConfig, calibrate_node_budget, label_positions};
+use engine_search::{Nnue, SearchParams, active_features};
 use engine_core::Board;
 
 const BENCHMARKS: &[(&str, u8)] = &[
@@ -51,6 +52,12 @@ const EXTERNAL_SPRT_POSITIONS: &[&str] = &[
 ];
 
 fn main() -> Result<(), String> {
+    if std::env::args().nth(1).as_deref() == Some("stockfish-calibrate") {
+        return stockfish_calibrate();
+    }
+    if std::env::args().nth(1).as_deref() == Some("stockfish-label") {
+        return stockfish_label();
+    }
     if std::env::args().nth(1).as_deref() == Some("dataset-build") {
         return dataset_build();
     }
@@ -231,6 +238,69 @@ fn main() -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()?;
     print!("{}", throughput_tsv_report(&samples));
     Ok(())
+}
+
+fn stockfish_calibrate() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 6 { return Err("usage: stockfish-calibrate <manifest> <stockfish> <sha256> <out_config>".into()); }
+    let fens = manifest_fens(Path::new(&args[2]), None)?;
+    let mut config = StockfishConfig {
+        binary: args[3].clone().into(), binary_sha256: args[4].clone(), hash_mb: 16,
+        node_budget: 25_000, response_timeout: Duration::from_secs(30),
+    };
+    config.node_budget = calibrate_node_budget(&config, &fens)?;
+    write_stockfish_config(Path::new(&args[5]), &config)
+}
+
+fn stockfish_label() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 6 { return Err("usage: stockfish-label <manifest> <split> <stockfish_config> <out_tsv>".into()); }
+    let fens = manifest_fens(Path::new(&args[2]), Some(&args[3]))?;
+    let config = read_stockfish_config(Path::new(&args[4]))?;
+    let labels = label_positions(&config, &fens)?;
+    let mut output = String::new();
+    for label in labels {
+        let board = Board::from_fen(&label.fen)?;
+        let own = join_usize(&active_features(&board, board.side_to_move));
+        let opp = join_usize(&active_features(&board, board.side_to_move.opposite()));
+        output.push_str(&format!("{}\t{}\t{}\t{}\t{}\n", label.score_cp, own, opp, label.fen, label.nodes));
+    }
+    let out = Path::new(&args[5]);
+    if out.exists() { return Err(format!("refusing to overwrite label output {}", out.display())); }
+    std::fs::write(out, output).map_err(|error| format!("failed to write {}: {error}", out.display()))
+}
+
+fn manifest_fens(manifest_path: &Path, requested_split: Option<&str>) -> Result<Vec<String>, String> {
+    let manifest = engine_bench::dataset::read_manifest(manifest_path)?;
+    let split = requested_split.unwrap_or(TRAIN_SPLIT);
+    let index = match split { TRAIN_SPLIT => 0, VALIDATION_SPLIT => 1, TEST_SPLIT => 2, _ => return Err(format!("unknown dataset split: {split}")) };
+    let shard = manifest_path.parent().ok_or_else(|| "manifest has no parent directory".to_string())?.join(format!("{split}.tsv"));
+    let bytes = std::fs::read(&shard).map_err(|error| format!("failed to read split {}: {error}", shard.display()))?;
+    if sha256_hex(&bytes) != manifest.shard_sha256[index] { return Err(format!("split FEN hash does not match manifest: {split}")); }
+    let text = std::str::from_utf8(&bytes).map_err(|_| format!("split is not UTF-8: {}", shard.display()))?;
+    if text.lines().next() != Some("fen\tsource") { return Err(format!("invalid split header: {split}")); }
+    text.lines().skip(1).map(|line| line.split_once('\t').map(|(fen, _)| fen.to_string()).ok_or_else(|| format!("invalid split row: {line}"))).collect()
+}
+
+fn write_stockfish_config(path: &Path, config: &StockfishConfig) -> Result<(), String> {
+    if path.exists() { return Err(format!("refusing to overwrite Stockfish config {}", path.display())); }
+    let body = format!("stockfish_config\t1\nbinary\t{}\nbinary_sha256\t{}\nhash_mb\t{}\nnode_budget\t{}\nresponse_timeout_ms\t{}\n", config.binary.display(), config.binary_sha256, config.hash_mb, config.node_budget, config.response_timeout.as_millis());
+    std::fs::write(path, body).map_err(|error| format!("failed to write {}: {error}", path.display()))
+}
+
+fn read_stockfish_config(path: &Path) -> Result<StockfishConfig, String> {
+    let text = std::fs::read_to_string(path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let mut lines = text.lines();
+    if lines.next() != Some("stockfish_config\t1") { return Err("unsupported Stockfish config format".into()); }
+    let mut values = BTreeMap::new();
+    for line in lines { let (key, value) = line.split_once('\t').ok_or_else(|| format!("invalid Stockfish config line: {line}"))?; if values.insert(key, value).is_some() { return Err(format!("duplicate Stockfish config field: {key}")); } }
+    Ok(StockfishConfig {
+        binary: values.remove("binary").ok_or_else(|| "Stockfish config missing binary".to_string())?.into(),
+        binary_sha256: values.remove("binary_sha256").ok_or_else(|| "Stockfish config missing binary_sha256".to_string())?.to_string(),
+        hash_mb: values.remove("hash_mb").ok_or_else(|| "Stockfish config missing hash_mb".to_string())?.parse().map_err(|_| "invalid hash_mb".to_string())?,
+        node_budget: values.remove("node_budget").ok_or_else(|| "Stockfish config missing node_budget".to_string())?.parse().map_err(|_| "invalid node_budget".to_string())?,
+        response_timeout: Duration::from_millis(values.remove("response_timeout_ms").ok_or_else(|| "Stockfish config missing response_timeout_ms".to_string())?.parse().map_err(|_| "invalid response_timeout_ms".to_string())?),
+    })
 }
 
 fn dataset_build() -> Result<(), String> {

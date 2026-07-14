@@ -1,7 +1,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -9,6 +9,7 @@ use engine_core::{Board, Color, GameStatus};
 use engine_search::{Nnue, SearchLimits, SearchParams, Searcher};
 
 pub mod dataset;
+pub mod stockfish;
 pub mod train;
 
 #[derive(Clone, Debug)]
@@ -291,7 +292,11 @@ impl Default for ExternalMatchConfig {
 
 impl ExternalMatchConfig {
     pub fn validate(&self) -> Result<(), String> {
-        match self.uci_path.as_deref().filter(|path| !path.trim().is_empty()) {
+        match self
+            .uci_path
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+        {
             Some(_) => Ok(()),
             None => Err("RUSTY_FISH_EXTERNAL_UCI must name an external UCI executable".to_string()),
         }
@@ -371,7 +376,13 @@ fn run_nnue_gauntlet_with_optional_move_time(
     let mut records = Vec::with_capacity(positions.len() * 2);
     for fen in positions {
         for candidate_color in [Color::White, Color::Black] {
-            records.push(play_nnue_game(fen, candidate_color, &net, config, move_time)?);
+            records.push(play_nnue_game(
+                fen,
+                candidate_color,
+                &net,
+                config,
+                move_time,
+            )?);
         }
     }
     Ok(records)
@@ -752,14 +763,54 @@ pub struct SpsaSpec {
 /// The tunable dimensions, in the same order as the vector produced by
 /// [`search_params_to_vector`].
 pub const SPSA_SPECS: [SpsaSpec; SPSA_DIMENSIONS] = [
-    SpsaSpec { name: "aspiration_window", min: 10.0, max: 200.0, step: 8.0 },
-    SpsaSpec { name: "razor_margin_base", min: 40.0, max: 400.0, step: 16.0 },
-    SpsaSpec { name: "razor_margin_scale", min: 10.0, max: 200.0, step: 12.0 },
-    SpsaSpec { name: "reverse_futility_base", min: 40.0, max: 400.0, step: 16.0 },
-    SpsaSpec { name: "reverse_futility_scale", min: 10.0, max: 200.0, step: 12.0 },
-    SpsaSpec { name: "late_move_pruning_base", min: 1.0, max: 10.0, step: 1.0 },
-    SpsaSpec { name: "late_move_pruning_scale", min: 1.0, max: 6.0, step: 1.0 },
-    SpsaSpec { name: "null_move_reduction", min: 2.0, max: 5.0, step: 1.0 },
+    SpsaSpec {
+        name: "aspiration_window",
+        min: 10.0,
+        max: 200.0,
+        step: 8.0,
+    },
+    SpsaSpec {
+        name: "razor_margin_base",
+        min: 40.0,
+        max: 400.0,
+        step: 16.0,
+    },
+    SpsaSpec {
+        name: "razor_margin_scale",
+        min: 10.0,
+        max: 200.0,
+        step: 12.0,
+    },
+    SpsaSpec {
+        name: "reverse_futility_base",
+        min: 40.0,
+        max: 400.0,
+        step: 16.0,
+    },
+    SpsaSpec {
+        name: "reverse_futility_scale",
+        min: 10.0,
+        max: 200.0,
+        step: 12.0,
+    },
+    SpsaSpec {
+        name: "late_move_pruning_base",
+        min: 1.0,
+        max: 10.0,
+        step: 1.0,
+    },
+    SpsaSpec {
+        name: "late_move_pruning_scale",
+        min: 1.0,
+        max: 6.0,
+        step: 1.0,
+    },
+    SpsaSpec {
+        name: "null_move_reduction",
+        min: 2.0,
+        max: 5.0,
+        step: 1.0,
+    },
 ];
 
 /// Projects a [`SearchParams`] onto the tunable vector.
@@ -980,12 +1031,12 @@ pub fn spsa_tsv_report(report: &SpsaReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TACTICAL_SUITE, ExternalMatchConfig, MatchScore, SPSA_DIMENSIONS, SPSA_SPECS,
-        SpsaConfig, SpsaRng, external_match_game_count, external_tsv_report, measure_throughput,
-        run_spsa_campaign, run_tactical_suite, search_params_to_vector, spsa_tsv_report,
-        spsa_update, sprt, tactical_solve_rate, tactical_tsv_report, throughput_tsv_report,
-        vector_to_search_params, MatchConfig, SprtConfig, SprtDecision, random_opening_fens,
-        run_nnue_gauntlet, run_nnue_gauntlet_with_move_time, summarize,
+        external_match_game_count, external_tsv_report, measure_throughput, random_opening_fens,
+        run_nnue_gauntlet, run_nnue_gauntlet_with_move_time, run_spsa_campaign, run_tactical_suite,
+        search_params_to_vector, sprt, spsa_tsv_report, spsa_update, summarize,
+        tactical_solve_rate, tactical_tsv_report, throughput_tsv_report, vector_to_search_params,
+        ExternalMatchConfig, MatchConfig, MatchScore, SprtConfig, SprtDecision, SpsaConfig,
+        SpsaRng, DEFAULT_TACTICAL_SUITE, SPSA_DIMENSIONS, SPSA_SPECS,
     };
     use engine_search::{Nnue, SearchParams};
     use std::{sync::Arc, time::Duration};
@@ -995,7 +1046,10 @@ mod tests {
         let fens = random_opening_fens(8, 6, 42);
         assert_eq!(fens.len(), 8);
         for fen in &fens {
-            assert!(engine_core::Board::from_fen(fen).is_ok(), "opening FEN parses: {fen}");
+            assert!(
+                engine_core::Board::from_fen(fen).is_ok(),
+                "opening FEN parses: {fen}"
+            );
         }
         // The walks diverge, so not every opening is identical.
         let unique: std::collections::HashSet<&String> = fens.iter().collect();
@@ -1068,8 +1122,14 @@ mod tests {
         for index in 0..SPSA_DIMENSIONS {
             // Defaults sit strictly inside the bounds, so a decisive result moves
             // every parameter in the direction of the stronger side.
-            assert!(up[index] > theta[index], "dimension {index} should increase");
-            assert!(down[index] < theta[index], "dimension {index} should decrease");
+            assert!(
+                up[index] > theta[index],
+                "dimension {index} should increase"
+            );
+            assert!(
+                down[index] < theta[index],
+                "dimension {index} should decrease"
+            );
         }
         // A drawn result leaves the parameters unchanged.
         assert_eq!(spsa_update(&theta, &direction, 0.5, 1.0), theta);
@@ -1132,15 +1192,13 @@ mod tests {
 
     #[test]
     fn winning_score_has_positive_elo_difference() {
-        assert!(
-            MatchScore {
-                wins: 7,
-                draws: 2,
-                losses: 1,
-            }
-            .elo_difference()
-            .is_some_and(|elo| elo > 0.0)
-        );
+        assert!(MatchScore {
+            wins: 7,
+            draws: 2,
+            losses: 1,
+        }
+        .elo_difference()
+        .is_some_and(|elo| elo > 0.0));
     }
 
     #[test]
