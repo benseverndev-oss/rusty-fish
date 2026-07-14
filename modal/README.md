@@ -22,12 +22,13 @@ artifact; a conflicting result at that address is rejected.
 
 ## Run
 
-First create the run-specific config in Modal. This calibrates the deterministic
-1,000-position sample from that run's training split against the pinned Linux
-Stockfish 18 binary and writes the resulting config to the requested local path:
+First create the run-specific config with the direct remote function. It builds
+the corpus and calibrates the deterministic 1,000-position training sample in
+one Modal execution against the pinned Linux Stockfish 18 binary, then writes
+the returned config to the requested local path:
 
 ```bash
-modal run modal/app.py::calibrate --run-id stockfish18-v1 --output stockfish-config.tsv
+modal run --write-result stockfish-config.tsv modal/app.py::calibrate_run --run-id stockfish18-v1
 ```
 
 Then use that exact config for the matching run. Do not create it with a local

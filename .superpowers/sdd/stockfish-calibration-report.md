@@ -67,6 +67,29 @@ check, Rust build, and application behavior are unchanged.
 - CLI regression: `C:\Users\bsevern\AppData\Local\Programs\Python\Python312\python.exe -m modal run modal/app.py::calibrate --help`
   succeeded and still exposes the calibration entrypoint options.
 
+## Direct remote calibration remediation
+
+The Windows local-entrypoint invocation created Modal objects but did not invoke
+any function after `Created objects`, so no calibration container appeared in
+the app logs. `calibrate_run` is now a direct `@app.function` that builds (or
+reuses the immutable corpus artifacts) and calibrates within one remote
+execution; it does not rely on a local entrypoint dispatching nested remote
+calls.
+
+Use the Modal CLI's global result writer (before the function reference):
+
+```text
+modal run --write-result stockfish-config.tsv modal/app.py::calibrate_run --run-id stockfish18-v1
+```
+
+- RED: the new direct-function regression failed because
+  `_build_corpus_artifacts` did not exist.
+- GREEN: `C:\Users\bsevern\AppData\Local\Programs\Python\Python312\python.exe -m pytest modal/test_train_nnue.py -q`
+  passed: 18 passed, 2 expected Modal local-execution warnings.
+- CLI verification: `C:\Users\bsevern\AppData\Local\Programs\Python\Python312\python.exe -m modal run --help`
+  confirms the global `--write-result` option; function help for
+  `modal/app.py::calibrate_run` confirms `--run-id` and `--smoke`.
+
 ## Modal image-path remediation
 
 Real Modal image construction exposed a path collision: the Stockfish archive

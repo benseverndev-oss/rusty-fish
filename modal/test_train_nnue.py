@@ -178,6 +178,29 @@ def test_calibration_entrypoint_writes_the_remote_config_to_the_requested_path(t
     assert output.read_text(encoding="utf-8") == "stockfish_config\\t1\\n"
 
 
+def test_calibrate_run_builds_and_calibrates_within_one_remote_function(monkeypatch):
+    import app
+
+    calls = []
+    monkeypatch.setattr(
+        app, "_build_corpus_artifacts",
+        lambda run_id, smoke: calls.append(("corpus", run_id, smoke)) or ("manifest", "positions"),
+    )
+    monkeypatch.setattr(
+        app, "_calibrate_remote_stockfish_config",
+        lambda manifest, positions, _root: calls.append(("calibrate", manifest, positions)) or "config-tsv\n",
+    )
+    monkeypatch.setattr(
+        app, "_write_artifact",
+        lambda run_id, stage, _input, contents, name: calls.append(("artifact", run_id, stage, contents, name)),
+    )
+
+    assert app.calibrate_run.local("direct-run", True) == "config-tsv\n"
+    assert calls[0] == ("corpus", "direct-run", True)
+    assert calls[1] == ("calibrate", "manifest", "positions")
+    assert calls[2] == ("artifact", "direct-run", "stockfish-config", "config-tsv\n", "stockfish-config.tsv")
+
+
 def test_load_samples_rejects_mixed_schema_or_feature_dimension(tmp_path):
     path = tmp_path / "mixed.tsv"
     path.write_text(

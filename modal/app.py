@@ -172,8 +172,8 @@ def _calibrate_remote_stockfish_config(manifest_text: str, corpus_payload: str,
     return config_path.read_text(encoding="utf-8")
 
 
-@app.function(image=rust_image, volumes={"/artifacts": artifacts}, timeout=60 * 60)
-def build_corpus(run_id: str, smoke: bool) -> tuple[str, str]:
+def _build_corpus_artifacts(run_id: str, smoke: bool) -> tuple[str, str]:
+    """Build one corpus and persist its manifest-addressed source splits."""
     args = [BIN, "dataset-build", run_id, "/tmp/corpus", "400000", "400000", "200000", "1"]
     if smoke:
         # dataset-build deliberately caps smoke totals; preserve the same composition ratio.
@@ -186,6 +186,11 @@ def build_corpus(run_id: str, smoke: bool) -> tuple[str, str]:
     _write_artifact(run_id, "corpus-manifest", corpus_input, manifest)
     _write_artifact(run_id, "corpus-positions", manifest, positions)
     return manifest, positions
+
+
+@app.function(image=rust_image, volumes={"/artifacts": artifacts}, timeout=60 * 60)
+def build_corpus(run_id: str, smoke: bool) -> tuple[str, str]:
+    return _build_corpus_artifacts(run_id, smoke)
 
 
 @app.function(image=rust_image, volumes={"/artifacts": artifacts}, timeout=60 * 60)
@@ -202,6 +207,20 @@ def calibrate_stockfish_config(run_id: str, manifest_text: str) -> str:
     _write_artifact(
         run_id, "stockfish-config", manifest_text + binary_sha256, config,
         "stockfish-config.tsv",
+    )
+    return config
+
+
+@app.function(image=rust_image, volumes={"/artifacts": artifacts}, timeout=60 * 60)
+def calibrate_run(run_id: str, smoke: bool = False) -> str:
+    """Build and calibrate one run entirely inside a single Modal function."""
+    manifest, positions = _build_corpus_artifacts(run_id, smoke)
+    with tempfile.TemporaryDirectory() as directory:
+        config = _calibrate_remote_stockfish_config(
+            manifest, positions, pathlib.Path(directory)
+        )
+    _write_artifact(
+        run_id, "stockfish-config", manifest + config, config, "stockfish-config.tsv"
     )
     return config
 
