@@ -18,9 +18,10 @@ LEARNING_RATE = 1e-3
 STOCKFISH_18_URL = "https://github.com/official-stockfish/Stockfish/releases/download/sf_18/stockfish-ubuntu-x86-64.tar"
 STOCKFISH_18_ARCHIVE_SHA256 = "5c6f38b02a4da5f3ffe763f27da6c3e743eebefd92b50cb3661623b96696adff"
 REMOTE_STOCKFISH = "/opt/stockfish/stockfish"
+RUST_IMAGE_BASE = "debian@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df"
 
 rust_image = (
-    modal.Image.debian_slim()
+    modal.Image.from_registry(RUST_IMAGE_BASE, add_python="3.12")
     .apt_install("curl", "build-essential", "pkg-config")
     .run_commands(
         f"curl --fail --location --retry 3 --output /tmp/stockfish-18.tar {STOCKFISH_18_URL}",

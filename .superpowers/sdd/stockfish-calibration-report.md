@@ -51,3 +51,18 @@ image. No credential values are accepted, logged, or written by this path.
 - The Modal calibration itself was not launched during this change; it would
   consume remote compute. The entrypoint's CLI shape and local behavior are
   verified, while the remote subprocess is covered with a focused unit test.
+
+## Reproducibility remediation
+
+The Rust/Stockfish Modal image now starts from the immutable official Debian
+bookworm-slim reference
+`debian@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df`
+via `modal.Image.from_registry(..., add_python="3.12")`, rather than a moving
+`debian_slim()` tag. The existing package install, Stockfish archive digest
+check, Rust build, and application behavior are unchanged.
+
+- RED: `C:\Users\bsevern\AppData\Local\Programs\Python\Python312\python.exe -m pytest modal/test_train_nnue.py -q`
+  failed because `RUST_IMAGE_BASE` did not exist.
+- GREEN: the same command passed: 16 passed, 1 existing Modal local-volume warning.
+- CLI regression: `C:\Users\bsevern\AppData\Local\Programs\Python\Python312\python.exe -m modal run modal/app.py::calibrate --help`
+  succeeded and still exposes the calibration entrypoint options.

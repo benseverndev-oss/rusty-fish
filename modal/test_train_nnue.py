@@ -10,6 +10,14 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from train_nnue import _load_samples
 
 
+def test_rust_image_uses_the_pinned_debian_bookworm_slim_digest():
+    import app
+
+    assert app.RUST_IMAGE_BASE == (
+        "debian@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df"
+    )
+
+
 def test_gate_outcome_records_addressed_inputs_wdl_and_sprt_verdict():
     import app
 
