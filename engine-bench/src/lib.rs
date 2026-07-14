@@ -347,10 +347,30 @@ pub fn run_nnue_gauntlet(
     net: Arc<Nnue>,
     config: MatchConfig,
 ) -> Result<Vec<GameRecord>, String> {
+    run_nnue_gauntlet_with_optional_move_time(positions, net, config, None)
+}
+
+/// Plays a bounded NNUE gauntlet. Every search receives the same per-move
+/// deadline so an unusually expensive position cannot stall a whole campaign.
+pub fn run_nnue_gauntlet_with_move_time(
+    positions: &[&str],
+    net: Arc<Nnue>,
+    config: MatchConfig,
+    move_time: Duration,
+) -> Result<Vec<GameRecord>, String> {
+    run_nnue_gauntlet_with_optional_move_time(positions, net, config, Some(move_time))
+}
+
+fn run_nnue_gauntlet_with_optional_move_time(
+    positions: &[&str],
+    net: Arc<Nnue>,
+    config: MatchConfig,
+    move_time: Option<Duration>,
+) -> Result<Vec<GameRecord>, String> {
     let mut records = Vec::with_capacity(positions.len() * 2);
     for fen in positions {
         for candidate_color in [Color::White, Color::Black] {
-            records.push(play_nnue_game(fen, candidate_color, &net, config)?);
+            records.push(play_nnue_game(fen, candidate_color, &net, config, move_time)?);
         }
     }
     Ok(records)
@@ -404,6 +424,7 @@ fn play_nnue_game(
     candidate_color: Color,
     net: &Arc<Nnue>,
     config: MatchConfig,
+    move_time: Option<Duration>,
 ) -> Result<GameRecord, String> {
     let mut board = Board::from_fen(fen)?;
     let mut candidate = Searcher::default();
@@ -419,6 +440,7 @@ fn play_nnue_game(
             &board,
             SearchLimits {
                 depth: Some(depth),
+                movetime: move_time,
                 ..SearchLimits::default()
             },
         );
@@ -962,10 +984,10 @@ mod tests {
         run_spsa_campaign, run_tactical_suite, search_params_to_vector, spsa_tsv_report,
         spsa_update, sprt, tactical_solve_rate, tactical_tsv_report, throughput_tsv_report,
         vector_to_search_params, MatchConfig, SprtConfig, SprtDecision, random_opening_fens,
-        run_nnue_gauntlet, summarize,
+        run_nnue_gauntlet, run_nnue_gauntlet_with_move_time, summarize,
     };
     use engine_search::{Nnue, SearchParams};
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     #[test]
     fn random_openings_are_legal_and_varied() {
@@ -995,6 +1017,24 @@ mod tests {
         .expect("gauntlet runs");
         assert_eq!(records.len(), 2);
         assert_eq!(summarize(&records).games(), 2);
+    }
+
+    #[test]
+    fn timed_nnue_gauntlet_stops_each_search_at_its_move_budget() {
+        let records = run_nnue_gauntlet_with_move_time(
+            &["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"],
+            Arc::new(Nnue::from_seed(1, 8)),
+            MatchConfig {
+                candidate_depth: 4,
+                baseline_depth: 4,
+                max_plies: 160,
+            },
+            Duration::ZERO,
+        )
+        .expect("timed gauntlet runs");
+
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| record.plies == 0));
     }
 
     #[test]
