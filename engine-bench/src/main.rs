@@ -77,13 +77,24 @@ fn main() -> Result<(), String> {
             .nth(3)
             .and_then(|arg| arg.parse::<u32>().ok())
             .unwrap_or(48);
+        // Optional 4th arg: label with a depth-N search instead of static eval.
+        // A value of 0 means static labels.
+        let label_depth = std::env::args()
+            .nth(4)
+            .and_then(|arg| arg.parse::<u8>().ok())
+            .filter(|depth| *depth > 0);
         let config = TrainConfig::default();
-        let samples = generate_training_samples(EXTERNAL_SPRT_POSITIONS, plies, config.seed)?;
+        let samples =
+            generate_training_samples(EXTERNAL_SPRT_POSITIONS, plies, config.seed, label_depth)?;
         let (network, report) = train_nnue(&samples, config)?;
         std::fs::write(&path, network.to_bytes())
             .map_err(|error| format!("failed to write network {path}: {error}"))?;
+        let teacher = match label_depth {
+            Some(depth) => format!("depth-{depth} search"),
+            None => "static eval".to_string(),
+        };
         eprintln!(
-            "trained on {} samples: loss {:.2} -> {:.2}; wrote {path}",
+            "trained on {} samples ({teacher} labels): loss {:.2} -> {:.2}; wrote {path}",
             report.samples, report.initial_loss, report.final_loss
         );
         return Ok(());

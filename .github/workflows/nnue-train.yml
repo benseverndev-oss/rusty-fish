@@ -6,7 +6,12 @@ on:
       plies:
         description: Plies of self-play per seed position
         required: true
-        default: "48"
+        default: "32"
+        type: string
+      label_depth:
+        description: Search depth for teacher labels (0 = static evaluation)
+        required: true
+        default: "6"
         type: string
 
 permissions:
@@ -22,7 +27,8 @@ jobs:
       - name: Train a bootstrap NNUE network
         run: |
           mkdir -p artifacts
-          cargo run --release -p engine-bench -- train artifacts/rusty-fish.rfnn "${{ inputs.plies }}"
+          cargo run --release -p engine-bench -- \
+            train artifacts/rusty-fish.rfnn "${{ inputs.plies }}" "${{ inputs.label_depth }}"
       - name: Upload trained network
         uses: actions/upload-artifact@v4
         with:
