@@ -1,0 +1,30 @@
+name: NNUE Training
+
+on:
+  workflow_dispatch:
+    inputs:
+      plies:
+        description: Plies of self-play per seed position
+        required: true
+        default: "48"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Train a bootstrap NNUE network
+        run: |
+          mkdir -p artifacts
+          cargo run --release -p engine-bench -- train artifacts/rusty-fish.rfnn "${{ inputs.plies }}"
+      - name: Upload trained network
+        uses: actions/upload-artifact@v4
+        with:
+          name: rusty-fish-nnue
+          path: artifacts/rusty-fish.rfnn
