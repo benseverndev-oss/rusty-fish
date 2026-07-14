@@ -7,6 +7,8 @@ use std::time::Duration;
 use engine_core::{Board, Color, GameStatus};
 use engine_search::{SearchLimits, SearchParams, Searcher};
 
+pub mod train;
+
 #[derive(Clone, Debug)]
 pub struct ThroughputSample {
     pub fen: String,

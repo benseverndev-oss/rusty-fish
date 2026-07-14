@@ -4,6 +4,7 @@ use engine_bench::{
     run_spsa_campaign, run_tactical_suite, spsa_tsv_report, sprt_tsv_report, summarize,
     tactical_tsv_report, throughput_tsv_report,
 };
+use engine_bench::train::{generate_training_samples, train_nnue, TrainConfig};
 use engine_search::SearchParams;
 
 const BENCHMARKS: &[(&str, u8)] = &[
@@ -66,6 +67,25 @@ fn main() -> Result<(), String> {
         }
         let report = run_spsa_campaign(EXTERNAL_SPRT_POSITIONS, SearchParams::default(), config)?;
         print!("{}", spsa_tsv_report(&report));
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("train") {
+        let path = std::env::args()
+            .nth(2)
+            .unwrap_or_else(|| "artifacts/rusty-fish.rfnn".to_string());
+        let plies = std::env::args()
+            .nth(3)
+            .and_then(|arg| arg.parse::<u32>().ok())
+            .unwrap_or(48);
+        let config = TrainConfig::default();
+        let samples = generate_training_samples(EXTERNAL_SPRT_POSITIONS, plies, config.seed)?;
+        let (network, report) = train_nnue(&samples, config)?;
+        std::fs::write(&path, network.to_bytes())
+            .map_err(|error| format!("failed to write network {path}: {error}"))?;
+        eprintln!(
+            "trained on {} samples: loss {:.2} -> {:.2}; wrote {path}",
+            report.samples, report.initial_loss, report.final_loss
+        );
         return Ok(());
     }
 
