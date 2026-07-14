@@ -13,10 +13,12 @@ BIN = "/repo/target/release/engine-bench"
 SCHEMA = "v1"
 INPUT_DIMENSION = 768
 LEARNING_RATE = 1e-3
+STOCKFISH_PACKAGE = "stockfish=15.1-4"
+REMOTE_STOCKFISH = "/usr/games/stockfish"
 
 rust_image = (
     modal.Image.debian_slim()
-    .apt_install("curl", "build-essential", "pkg-config")
+    .apt_install("curl", "build-essential", "pkg-config", STOCKFISH_PACKAGE)
     .run_commands("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable")
     .add_local_dir(REPO_ROOT, remote_path="/repo", copy=True)
     .run_commands("cd /repo && $HOME/.cargo/bin/cargo build --release -p engine-bench")
@@ -57,6 +59,24 @@ def _corpus_payload(directory: str) -> str:
                        for split in ("train", "validation", "test")}, sort_keys=True)
 
 
+def _remote_stockfish_config(stockfish_config_text: str) -> str:
+    """Bind a calibrated config to the pinned engine installed in this image."""
+    fields = {}
+    for line in stockfish_config_text.splitlines():
+        if "\t" in line:
+            key, value = line.split("\t", 1)
+            fields[key] = value
+    actual_hash = _sha256(pathlib.Path(REMOTE_STOCKFISH).read_bytes())
+    if fields.get("binary_sha256") != actual_hash:
+        raise ValueError(
+            "Stockfish config binary_sha256 does not match the pinned remote Stockfish binary"
+        )
+    lines = []
+    for line in stockfish_config_text.splitlines():
+        lines.append(f"binary\t{REMOTE_STOCKFISH}" if line.startswith("binary\t") else line)
+    return "\n".join(lines) + "\n"
+
+
 @app.function(image=rust_image, volumes={"/artifacts": artifacts}, timeout=60 * 60)
 def build_corpus(run_id: str, smoke: bool) -> tuple[str, str]:
     args = [BIN, "dataset-build", run_id, "/tmp/corpus", "400000", "400000", "200000", "1"]
@@ -67,7 +87,8 @@ def build_corpus(run_id: str, smoke: bool) -> tuple[str, str]:
     subprocess.run(args, check=True)
     manifest = pathlib.Path("/tmp/corpus/manifest.tsv").read_text(encoding="utf-8")
     positions = _corpus_payload("/tmp/corpus")
-    _write_artifact(run_id, "corpus-manifest", run_id, manifest)
+    corpus_input = json.dumps({"run_id": run_id, "smoke": smoke, "counts": args[4:7], "seed": args[7]}, sort_keys=True)
+    _write_artifact(run_id, "corpus-manifest", corpus_input, manifest)
     _write_artifact(run_id, "corpus-positions", manifest, positions)
     return manifest, positions
 
@@ -86,7 +107,7 @@ def label_manifest(run_id: str, manifest_text: str, stockfish_config_text: str) 
         for split, content in payload.items():
             (root / f"{split}.tsv").write_text(content, encoding="utf-8")
         config = root / "stockfish-config.tsv"
-        config.write_text(stockfish_config_text, encoding="utf-8")
+        config.write_text(_remote_stockfish_config(stockfish_config_text), encoding="utf-8")
         result = {}
         for split in ("train", "validation", "test"):
             output = root / f"{split}-labels.tsv"
@@ -97,7 +118,8 @@ def label_manifest(run_id: str, manifest_text: str, stockfish_config_text: str) 
 
 
 @app.function(image=torch_image, gpu="A10G", volumes={"/artifacts": artifacts}, timeout=60 * 60)
-def train_net(data_text: str, schema: str, input_dimension: int, hidden: int, epochs: int, run_id: str) -> bytes:
+def train_net(data_text: str, schema: str, input_dimension: int, hidden: int, epochs: int,
+              run_id: str, seed: int = 1) -> bytes:
     import train_nnue
 
     splits = json.loads(data_text)
@@ -106,19 +128,27 @@ def train_net(data_text: str, schema: str, input_dimension: int, hidden: int, ep
         paths = {name: root / f"{name}.tsv" for name in ("train", "validation", "test")}
         for name, path in paths.items():
             path.write_text(splits[name], encoding="utf-8")
-        model = train_nnue.train(str(paths["train"]), hidden, epochs, 1024, LEARNING_RATE, "cuda", schema, input_dimension)
+        model = train_nnue.train(
+            str(paths["train"]), hidden, epochs, 1024, LEARNING_RATE, "cuda",
+            schema, input_dimension, seed,
+        )
+        train_loss = model.train_wdl_loss
         validation_loss = train_nnue.wdl_loss(model, str(paths["validation"]), "cuda", schema, input_dimension)
         test_loss = train_nnue.wdl_loss(model, str(paths["test"]), "cuda", schema, input_dimension)
+        quantization_error = train_nnue.quantization_max_error_cp(
+            model, str(paths["test"]), "cuda", schema, input_dimension,
+        )
         net = root / "net.rfnn"
-        quantization_error = train_nnue.quantize_and_write(model, hidden, str(net))
+        train_nnue.quantize_and_write(model, hidden, str(net))
         net_bytes = net.read_bytes()
     report = {
-        "validation_wdl_loss": validation_loss, "test_wdl_loss": test_loss,
+        "train_wdl_loss": train_loss, "validation_wdl_loss": validation_loss,
+        "test_wdl_loss": test_loss,
         "model_sha256": _sha256(net_bytes), "input_dimension": input_dimension,
         "schema": schema, "epochs": epochs, "learning_rate": LEARNING_RATE,
-        "quantization_max_error_cp": quantization_error,
+        "quantization_max_error_cp": quantization_error, "seed": seed,
     }
-    input_hash = _sha256(data_text + f"{schema}:{input_dimension}:{hidden}:{epochs}")
+    input_hash = _sha256(data_text + f"{schema}:{input_dimension}:{hidden}:{epochs}:{seed}")
     _write_artifact(run_id, f"net-{hidden}", input_hash, net_bytes, "net.rfnn")
     _write_artifact(run_id, f"report-{hidden}", input_hash, json.dumps(report, sort_keys=True, indent=2), "report.json")
     return net_bytes
@@ -160,7 +190,8 @@ def read_report(run_id: str, width: int, input_hash: str) -> dict:
 
 @app.local_entrypoint()
 def run(run_id: str = "smoke-v1", smoke: bool = False, schema: str = SCHEMA,
-        widths: str = "128,256,512", epochs: int = 40, stockfish_config: str = "stockfish-config.tsv"):
+        widths: str = "128,256,512", epochs: int = 40, stockfish_config: str = "stockfish-config.tsv",
+        seed: int = 1):
     if schema != SCHEMA:
         raise ValueError(f"unsupported schema: {schema}")
     config_text = pathlib.Path(stockfish_config).read_text(encoding="utf-8")
@@ -169,11 +200,11 @@ def run(run_id: str = "smoke-v1", smoke: bool = False, schema: str = SCHEMA,
     data_text = json.dumps(labels, sort_keys=True)
     reports = []
     for width in (int(value) for value in widths.split(",") if value):
-        net = train_net.remote(data_text, schema, INPUT_DIMENSION, width, epochs, run_id)
-        input_hash = _sha256(data_text + f"{schema}:{INPUT_DIMENSION}:{width}:{epochs}")
+        net = train_net.remote(data_text, schema, INPUT_DIMENSION, width, epochs, run_id, seed)
+        input_hash = _sha256(data_text + f"{schema}:{INPUT_DIMENSION}:{width}:{epochs}:{seed}")
         report = read_report.remote(run_id, width, input_hash)
         reports.append((width, net, report))
-        print(f"manifest SHA {_sha256(manifest)}; width {width}: {json.dumps(report, sort_keys=True)}")
+        print(f"manifest SHA {_sha256(manifest)}; seed {seed}; width {width}: {json.dumps(report, sort_keys=True)}")
     control = reports[0][2]
     for width, net, report in reports:
         offline_ok = (
@@ -184,3 +215,4 @@ def run(run_id: str = "smoke-v1", smoke: bool = False, schema: str = SCHEMA,
         if offline_ok:
             screen = run_screen.remote(net)
             print(f"width {width} screen (384 games): {screen[0]}W {screen[1]}D {screen[2]}L")
+            print(f"width {width} promotion: {'promoted' if promotes(report, control, screen) else 'rejected'}")

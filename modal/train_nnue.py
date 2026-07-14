@@ -21,6 +21,7 @@ Validate an exported network against the Rust engine:
 from __future__ import annotations
 
 import argparse
+import copy
 import struct
 import sys
 
@@ -76,10 +77,13 @@ def _ragged_to_bag(rows):
 
 
 def train(data_path: str, hidden: int, epochs: int, batch_size: int, lr: float, device: str,
-          schema: str = "v1", input_dimension: int = INPUT_DIMENSION):
+          schema: str = "v1", input_dimension: int = INPUT_DIMENSION, seed: int = 1):
     import torch
     from torch import nn
 
+    torch.manual_seed(seed)
+    if device.startswith("cuda"):
+        torch.cuda.manual_seed_all(seed)
     owns, opps, targets = _load_samples(data_path, schema, input_dimension)
     if not owns:
         raise SystemExit(f"no training samples in {data_path}")
@@ -136,6 +140,8 @@ def train(data_path: str, hidden: int, epochs: int, batch_size: int, lr: float, 
             total += loss.item() * len(idx)
         print(f"epoch {epoch + 1}/{epochs}: wdl_loss {total / count:.6f}", file=sys.stderr)
 
+    model.train_wdl_loss = wdl_loss(model, data_path, device, schema, input_dimension)
+    model.training_seed = seed
     return model
 
 
@@ -158,7 +164,32 @@ def wdl_loss(model, data_path: str, device: str, schema: str = "v1",
         return float(((torch.sigmoid(prediction / WDL_SCALE) - torch.sigmoid(target / WDL_SCALE)) ** 2).mean().item())
 
 
-def quantize_and_write(model, hidden: int, out_path: str) -> float:
+def quantization_max_error_cp(model, data_path: str, device: str, schema: str = "v1",
+                              input_dimension: int = INPUT_DIMENSION) -> float:
+    """Maximum sealed-split centipawn prediction delta after RFNN quantization."""
+    import torch
+
+    owns, opps, _ = _load_samples(data_path, schema, input_dimension)
+    if not owns:
+        raise ValueError(f"no quantization samples in {data_path}")
+    quantized = copy.deepcopy(model).to(device)
+    with torch.no_grad():
+        for parameter in quantized.parameters():
+            parameter.copy_(torch.clamp(torch.round(parameter), -32768, 32767))
+        own_values, own_offsets = _ragged_to_bag(owns)
+        opp_values, opp_offsets = _ragged_to_bag(opps)
+        float_prediction = model(
+            own_values.to(device), own_offsets.to(device),
+            opp_values.to(device), opp_offsets.to(device),
+        )
+        quantized_prediction = quantized(
+            own_values.to(device), own_offsets.to(device),
+            opp_values.to(device), opp_offsets.to(device),
+        )
+        return float((float_prediction - quantized_prediction).abs().max().item())
+
+
+def quantize_and_write(model, hidden: int, out_path: str) -> None:
     import torch
 
     with torch.no_grad():
@@ -167,11 +198,7 @@ def quantize_and_write(model, hidden: int, out_path: str) -> float:
         w2 = model.output.weight.detach().cpu().squeeze(0)    # [2*hidden]
         b2 = float(model.output.bias.detach().cpu().item())
 
-    maximum_error = 0.0
-
     def to_i16(t):
-        nonlocal maximum_error
-        maximum_error = max(maximum_error, float((t - torch.round(t)).abs().max().item()))
         return torch.clamp(torch.round(t), -32768, 32767).to(torch.int16)
 
     fw = to_i16(w1).reshape(-1).tolist()   # row-major feature*hidden + i
@@ -190,7 +217,6 @@ def quantize_and_write(model, hidden: int, out_path: str) -> float:
     with open(out_path, "wb") as handle:
         handle.write(blob)
     print(f"wrote {out_path} ({len(blob)} bytes, hidden={hidden})", file=sys.stderr)
-    return maximum_error
 
 
 def main():
