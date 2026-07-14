@@ -4,14 +4,14 @@ use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use engine_core::{Board, ChessMove, Color, GameStatus, Piece, PieceKind, Square};
+use engine_core::{Board, ChessMove, Color, GameStatus, Piece, PieceKind, Square, UndoState};
 use pyrrhic_rs::{
     Color as TbColor, DtzProbeValue, EngineAdapter, Piece as TbPiece, TableBases, WdlProbeResult,
 };
 
 mod nnue;
 
-pub use nnue::Nnue;
+pub use nnue::{active_features, Nnue, INPUT_DIMENSION};
 
 const MATE_SCORE: i32 = 100_000;
 const MAX_KILLER_PLY: usize = 128;
@@ -414,8 +414,22 @@ pub struct Searcher {
     options: SearchOptions,
     params: SearchParams,
     nnue: Option<Arc<Nnue>>,
+    nnue_accumulator: Option<nnue::Accumulator>,
+    nnue_stack: Vec<NnueDelta>,
     opening_book: Option<OpeningBook>,
     syzygy: Option<SyzygyTablebases>,
+}
+
+/// One square's piece change from a move: `(square, before, after)`.
+type NnueChange = (Square, Option<Piece>, Option<Piece>);
+
+/// The set of square changes a single move makes, used to update the NNUE
+/// accumulator incrementally and to reverse it on unmake. A move touches at
+/// most four squares (castling moves the king and the rook).
+#[derive(Clone, Copy)]
+struct NnueDelta {
+    changes: [NnueChange; 4],
+    len: usize,
 }
 
 impl Default for Searcher {
@@ -435,6 +449,8 @@ impl Default for Searcher {
             options: SearchOptions::default(),
             params: SearchParams::default(),
             nnue: None,
+            nnue_accumulator: None,
+            nnue_stack: Vec::new(),
             opening_book: None,
             syzygy: None,
         }
@@ -709,6 +725,8 @@ impl Searcher {
             options,
             params,
             nnue,
+            nnue_accumulator: None,
+            nnue_stack: Vec::new(),
             opening_book: None,
             syzygy: None,
         }
@@ -734,6 +752,7 @@ impl Searcher {
         self.killer_moves.fill([None, None]);
         self.history.fill(0);
         self.counter_moves.fill(None);
+        self.nnue_refresh(board);
 
         // Desynchronise the fleet: odd-indexed helpers begin one ply deeper so
         // threads explore the shared tree from different starting points.
@@ -824,6 +843,7 @@ impl Searcher {
         self.killer_moves.fill([None, None]);
         self.history.fill(0);
         self.counter_moves.fill(None);
+        self.nnue_refresh(board);
 
         let max_depth = if limits.infinite {
             u8::MAX
@@ -990,7 +1010,7 @@ impl Searcher {
             if self.should_stop() {
                 break;
             }
-            let undo = board.make_move(mv).expect("generated move must be legal");
+            let undo = self.nnue_make(board, mv);
             let child_depth = depth.saturating_sub(1);
             let (mut score, mut line) = if move_index == 0 {
                 let (score, line) = self.negamax(board, child_depth, 1, -beta, -alpha, Some(mv), None);
@@ -1006,7 +1026,7 @@ impl Searcher {
                 score = -full_score;
                 line = full_line;
             }
-            board.unmake_move(mv, undo);
+            self.nnue_unmake(board, mv, undo);
 
             if score > best_score {
                 best_score = score;
@@ -1175,7 +1195,7 @@ impl Searcher {
             {
                 break;
             }
-            let undo = board.make_move(mv).expect("generated move must be legal");
+            let undo = self.nnue_make(board, mv);
             let extension = u8::from(board.in_check(board.side_to_move))
                 .max(pawn_extension)
                 .max(u8::from(singular_extension));
@@ -1210,7 +1230,7 @@ impl Searcher {
                 score = -full_score;
                 line = full_line;
             }
-            board.unmake_move(mv, undo);
+            self.nnue_unmake(board, mv, undo);
 
             if score > best_score {
                 best_score = score;
@@ -1266,9 +1286,9 @@ impl Searcher {
                 return self.evaluate_terminal(board, 0);
             }
             for &mv in evasions.as_slice() {
-                let undo = board.make_move(mv).expect("generated move must be legal");
+                let undo = self.nnue_make(board, mv);
                 let score = -self.quiescence(board, -beta, -alpha);
-                board.unmake_move(mv, undo);
+                self.nnue_unmake(board, mv, undo);
                 if score >= beta {
                     return beta;
                 }
@@ -1289,9 +1309,9 @@ impl Searcher {
             if !self.is_promising_quiescence_capture(board, mv, stand_pat, alpha) {
                 continue;
             }
-            let undo = board.make_move(mv).expect("generated move must be legal");
+            let undo = self.nnue_make(board, mv);
             let score = -self.quiescence(board, -beta, -alpha);
-            board.unmake_move(mv, undo);
+            self.nnue_unmake(board, mv, undo);
 
             if score >= beta {
                 return beta;
@@ -1319,8 +1339,100 @@ impl Searcher {
 
     fn evaluate(&self, board: &Board) -> i32 {
         match self.nnue.as_ref() {
-            Some(nnue) => nnue.evaluate(board, board.side_to_move),
+            Some(nnue) => match self.nnue_accumulator.as_ref() {
+                Some(accumulator) => {
+                    debug_assert_eq!(
+                        *accumulator,
+                        nnue::Accumulator::refresh(nnue, board),
+                        "incremental nnue accumulator desynced from the board",
+                    );
+                    nnue.evaluate_with(accumulator, board.side_to_move)
+                }
+                // No maintained accumulator (e.g. a direct evaluate outside a
+                // search): fall back to a full refresh.
+                None => nnue.evaluate(board, board.side_to_move),
+            },
             None => evaluate_position(board),
+        }
+    }
+
+    /// Rebuilds the NNUE accumulator from scratch for `board` and clears the
+    /// incremental delta stack. Called once at the start of a search when a
+    /// network is loaded.
+    fn nnue_refresh(&mut self, board: &Board) {
+        self.nnue_accumulator = self
+            .nnue
+            .as_ref()
+            .map(|nnue| nnue::Accumulator::refresh(nnue, board));
+        self.nnue_stack.clear();
+    }
+
+    /// Makes a move, updating the NNUE accumulator incrementally when a network
+    /// is loaded. Mirror of [`Searcher::nnue_unmake`].
+    fn nnue_make(&mut self, board: &mut Board, mv: ChessMove) -> UndoState {
+        if self.nnue.is_none() {
+            return board.make_move(mv).expect("generated move must be legal");
+        }
+        let (squares, square_count) = nnue_changed_squares(board, mv);
+        let before: [Option<Piece>; 4] =
+            std::array::from_fn(|index| board.piece_at(squares[index]));
+        let undo = board.make_move(mv).expect("generated move must be legal");
+
+        let nnue = self.nnue.clone().expect("network is loaded");
+        let accumulator = self
+            .nnue_accumulator
+            .as_mut()
+            .expect("nnue accumulator is initialised while a network is loaded");
+        let mut delta = NnueDelta {
+            changes: [(Square(0), None, None); 4],
+            len: 0,
+        };
+        for index in 0..square_count {
+            let square = squares[index];
+            let old = before[index];
+            let new = board.piece_at(square);
+            if old == new {
+                continue;
+            }
+            if let Some(piece) = old {
+                accumulator.remove_feature(&nnue, Color::White, piece, square);
+                accumulator.remove_feature(&nnue, Color::Black, piece, square);
+            }
+            if let Some(piece) = new {
+                accumulator.add_feature(&nnue, Color::White, piece, square);
+                accumulator.add_feature(&nnue, Color::Black, piece, square);
+            }
+            delta.changes[delta.len] = (square, old, new);
+            delta.len += 1;
+        }
+        self.nnue_stack.push(delta);
+        undo
+    }
+
+    /// Unmakes a move, reversing the incremental accumulator update pushed by
+    /// [`Searcher::nnue_make`].
+    fn nnue_unmake(&mut self, board: &mut Board, mv: ChessMove, undo: UndoState) {
+        board.unmake_move(mv, undo);
+        if self.nnue.is_none() {
+            return;
+        }
+        let nnue = self.nnue.clone().expect("network is loaded");
+        let delta = self.nnue_stack.pop().expect("balanced nnue make/unmake");
+        let accumulator = self
+            .nnue_accumulator
+            .as_mut()
+            .expect("nnue accumulator is initialised while a network is loaded");
+        for &(square, old, new) in delta.changes.iter().take(delta.len) {
+            // Reverse of nnue_make: we removed `old` and added `new`, so now
+            // remove `new` and restore `old`.
+            if let Some(piece) = new {
+                accumulator.remove_feature(&nnue, Color::White, piece, square);
+                accumulator.remove_feature(&nnue, Color::Black, piece, square);
+            }
+            if let Some(piece) = old {
+                accumulator.add_feature(&nnue, Color::White, piece, square);
+                accumulator.add_feature(&nnue, Color::Black, piece, square);
+            }
         }
     }
 
@@ -1752,6 +1864,44 @@ impl EvalFeatures {
             Color::Black => -score,
         }
     }
+}
+
+/// The squares whose contents a move changes: always `from` and `to`, plus the
+/// rook's two squares for castling and the captured pawn's square for en
+/// passant. Returns the squares and how many are valid. Used to update the NNUE
+/// accumulator incrementally without allocating.
+fn nnue_changed_squares(board: &Board, mv: ChessMove) -> ([Square; 4], usize) {
+    let mut squares = [mv.from, mv.to, Square(0), Square(0)];
+    let mut count = 2;
+    if let Some(piece) = board.piece_at(mv.from) {
+        let from_file = mv.from.0 % 8;
+        let to_file = mv.to.0 % 8;
+        let rank_base = mv.from.0 - from_file;
+        if piece.kind == PieceKind::King && to_file.abs_diff(from_file) == 2 {
+            let (rook_from, rook_to) = if to_file == 6 {
+                (rank_base + 7, rank_base + 5) // king-side: h-file rook to f-file
+            } else {
+                (rank_base, rank_base + 3) // queen-side: a-file rook to d-file
+            };
+            squares[count] = Square(rook_from);
+            squares[count + 1] = Square(rook_to);
+            count += 2;
+        } else if piece.kind == PieceKind::Pawn
+            && board.en_passant() == Some(mv.to)
+            && board.piece_at(mv.to).is_none()
+        {
+            // The captured pawn sits on the to-file at the from-rank.
+            squares[count] = Square(rank_base + to_file);
+            count += 1;
+        }
+    }
+    (squares, count)
+}
+
+/// The hand-crafted evaluation of `board` from the side-to-move's perspective,
+/// in centipawns. Exposed as the teacher signal for NNUE training.
+pub fn hand_crafted_evaluation(board: &Board) -> i32 {
+    evaluate_position(board)
 }
 
 fn evaluate_position(board: &Board) -> i32 {
@@ -2422,6 +2572,33 @@ mod tests {
         assert!(razor_margin(&params, 2) > razor_margin(&params, 1));
         assert!(reverse_futility_margin(&params, 3) > reverse_futility_margin(&params, 2));
         assert!(late_move_pruning_limit(&params, 3) > late_move_pruning_limit(&params, 2));
+    }
+
+    #[test]
+    fn incremental_nnue_search_matches_refresh_across_move_types() {
+        // In debug builds, evaluate() asserts the incrementally maintained
+        // accumulator equals a full refresh at every evaluated node, so these
+        // searches exercise castling, en passant, and promotion deltas end to
+        // end. A desync would panic the assertion.
+        let net = Arc::new(Nnue::from_seed(2024, 16));
+        let fens = [
+            "r3k2r/pppq1ppp/2np1n2/2b1p3/2B1P1b1/2NP1N2/PPPQ1PPP/R3K2R w KQkq - 0 1",
+            "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
+            "4k3/P7/8/8/8/8/7p/4K3 w - - 0 1",
+        ];
+        for fen in fens {
+            let board = Board::from_fen(fen).unwrap();
+            let mut searcher = Searcher::default();
+            searcher.set_nnue(Some(Arc::clone(&net)));
+            let result = searcher.search(
+                &board,
+                SearchLimits {
+                    depth: Some(4),
+                    ..SearchLimits::default()
+                },
+            );
+            assert!(result.best_move.is_some(), "search returns a move for {fen}");
+        }
     }
 
     #[test]

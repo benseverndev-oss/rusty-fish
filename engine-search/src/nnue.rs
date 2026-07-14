@@ -47,6 +47,19 @@ pub fn feature_index(perspective: Color, piece: Piece, square: Square) -> usize 
     (relative_color * 6 + piece_kind_index(piece.kind)) * 64 + relative_square
 }
 
+/// Returns the active feature indices for `board` from `perspective` (one per
+/// piece on the board). Exposed for the NNUE trainer.
+pub fn active_features(board: &Board, perspective: Color) -> Vec<usize> {
+    let mut features = Vec::with_capacity(32);
+    for index in 0..64 {
+        let square = Square(index);
+        if let Some(piece) = board.piece_at(square) {
+            features.push(feature_index(perspective, piece, square));
+        }
+    }
+    features
+}
+
 /// Two per-perspective accumulators. Values are summed into `i32` so a full
 /// board can never overflow.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,11 +95,9 @@ impl Accumulator {
         }
     }
 
-    /// Removes a piece's contribution from one perspective's accumulator. Part
-    /// of the incremental-update primitives; the forthcoming make/unmake hook
-    /// will drive it, and the tests prove it is the exact inverse of
-    /// [`Accumulator::add_feature`].
-    #[allow(dead_code)]
+    /// Removes a piece's contribution from one perspective's accumulator. The
+    /// inverse of [`Accumulator::add_feature`]; the search's make/unmake hook
+    /// drives both to keep the accumulator in sync incrementally.
     pub fn remove_feature(&mut self, net: &Nnue, perspective: Color, piece: Piece, square: Square) {
         let feature = feature_index(perspective, piece, square);
         let hidden = net.hidden;
@@ -131,6 +142,12 @@ impl Nnue {
     pub fn evaluate(&self, board: &Board, side_to_move: Color) -> i32 {
         let accumulator = Accumulator::refresh(self, board);
         self.forward(&accumulator, side_to_move)
+    }
+
+    /// Evaluates from a prebuilt (incrementally maintained) accumulator, in
+    /// centipawns from `side_to_move`'s perspective.
+    pub fn evaluate_with(&self, accumulator: &Accumulator, side_to_move: Color) -> i32 {
+        self.forward(accumulator, side_to_move)
     }
 
     fn forward(&self, accumulator: &Accumulator, side_to_move: Color) -> i32 {
@@ -203,6 +220,40 @@ impl Nnue {
         let bytes = std::fs::read(path)
             .map_err(|error| format!("failed to read NNUE file {path}: {error}"))?;
         Self::from_bytes(&bytes)
+    }
+
+    /// Builds a network from explicit quantised parameters, validating that the
+    /// weight vectors have the lengths implied by `hidden`. Used by the trainer
+    /// to assemble a network after fitting.
+    pub fn from_parameters(
+        hidden: usize,
+        feature_weights: Vec<i16>,
+        feature_bias: Vec<i16>,
+        output_weights: Vec<i16>,
+        output_bias: i32,
+    ) -> Result<Self, String> {
+        if hidden == 0 {
+            return Err("hidden size must be non-zero".to_string());
+        }
+        if feature_weights.len() != INPUT_DIMENSION * hidden {
+            return Err(format!(
+                "feature_weights must have {} entries",
+                INPUT_DIMENSION * hidden
+            ));
+        }
+        if feature_bias.len() != hidden {
+            return Err(format!("feature_bias must have {hidden} entries"));
+        }
+        if output_weights.len() != 2 * hidden {
+            return Err(format!("output_weights must have {} entries", 2 * hidden));
+        }
+        Ok(Self {
+            hidden,
+            feature_weights,
+            feature_bias,
+            output_weights,
+            output_bias,
+        })
     }
 
     /// Builds a deterministic network with small pseudo-random weights. This is
