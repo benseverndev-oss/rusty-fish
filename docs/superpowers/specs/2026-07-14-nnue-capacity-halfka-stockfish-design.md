@@ -63,11 +63,11 @@ mate conversion/clamp rule, and any timeout/error.
 
 Use a fixed node budget selected by a small calibration run before the corpus
 run. The calibration labels the same 1,000 held-out FENs at 25,000, 100,000,
-and 400,000 nodes. Select the lowest budget whose 95th-percentile absolute
-centipawn difference from the next budget is at most 20 cp and whose shard has
-no timeouts. If neither 25,000 nor 100,000 nodes qualifies, use 400,000 nodes.
-Timed-out or malformed labels fail the shard; they are never silently replaced
-by the hand-crafted evaluation.
+and 400,000 nodes. Treat the 400,000-node score as the reference. Select the
+lowest of 25,000 or 100,000 nodes whose 95th-percentile absolute centipawn
+difference from the 400,000-node score is at most 20 cp and whose shard has no
+timeouts; otherwise use 400,000 nodes. Timed-out or malformed labels fail the
+shard; they are never silently replaced by the hand-crafted evaluation.
 
 Convert non-mate centipawn labels to the existing WDL target with
 `sigmoid(cp / 400)`. Convert mate scores to a finite signed centipawn value

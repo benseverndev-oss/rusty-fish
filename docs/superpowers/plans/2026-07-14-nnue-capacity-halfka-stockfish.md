@@ -12,7 +12,7 @@
 
 - Use Modal as the primary path: CPU containers label and gate; an A10G GPU trains.
 - Corpus: exactly 1,000,000 legal nonterminal positions: 400,000 random-walk, 400,000 opening-derived, 200,000 quiet-walk positions; deduplicate canonical FENs before splitting.
-- Stockfish: pinned Stockfish 18 SHA-256, one process/thread, fixed hash, `go nodes N`, per-position timeout. Calibrate on 1,000 FENs at 25k/100k/400k nodes; use the lowest budget with <=20 cp 95th-percentile delta to the next budget and no timeouts, otherwise 400k.
+- Stockfish: pinned Stockfish 18 SHA-256, one process/thread, fixed hash, `go nodes N`, per-position timeout. Calibrate on 1,000 FENs at 25k/100k/400k nodes; use the lowest 25k/100k budget with <=20 cp 95th-percentile delta to the 400k reference and no timeouts, otherwise 400k.
 - Split canonical FEN hash into 90% train, 5% validation, 5% test. Store counts and SHA-256 values in immutable manifests.
 - Keep WDL target `sigmoid(cp / 400)`. Current v1 features remain a 768-input control at widths 128, 256, and 512.
 - Capacity promotion: >=2% validation WDL-loss reduction versus v1-128, <=32 cp maximum float-to-quantized difference on sealed test, >=1% sealed-test WDL-loss reduction, and >=50% in a 384-game deterministic screen.
