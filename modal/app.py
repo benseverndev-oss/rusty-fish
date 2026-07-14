@@ -148,6 +148,24 @@ def _remote_stockfish_config(stockfish_config_text: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _calibrate_remote_stockfish_config(manifest_text: str, corpus_payload: str,
+                                       root: pathlib.Path) -> str:
+    """Calibrate against the exact Stockfish binary packaged in this image."""
+    root.mkdir(parents=True, exist_ok=True)
+    manifest_path = root / "manifest.tsv"
+    manifest_path.write_text(manifest_text, encoding="utf-8")
+    for split, content in json.loads(corpus_payload).items():
+        (root / f"{split}.tsv").write_text(content, encoding="utf-8")
+    config_path = root / "stockfish-config.tsv"
+    binary_sha256 = _sha256(pathlib.Path(REMOTE_STOCKFISH).read_bytes())
+    subprocess.run(
+        [BIN, "stockfish-calibrate", str(manifest_path), REMOTE_STOCKFISH,
+         binary_sha256, str(config_path)],
+        check=True,
+    )
+    return config_path.read_text(encoding="utf-8")
+
+
 @app.function(image=rust_image, volumes={"/artifacts": artifacts}, timeout=60 * 60)
 def build_corpus(run_id: str, smoke: bool) -> tuple[str, str]:
     args = [BIN, "dataset-build", run_id, "/tmp/corpus", "400000", "400000", "200000", "1"]
@@ -162,6 +180,24 @@ def build_corpus(run_id: str, smoke: bool) -> tuple[str, str]:
     _write_artifact(run_id, "corpus-manifest", corpus_input, manifest)
     _write_artifact(run_id, "corpus-positions", manifest, positions)
     return manifest, positions
+
+
+@app.function(image=rust_image, volumes={"/artifacts": artifacts}, timeout=60 * 60)
+def calibrate_stockfish_config(run_id: str, manifest_text: str) -> str:
+    """Produce a config bound to the pinned Linux Stockfish 18 binary."""
+    artifacts.reload()
+    positions_path = _artifact_path(run_id, "corpus-positions", _sha256(manifest_text))
+    corpus_payload = pathlib.Path(positions_path).read_text(encoding="utf-8")
+    with tempfile.TemporaryDirectory() as directory:
+        config = _calibrate_remote_stockfish_config(
+            manifest_text, corpus_payload, pathlib.Path(directory)
+        )
+    binary_sha256 = _sha256(pathlib.Path(REMOTE_STOCKFISH).read_bytes())
+    _write_artifact(
+        run_id, "stockfish-config", manifest_text + binary_sha256, config,
+        "stockfish-config.tsv",
+    )
+    return config
 
 
 @app.function(image=rust_image, volumes={"/artifacts": artifacts}, timeout=60 * 60)
@@ -344,6 +380,20 @@ def read_report(run_id: str, width: int, input_hash: str) -> dict:
     artifacts.reload()
     path = _artifact_path(run_id, f"report-{width}", input_hash, "report.json")
     return json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+
+
+@app.local_entrypoint()
+def calibrate(run_id: str = "calibration-v1", smoke: bool = False,
+              output: str = "stockfish-config.tsv"):
+    """Build a run corpus remotely and save its pinned Stockfish config locally."""
+    target = pathlib.Path(output)
+    if target.exists():
+        raise ValueError(f"refusing to overwrite Stockfish config {target}")
+    manifest, _ = build_corpus.remote(run_id, smoke)
+    config = calibrate_stockfish_config.remote(run_id, manifest)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(config, encoding="utf-8")
+    print(f"wrote calibrated Stockfish config to {target}")
 
 
 @app.local_entrypoint()

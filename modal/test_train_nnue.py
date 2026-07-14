@@ -1,3 +1,4 @@
+import json
 import pathlib
 import struct
 import subprocess
@@ -106,6 +107,60 @@ def test_screen_rejects_truncated_aggregate_before_sprt_or_report_write(monkeypa
         app.run_screen.local(b"candidate", "run", {}, {}, "manifest", "config")
 
     assert all(command[1] != "sprt" for command in calls)
+
+
+def test_remote_calibration_uses_the_pinned_binary_and_returns_its_config(tmp_path, monkeypatch):
+    import app
+
+    remote_binary = tmp_path / "stockfish"
+    remote_binary.write_bytes(b"pinned Stockfish 18")
+    monkeypatch.setattr(app, "REMOTE_STOCKFISH", str(remote_binary))
+
+    observed = []
+
+    def fake_run(command, **_kwargs):
+        observed.append(command)
+        output = pathlib.Path(command[-1])
+        output.write_text(
+            "stockfish_config\\t1\\n"
+            f"binary\\t{remote_binary}\\n"
+            f"binary_sha256\\t{app._sha256(remote_binary.read_bytes())}\\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    manifest = "manifest body"
+    payload = json.dumps({
+        "train": "fen\\tsource\\n" + "\\n".join(f"fen-{index}\\trandom" for index in range(1_000)),
+        "validation": "fen\\tsource\\n",
+        "test": "fen\\tsource\\n",
+    })
+
+    config = app._calibrate_remote_stockfish_config(manifest, payload, tmp_path / "work")
+
+    assert observed[0][0:3] == [app.BIN, "stockfish-calibrate", str(tmp_path / "work" / "manifest.tsv")]
+    assert observed[0][3] == str(remote_binary)
+    assert observed[0][4] == app._sha256(remote_binary.read_bytes())
+    assert f"binary_sha256\\t{app._sha256(remote_binary.read_bytes())}" in config
+
+
+def test_calibration_entrypoint_writes_the_remote_config_to_the_requested_path(tmp_path, monkeypatch):
+    import app
+
+    class Remote:
+        def __init__(self, result):
+            self.result = result
+
+        def remote(self, *_args):
+            return self.result
+
+    monkeypatch.setattr(app, "build_corpus", Remote(("manifest", "positions")))
+    monkeypatch.setattr(app, "calibrate_stockfish_config", Remote("stockfish_config\\t1\\n"))
+    output = tmp_path / "chosen-config.tsv"
+
+    app.calibrate.info.raw_f(run_id="chosen-run", smoke=True, output=str(output))
+
+    assert output.read_text(encoding="utf-8") == "stockfish_config\\t1\\n"
 
 
 def test_load_samples_rejects_mixed_schema_or_feature_dimension(tmp_path):

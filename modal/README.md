@@ -22,6 +22,17 @@ artifact; a conflicting result at that address is rejected.
 
 ## Run
 
+First create the run-specific config in Modal. This calibrates the deterministic
+1,000-position sample from that run's training split against the pinned Linux
+Stockfish 18 binary and writes the resulting config to the requested local path:
+
+```bash
+modal run modal/app.py::calibrate --run-id stockfish18-v1 --output stockfish-config.tsv
+```
+
+Then use that exact config for the matching run. Do not create it with a local
+Windows Stockfish binary: label jobs verify the executable hash inside Modal.
+
 ```bash
 modal run modal/app.py --run-id smoke-v1 --smoke --schema v1 --widths 128,256,512 \
   --stockfish-config stockfish-config.tsv --seed 1

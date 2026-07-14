@@ -281,7 +281,7 @@ fn stockfish_calibrate() -> Result<(), String> {
             "usage: stockfish-calibrate <manifest> <stockfish> <sha256> <out_config>".into(),
         );
     }
-    let fens = manifest_fens(Path::new(&args[2]), None)?;
+    let fens = calibration_sample(manifest_fens(Path::new(&args[2]), Some(TRAIN_SPLIT))?)?;
     let mut config = StockfishConfig {
         binary: args[3].clone().into(),
         binary_sha256: args[4].clone(),
@@ -291,6 +291,17 @@ fn stockfish_calibrate() -> Result<(), String> {
     };
     config.node_budget = calibrate_node_budget(&config, &fens)?;
     write_stockfish_config(Path::new(&args[5]), &config)
+}
+
+fn calibration_sample(fens: Vec<String>) -> Result<Vec<String>, String> {
+    const CALIBRATION_SAMPLE_SIZE: usize = 1_000;
+    if fens.len() < CALIBRATION_SAMPLE_SIZE {
+        return Err(format!(
+            "Stockfish calibration requires at least 1,000 training positions; manifest contains {}",
+            fens.len()
+        ));
+    }
+    Ok(fens.into_iter().take(CALIBRATION_SAMPLE_SIZE).collect())
 }
 
 fn stockfish_label() -> Result<(), String> {
@@ -689,8 +700,8 @@ fn feature_schema_header(schema: FeatureSchema) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_records, canonical_label_fen, deduplicate_and_split, feature_schema_header,
-        parse_feature_schema, reserve_output_directory,
+        append_records, calibration_sample, canonical_label_fen, deduplicate_and_split,
+        feature_schema_header, parse_feature_schema, reserve_output_directory,
     };
     use engine_search::FeatureSchema;
 
@@ -702,6 +713,26 @@ mod tests {
         append_records(&mut records, "quiet", 200, 24, 1 ^ 0xD1B5_4A32_D192_ED03);
         assert_eq!(records.len(), 1_000);
         assert!(deduplicate_and_split(records).is_ok());
+    }
+
+    #[test]
+    fn calibration_sample_selects_exactly_one_thousand_stable_training_positions() {
+        let positions = (0..1_001)
+            .map(|index| format!("fen-{index}"))
+            .collect::<Vec<_>>();
+        let first = calibration_sample(positions.clone()).expect("enough training positions");
+        let second = calibration_sample(positions).expect("enough training positions");
+
+        assert_eq!(first.len(), 1_000);
+        assert_eq!(first, second);
+        assert_eq!(first[0], "fen-0");
+        assert_eq!(first[999], "fen-999");
+    }
+
+    #[test]
+    fn calibration_sample_requires_one_thousand_training_positions() {
+        let error = calibration_sample(vec!["fen".to_string(); 999]).unwrap_err();
+        assert!(error.contains("at least 1,000"));
     }
 
     #[test]
