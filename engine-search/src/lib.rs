@@ -9,6 +9,10 @@ use pyrrhic_rs::{
     Color as TbColor, DtzProbeValue, EngineAdapter, Piece as TbPiece, TableBases, WdlProbeResult,
 };
 
+mod nnue;
+
+pub use nnue::Nnue;
+
 const MATE_SCORE: i32 = 100_000;
 const MAX_KILLER_PLY: usize = 128;
 const HISTORY_PROMOTION_STATES: usize = 5;
@@ -409,6 +413,7 @@ pub struct Searcher {
     counter_moves: Vec<Option<ChessMove>>,
     options: SearchOptions,
     params: SearchParams,
+    nnue: Option<Arc<Nnue>>,
     opening_book: Option<OpeningBook>,
     syzygy: Option<SyzygyTablebases>,
 }
@@ -429,6 +434,7 @@ impl Default for Searcher {
             counter_moves: vec![None; HISTORY_SIZE],
             options: SearchOptions::default(),
             params: SearchParams::default(),
+            nnue: None,
             opening_book: None,
             syzygy: None,
         }
@@ -661,6 +667,17 @@ impl Searcher {
         self.params = params;
     }
 
+    /// Installs an NNUE network as the evaluation. Passing `None` restores the
+    /// hand-crafted evaluation. The network is shared (read-only) across Lazy
+    /// SMP helper threads.
+    pub fn set_nnue(&mut self, nnue: Option<Arc<Nnue>>) {
+        self.nnue = nnue;
+    }
+
+    pub fn has_nnue(&self) -> bool {
+        self.nnue.is_some()
+    }
+
     pub fn set_opening_book(&mut self, opening_book: Option<OpeningBook>) {
         self.opening_book = opening_book;
     }
@@ -677,6 +694,7 @@ impl Searcher {
         tt: Arc<SharedTranspositionTable>,
         options: SearchOptions,
         params: SearchParams,
+        nnue: Option<Arc<Nnue>>,
     ) -> Self {
         Self {
             nodes: 0,
@@ -690,6 +708,7 @@ impl Searcher {
             counter_moves: vec![None; HISTORY_SIZE],
             options,
             params,
+            nnue,
             opening_book: None,
             syzygy: None,
         }
@@ -836,10 +855,11 @@ impl Searcher {
                 let tt = Arc::clone(&self.tt);
                 let options = self.options.clone();
                 let params = self.params;
+                let nnue = self.nnue.clone();
                 let helper_board = board.clone();
                 let stop = Arc::clone(&shared_stop);
                 helper_handles.push(thread::spawn(move || {
-                    Searcher::helper(tt, options, params).run_lazy_smp_helper(
+                    Searcher::helper(tt, options, params, nnue).run_lazy_smp_helper(
                         &helper_board,
                         max_depth,
                         deadline,
@@ -1298,7 +1318,10 @@ impl Searcher {
     }
 
     fn evaluate(&self, board: &Board) -> i32 {
-        evaluate_position(board)
+        match self.nnue.as_ref() {
+            Some(nnue) => nnue.evaluate(board, board.side_to_move),
+            None => evaluate_position(board),
+        }
     }
 
     fn order_moves(
@@ -2115,8 +2138,8 @@ mod tests {
     use pyrrhic_rs::{Piece as TbPiece, WdlProbeResult};
 
     use super::{
-        Bound, ClockControl, MATE_SCORE, OpeningBook, SearchLimits, SearchOptions, SearchParams,
-        Searcher, SharedTranspositionTable, SyzygyRootProbe,
+        Bound, ClockControl, MATE_SCORE, Nnue, OpeningBook, SearchLimits, SearchOptions,
+        SearchParams, Searcher, SharedTranspositionTable, SyzygyRootProbe,
         SyzygyTablebases, SyzygyWdl, TaperedScore, TranspositionEntry, TranspositionTable,
         evaluate_position, history_index, late_move_reduction, passed_pawn_extension,
         promotion_from_tablebase, root_tablebase_search_result, static_exchange_evaluation,
@@ -2399,6 +2422,24 @@ mod tests {
         assert!(razor_margin(&params, 2) > razor_margin(&params, 1));
         assert!(reverse_futility_margin(&params, 3) > reverse_futility_margin(&params, 2));
         assert!(late_move_pruning_limit(&params, 3) > late_move_pruning_limit(&params, 2));
+    }
+
+    #[test]
+    fn nnue_evaluation_overrides_the_handcrafted_score() {
+        let board = Board::startpos();
+        let mut searcher = Searcher::default();
+        let handcrafted = searcher.evaluate(&board);
+
+        let net = Arc::new(Nnue::from_seed(12_345, 32));
+        let expected = net.evaluate(&board, board.side_to_move);
+        searcher.set_nnue(Some(net));
+        assert!(searcher.has_nnue());
+        assert_eq!(searcher.evaluate(&board), expected);
+
+        // Removing the network restores the hand-crafted evaluation exactly.
+        searcher.set_nnue(None);
+        assert!(!searcher.has_nnue());
+        assert_eq!(searcher.evaluate(&board), handcrafted);
     }
 
     #[test]
