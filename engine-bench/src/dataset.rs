@@ -21,8 +21,8 @@ mod tests {
         DatasetManifest {
             run_id: "sample".to_string(),
             source_counts: BTreeMap::from([("random".to_string(), 2)]),
-            split_counts: BTreeMap::from([("train".to_string(), 2)]),
-            shard_sha256: vec!["a".repeat(64)],
+            split_counts: BTreeMap::from([("train".to_string(), 2), ("validation".to_string(), 0), ("test".to_string(), 0)]),
+            shard_sha256: vec!["a".repeat(64), "b".repeat(64), "c".repeat(64)],
             dataset_sha256: "b".repeat(64),
             stockfish_config_sha256: Some("c".repeat(64)),
         }
@@ -51,12 +51,34 @@ mod tests {
         assert_eq!(read_manifest(&path).unwrap(), manifest);
         std::fs::remove_file(path).unwrap();
     }
+
+    #[test]
+    fn canonical_fen_rejects_positions_with_missing_or_adjacent_kings() {
+        assert!(super::canonical_fen("8/8/8/8/8/8/8/4K3 w - - 0 1").is_err());
+        assert!(super::canonical_fen("8/8/8/8/8/8/4k3/4K3 w - - 0 1").is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_duplicate_fields_and_invalid_hashes() {
+        let path = std::env::temp_dir().join(format!("rusty-fish-invalid-{}.tsv", std::process::id()));
+        std::fs::write(&path, "dataset_manifest\t1\nrun_id\tone\nrun_id\ttwo\ndataset_sha256\tnot-a-hash\n").unwrap();
+        assert!(read_manifest(&path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn manifest_write_refuses_to_overwrite() {
+        let path = std::env::temp_dir().join(format!("rusty-fish-existing-{}.tsv", std::process::id()));
+        std::fs::write(&path, "existing").unwrap();
+        assert!(write_manifest(&path, &sample_manifest()).is_err());
+        let _ = std::fs::remove_file(path);
+    }
 }
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use engine_core::Board;
+use engine_core::{Board, Color, PieceKind};
 
 pub const TRAIN_SPLIT: &str = "train";
 pub const VALIDATION_SPLIT: &str = "validation";
@@ -80,6 +102,26 @@ pub struct DatasetManifest {
 
 pub fn canonical_fen(fen: &str) -> Result<String, String> {
     let mut board = Board::from_fen(fen)?;
+    if board.pieces(Color::White, PieceKind::King).count_ones() != 1
+        || board.pieces(Color::Black, PieceKind::King).count_ones() != 1
+    {
+        return Err("position must contain exactly one king per side".into());
+    }
+    let white_king = board.king_square(Color::White).expect("king count was checked");
+    let black_king = board.king_square(Color::Black).expect("king count was checked");
+    if white_king.file().abs_diff(black_king.file()) <= 1
+        && white_king.rank().abs_diff(black_king.rank()) <= 1
+    {
+        return Err("kings cannot be adjacent".into());
+    }
+    if board.pieces(Color::White, PieceKind::Pawn) & 0xff00_0000_0000_00ff != 0
+        || board.pieces(Color::Black, PieceKind::Pawn) & 0xff00_0000_0000_00ff != 0
+    {
+        return Err("pawns cannot occupy the first or eighth rank".into());
+    }
+    if board.in_check(board.side_to_move.opposite()) {
+        return Err("side that just moved cannot be in check".into());
+    }
     if board.generate_legal_move_list().is_empty() {
         return Err("terminal position".into());
     }
@@ -125,6 +167,10 @@ pub fn deduplicate_and_split(
 }
 
 pub fn write_manifest(path: &Path, manifest: &DatasetManifest) -> Result<(), String> {
+    if path.exists() {
+        return Err(format!("refusing to overwrite immutable manifest {}", path.display()));
+    }
+    validate_manifest(manifest)?;
     validate_manifest_field("run_id", &manifest.run_id)?;
     let mut output = String::from("dataset_manifest\t1\n");
     push_pair(&mut output, "run_id", &manifest.run_id)?;
@@ -162,16 +208,16 @@ pub fn read_manifest(path: &Path) -> Result<DatasetManifest, String> {
     for line in lines {
         let fields: Vec<_> = line.split('\t').collect();
         match fields.as_slice() {
-            ["run_id", value] => run_id = Some((*value).to_string()),
+            ["run_id", value] if run_id.is_none() => run_id = Some((*value).to_string()),
             ["source_count", source, count] => {
-                source_counts.insert((*source).to_string(), parse_count(count)?);
+                if source_counts.insert((*source).to_string(), parse_count(count)?).is_some() { return Err("duplicate source_count".into()); }
             }
             ["split_count", split, count] => {
-                split_counts.insert((*split).to_string(), parse_count(count)?);
+                if split_counts.insert((*split).to_string(), parse_count(count)?).is_some() { return Err("duplicate split_count".into()); }
             }
-            ["shard_sha256", hash] => shard_sha256.push((*hash).to_string()),
-            ["dataset_sha256", hash] => dataset_sha256 = Some((*hash).to_string()),
-            ["stockfish_config_sha256", hash] => stockfish_config_sha256 = Some((*hash).to_string()),
+            ["shard_sha256", hash] if is_sha256(hash) => shard_sha256.push((*hash).to_string()),
+            ["dataset_sha256", hash] if dataset_sha256.is_none() && is_sha256(hash) => dataset_sha256 = Some((*hash).to_string()),
+            ["stockfish_config_sha256", hash] if stockfish_config_sha256.is_none() && is_sha256(hash) => stockfish_config_sha256 = Some((*hash).to_string()),
             _ => return Err(format!("invalid dataset manifest line: {line}")),
         }
     }
@@ -185,6 +231,18 @@ pub fn read_manifest(path: &Path) -> Result<DatasetManifest, String> {
         stockfish_config_sha256,
     })
 }
+
+fn validate_manifest(manifest: &DatasetManifest) -> Result<(), String> {
+    if !is_sha256(&manifest.dataset_sha256) || manifest.shard_sha256.len() != 3 || manifest.shard_sha256.iter().any(|hash| !is_sha256(hash)) || manifest.stockfish_config_sha256.as_ref().is_some_and(|hash| !is_sha256(hash)) {
+        return Err("manifest contains invalid SHA-256 value".into());
+    }
+    if manifest.split_counts.keys().map(String::as_str).collect::<Vec<_>>() != [TEST_SPLIT, TRAIN_SPLIT, VALIDATION_SPLIT] {
+        return Err("manifest must list exactly the three dataset splits".into());
+    }
+    Ok(())
+}
+
+fn is_sha256(value: &str) -> bool { value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hash = [

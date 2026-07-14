@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
+use std::{collections::{BTreeMap, BTreeSet}, path::Path, sync::Arc, time::Duration};
 
 use engine_bench::{
     DEFAULT_TACTICAL_SUITE, ExternalMatchConfig, MatchConfig, MatchScore, SpsaConfig, SprtConfig,
@@ -259,6 +259,18 @@ fn dataset_build() -> Result<(), String> {
     append_records(&mut records, "opening", opening_count, 16, seed ^ 0x9E37_79B9_7F4A_7C15);
     append_records(&mut records, "quiet", quiet_count, 24, seed ^ 0xD1B5_4A32_D192_ED03);
     let splits = deduplicate_and_split(records)?;
+    let actual_source_counts = splits.values().flatten().fold(BTreeMap::new(), |mut counts, record| {
+        *counts.entry(record.source.clone()).or_insert(0_usize) += 1;
+        counts
+    });
+    let expected_source_counts = BTreeMap::from([
+        ("random".to_string(), random_count),
+        ("opening".to_string(), opening_count),
+        ("quiet".to_string(), quiet_count),
+    ]);
+    if actual_source_counts != expected_source_counts || splits.values().map(Vec::len).sum::<usize>() != total {
+        return Err("dataset generation did not preserve the requested unique source composition".into());
+    }
     std::fs::create_dir_all(out_dir)
         .map_err(|error| format!("failed to create {}: {error}", out_dir.display()))?;
 
@@ -295,11 +307,14 @@ fn dataset_build() -> Result<(), String> {
 
 fn append_records(records: &mut Vec<PositionRecord>, source: &str, count: usize, plies: u32, seed: u64) {
     let target_len = records.len().saturating_add(count);
+    let mut seen: BTreeSet<String> = records.iter().map(|record| record.fen.clone()).collect();
     let mut batch = 0_u64;
     while records.len() < target_len {
         let remaining = target_len - records.len();
         for fen in random_opening_fens(remaining.saturating_mul(2).max(16), plies, seed.wrapping_add(batch)) {
-            if let Ok(fen) = canonical_fen(&fen) {
+            if let Ok(fen) = canonical_fen(&fen)
+                && seen.insert(fen.clone())
+            {
                 records.push(PositionRecord {
                     fen,
                     source: source.to_string(),
