@@ -20,11 +20,11 @@ use engine_search::{
 /// magnitude so the regression stays well-conditioned.
 const TARGET_CLAMP: i32 = 10_000;
 
-/// Error magnitude (centipawns) beyond which the training gradient is clipped —
-/// a Huber-style robust loss. Large, high-variance deep-search targets otherwise
-/// produce exploding updates that make the network diverge; clipping keeps every
-/// gradient in the same well-behaved regime as small static-eval targets.
-const GRADIENT_ERROR_CLIP: f32 = 1_000.0;
+/// Centipawns-to-win-probability scale for the training loss. Targets and
+/// predictions are squashed through `sigmoid(cp / WDL_SCALE)` before the loss is
+/// taken, which bounds every gradient regardless of target magnitude — so
+/// extreme tactical labels no longer dominate the fit (nor make it diverge).
+const WDL_SCALE: f32 = 400.0;
 
 /// Divisor mirroring the quantised inference's `OUTPUT_SCALE`, so the float
 /// model and the exported integer model share the same output scaling.
@@ -112,7 +112,9 @@ impl Default for TrainConfig {
         Self {
             hidden: 64,
             epochs: 20,
-            learning_rate: 0.01,
+            // The WDL-sigmoid gradient is small (bounded), so it needs a much
+            // larger step than the old raw-centipawn MSE loss.
+            learning_rate: 8_000.0,
             seed: 0x51A5_2C0D_E5EE_D001,
         }
     }
@@ -177,13 +179,16 @@ impl FloatNet {
 
     fn sgd_step(&mut self, sample: &TrainingSample, learning_rate: f32) -> f32 {
         let (prediction, own, opp) = self.forward(sample);
-        let error = prediction - sample.target;
-        // Clip the error that drives the gradient (Huber-style): beyond the clip
-        // the loss is linear, so a huge tactical target cannot explode the step.
-        // The reported loss below still uses the true squared error.
-        let clipped_error = error.clamp(-GRADIENT_ERROR_CLIP, GRADIENT_ERROR_CLIP);
-        // d(loss)/d(output) with output = pred * SCALE.
-        let grad_output = clipped_error / OUTPUT_SCALE;
+        // Win-probability (WDL) loss: squash both prediction and target through a
+        // sigmoid so the loss lives in [0, 1] and its gradient is bounded — a
+        // huge tactical target contributes a bounded, non-dominating step.
+        let predicted_wp = win_probability(prediction);
+        let target_wp = win_probability(sample.target);
+        let error_wp = predicted_wp - target_wp;
+        // d(loss)/d(prediction) = error_wp * sigmoid'(pred) then chain through the
+        // OUTPUT_SCALE divisor to reach d(loss)/d(output).
+        let grad_output =
+            error_wp * predicted_wp * (1.0 - predicted_wp) / WDL_SCALE / OUTPUT_SCALE;
 
         self.output_bias -= learning_rate * grad_output;
         for i in 0..self.hidden {
@@ -209,7 +214,7 @@ impl FloatNet {
                 self.feature_weights[idx] -= learning_rate * grad_opp_acc;
             }
         }
-        0.5 * error * error
+        0.5 * error_wp * error_wp
     }
 
     fn mean_loss(&self, samples: &[TrainingSample]) -> f32 {
@@ -220,8 +225,8 @@ impl FloatNet {
             .iter()
             .map(|sample| {
                 let (prediction, _, _) = self.forward(sample);
-                let error = prediction - sample.target;
-                0.5 * error * error
+                let error_wp = win_probability(prediction) - win_probability(sample.target);
+                0.5 * error_wp * error_wp
             })
             .sum();
         total / samples.len() as f32
@@ -273,6 +278,11 @@ pub fn train_nnue(
             samples: samples.len(),
         },
     ))
+}
+
+/// Maps a centipawn evaluation to a win probability in `(0, 1)`.
+fn win_probability(centipawns: f32) -> f32 {
+    1.0 / (1.0 + (-centipawns / WDL_SCALE).exp())
 }
 
 fn clip(value: f32) -> f32 {
@@ -366,7 +376,7 @@ mod tests {
         let config = TrainConfig {
             hidden: 32,
             epochs: 30,
-            learning_rate: 0.01,
+            learning_rate: 8_000.0,
             seed: 4_242,
         };
         let (_net, report) = train_nnue(&samples, config).expect("training succeeds");
@@ -381,16 +391,20 @@ mod tests {
     #[test]
     fn training_reduces_loss_and_beats_a_zero_predictor() {
         let samples = generate_training_samples(SEEDS, 12, 7, None).expect("samples");
+        // A zero-centipawn predictor maps to a 0.5 win probability everywhere.
         let zero_loss: f32 = samples
             .iter()
-            .map(|sample| 0.5 * sample.target * sample.target)
+            .map(|sample| {
+                let error = 0.5 - super::win_probability(sample.target);
+                0.5 * error * error
+            })
             .sum::<f32>()
             / samples.len() as f32;
 
         let config = TrainConfig {
             hidden: 32,
             epochs: 40,
-            learning_rate: 0.01,
+            learning_rate: 8_000.0,
             seed: 20_260_714,
         };
         let (net, report) = train_nnue(&samples, config).expect("training succeeds");
