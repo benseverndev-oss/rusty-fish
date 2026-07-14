@@ -18,6 +18,13 @@ def test_rust_image_uses_the_pinned_debian_bookworm_slim_digest():
     )
 
 
+def test_stockfish_image_install_links_to_a_non_colliding_executable_path():
+    import app
+
+    assert app.REMOTE_STOCKFISH == "/opt/stockfish/stockfish-bin"
+    assert app.STOCKFISH_INSTALL_COMMAND.endswith('ln -s "$stockfish" /opt/stockfish/stockfish-bin')
+
+
 def test_gate_outcome_records_addressed_inputs_wdl_and_sprt_verdict():
     import app
 

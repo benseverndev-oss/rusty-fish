@@ -66,3 +66,22 @@ check, Rust build, and application behavior are unchanged.
 - GREEN: the same command passed: 16 passed, 1 existing Modal local-volume warning.
 - CLI regression: `C:\Users\bsevern\AppData\Local\Programs\Python\Python312\python.exe -m modal run modal/app.py::calibrate --help`
   succeeded and still exposes the calibration entrypoint options.
+
+## Modal image-path remediation
+
+Real Modal image construction exposed a path collision: the Stockfish archive
+extracts `/opt/stockfish/stockfish` as a directory, so linking the executable
+to that same path caused `ln` to resolve it as a directory and fail while
+creating an already-existing nested name. This was an image-layout issue, not
+credentials or calibration.
+
+`REMOTE_STOCKFISH` and the installation command now use the non-colliding
+stable path `/opt/stockfish/stockfish-bin`. All calibration and labeling code
+continues to read the binary through that one constant.
+
+- RED: `C:\Users\bsevern\AppData\Local\Programs\Python\Python312\python.exe -m pytest modal/test_train_nnue.py -q`
+  failed because the configured executable path was `/opt/stockfish/stockfish`
+  instead of `/opt/stockfish/stockfish-bin`.
+- GREEN: the same command passed: 17 passed, 1 existing Modal local-volume warning.
+- CLI regression: `C:\Users\bsevern\AppData\Local\Programs\Python\Python312\python.exe -m modal run modal/app.py::calibrate --help`
+  succeeded and still exposes the calibration entrypoint options.

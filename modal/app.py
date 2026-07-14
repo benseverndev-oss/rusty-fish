@@ -17,8 +17,13 @@ HALFKA_INPUT_DIMENSION = 64 * 2 * 5 * 64
 LEARNING_RATE = 1e-3
 STOCKFISH_18_URL = "https://github.com/official-stockfish/Stockfish/releases/download/sf_18/stockfish-ubuntu-x86-64.tar"
 STOCKFISH_18_ARCHIVE_SHA256 = "5c6f38b02a4da5f3ffe763f27da6c3e743eebefd92b50cb3661623b96696adff"
-REMOTE_STOCKFISH = "/opt/stockfish/stockfish"
+REMOTE_STOCKFISH = "/opt/stockfish/stockfish-bin"
 RUST_IMAGE_BASE = "debian@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df"
+STOCKFISH_INSTALL_COMMAND = (
+    "stockfish=$(find /opt/stockfish -type f -name stockfish-ubuntu-x86-64 -print -quit) "
+    "&& test -n \"$stockfish\" && chmod +x \"$stockfish\" "
+    "&& ln -s \"$stockfish\" /opt/stockfish/stockfish-bin"
+)
 
 rust_image = (
     modal.Image.from_registry(RUST_IMAGE_BASE, add_python="3.12")
@@ -27,7 +32,7 @@ rust_image = (
         f"curl --fail --location --retry 3 --output /tmp/stockfish-18.tar {STOCKFISH_18_URL}",
         f"echo '{STOCKFISH_18_ARCHIVE_SHA256}  /tmp/stockfish-18.tar' | sha256sum --check --status",
         "mkdir -p /opt/stockfish && tar --extract --file /tmp/stockfish-18.tar --directory /opt/stockfish",
-        "stockfish=$(find /opt/stockfish -type f -name stockfish-ubuntu-x86-64 -print -quit) && test -n \"$stockfish\" && chmod +x \"$stockfish\" && ln -s \"$stockfish\" /opt/stockfish/stockfish",
+        STOCKFISH_INSTALL_COMMAND,
     )
     .run_commands("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable")
     .add_local_dir(REPO_ROOT, remote_path="/repo", copy=True)
