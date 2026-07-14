@@ -62,3 +62,9 @@
 4. `cargo test -p engine-bench --bin engine-bench label_fens_are_canonicalized_and_validated` — passed: 1 test.
 5. `cargo test -p engine-bench` — passed: 35 tests total (32 library, 3 binary tests).
 6. `git diff --check` — passed.
+
+## Resolved calibration-reference policy
+
+The committed plan/spec at `597c209` resolves the prior conflict: 400k is the mandatory calibration reference. Task 2 now evaluates exactly 25k, 100k, and 400k nodes, calculates P95 absolute score deltas for 25k-vs-400k and 100k-vs-400k, then selects 25k first, 100k second, and 400k as the fallback. Any labeling timeout/error still propagates and prevents a selection.
+
+TDD evidence: added `calibration_compares_each_lower_budget_to_the_400k_reference` before `calibration_candidates` existed; `cargo test -p engine-bench stockfish::tests` failed with the expected unresolved-import error. After extracting the reference-based candidate calculation, focused tests passed (7 tests), `cargo test -p engine-bench` passed (36 tests), and `git diff --check` passed.

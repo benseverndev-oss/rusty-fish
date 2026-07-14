@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use super::{choose_budget, parse_info_score, MATE_LABEL_CP};
+    use super::{calibration_candidates, choose_budget, parse_info_score, StockfishLabel, MATE_LABEL_CP};
     use std::collections::VecDeque;
 
     trait UciTransport {
@@ -79,6 +79,12 @@ mod tests {
     #[test]
     fn calibration_uses_400k_when_no_lower_budget_meets_the_p95_limit() {
         assert_eq!(choose_budget(&[(25_000, 21), (100_000, 22)]), Some(400_000));
+    }
+
+    #[test]
+    fn calibration_compares_each_lower_budget_to_the_400k_reference() {
+        let labels = |score_cp| vec![StockfishLabel { fen: "fen".to_string(), score_cp, nodes: 1 }];
+        assert_eq!(calibration_candidates(&labels(0), &labels(100), &labels(10)), [(25_000, 10), (100_000, 90)]);
     }
 
     #[test]
@@ -211,7 +217,7 @@ pub fn label_positions(
 }
 
 /// Evaluates 25k, 100k, and 400k exactly, choosing the lowest budget whose
-/// P95 deviation from its next higher budget is at most 20 centipawns.
+/// P95 deviation from the mandatory 400k reference is at most 20 centipawns.
 pub fn calibrate_node_budget(config: &StockfishConfig, fens: &[String]) -> Result<u64, String> {
     if fens.is_empty() {
         return Err("cannot calibrate Stockfish with no positions".into());
@@ -219,16 +225,24 @@ pub fn calibrate_node_budget(config: &StockfishConfig, fens: &[String]) -> Resul
     let labels_25k = label_at_budget(config, fens, 25_000)?;
     let labels_100k = label_at_budget(config, fens, 100_000)?;
     let labels_400k = label_at_budget(config, fens, 400_000)?;
-    let candidates = [
-        (25_000, p95_score_delta(&labels_25k, &labels_100k)),
-        (100_000, p95_score_delta(&labels_100k, &labels_400k)),
-    ];
+    let candidates = calibration_candidates(&labels_25k, &labels_100k, &labels_400k);
     Ok(choose_budget(&candidates).expect("400k fallback is always present"))
 }
 
-fn p95_score_delta(actual: &[StockfishLabel], next_budget: &[StockfishLabel]) -> i32 {
-    let mut errors: Vec<i32> = actual.iter().zip(next_budget)
-        .map(|(actual, next)| (actual.score_cp - next.score_cp).abs())
+fn calibration_candidates(
+    labels_25k: &[StockfishLabel],
+    labels_100k: &[StockfishLabel],
+    labels_400k: &[StockfishLabel],
+) -> [(u64, i32); 2] {
+    [
+        (25_000, p95_score_delta(labels_25k, labels_400k)),
+        (100_000, p95_score_delta(labels_100k, labels_400k)),
+    ]
+}
+
+fn p95_score_delta(actual: &[StockfishLabel], reference: &[StockfishLabel]) -> i32 {
+    let mut errors: Vec<i32> = actual.iter().zip(reference)
+        .map(|(actual, reference)| (actual.score_cp - reference.score_cp).abs())
         .collect();
     errors.sort_unstable();
     errors[((errors.len() * 95).saturating_add(99) / 100).saturating_sub(1)]
