@@ -13,7 +13,7 @@
 
 use engine_core::{Board, Color};
 use engine_search::{
-    active_features, hand_crafted_evaluation, Nnue, SearchLimits, Searcher, INPUT_DIMENSION,
+    active_features, hand_crafted_evaluation, FeatureSchema, Nnue, SearchLimits, Searcher,
 };
 
 /// Search scores can reach mate values; training targets are clamped to this
@@ -43,6 +43,7 @@ fn opposite(color: Color) -> Color {
 /// side-to-move-relative teacher score in centipawns.
 #[derive(Clone, Debug)]
 pub struct TrainingSample {
+    pub schema: FeatureSchema,
     pub own: Vec<usize>,
     pub opp: Vec<usize>,
     pub target: f32,
@@ -83,6 +84,7 @@ pub fn generate_training_samples(
                     .clamp(-TARGET_CLAMP, TARGET_CLAMP),
             };
             samples.push(TrainingSample {
+                schema: FeatureSchema::RelativePieceSquareV1,
                 own: active_features(&board, stm),
                 opp: active_features(&board, opposite(stm)),
                 target: target as f32,
@@ -129,6 +131,7 @@ pub struct TrainReport {
 
 /// A float network with the same shape as [`Nnue`], trained by SGD.
 struct FloatNet {
+    schema: FeatureSchema,
     hidden: usize,
     feature_weights: Vec<f32>,
     feature_bias: Vec<f32>,
@@ -137,7 +140,7 @@ struct FloatNet {
 }
 
 impl FloatNet {
-    fn new(hidden: usize, rng: &mut Lcg) -> Self {
+    fn new(schema: FeatureSchema, hidden: usize, rng: &mut Lcg) -> Self {
         // Small symmetric initialisation keeps early activations in range.
         let mut init = |count: usize, scale: f32| {
             (0..count)
@@ -145,8 +148,9 @@ impl FloatNet {
                 .collect::<Vec<f32>>()
         };
         Self {
+            schema,
             hidden,
-            feature_weights: init(INPUT_DIMENSION * hidden, 0.2),
+            feature_weights: init(schema.input_dimension() * hidden, 0.2),
             feature_bias: init(hidden, 0.2),
             output_weights: init(2 * hidden, 0.2),
             output_bias: 0.0,
@@ -157,7 +161,10 @@ impl FloatNet {
         let mut acc = self.feature_bias.clone();
         for &feature in features {
             let base = feature * self.hidden;
-            for (value, weight) in acc.iter_mut().zip(&self.feature_weights[base..base + self.hidden]) {
+            for (value, weight) in acc
+                .iter_mut()
+                .zip(&self.feature_weights[base..base + self.hidden])
+            {
                 *value += weight;
             }
         }
@@ -187,8 +194,7 @@ impl FloatNet {
         let error_wp = predicted_wp - target_wp;
         // d(loss)/d(prediction) = error_wp * sigmoid'(pred) then chain through the
         // OUTPUT_SCALE divisor to reach d(loss)/d(output).
-        let grad_output =
-            error_wp * predicted_wp * (1.0 - predicted_wp) / WDL_SCALE / OUTPUT_SCALE;
+        let grad_output = error_wp * predicted_wp * (1.0 - predicted_wp) / WDL_SCALE / OUTPUT_SCALE;
 
         self.output_bias -= learning_rate * grad_output;
         for i in 0..self.hidden {
@@ -199,7 +205,8 @@ impl FloatNet {
 
             // Gradients flowing back into each accumulator through the clip.
             let grad_own_acc = grad_output * self.output_weights[i] * clip_grad(own[i]);
-            let grad_opp_acc = grad_output * self.output_weights[self.hidden + i] * clip_grad(opp[i]);
+            let grad_opp_acc =
+                grad_output * self.output_weights[self.hidden + i] * clip_grad(opp[i]);
 
             self.output_weights[i] -= learning_rate * grad_own_w;
             self.output_weights[self.hidden + i] -= learning_rate * grad_opp_w;
@@ -237,7 +244,8 @@ impl FloatNet {
         let feature_bias = self.feature_bias.iter().map(round_i16).collect();
         let output_weights = self.output_weights.iter().map(round_i16).collect();
         let output_bias = self.output_bias.round() as i32;
-        Nnue::from_parameters(
+        Nnue::from_parameters_with_schema(
+            self.schema,
             self.hidden,
             feature_weights,
             feature_bias,
@@ -256,8 +264,12 @@ pub fn train_nnue(
     if samples.is_empty() {
         return Err("cannot train on an empty sample set".to_string());
     }
+    let schema = samples[0].schema;
+    if samples.iter().any(|sample| sample.schema != schema) {
+        return Err("cannot train mixed feature schemas".to_string());
+    }
     let mut rng = Lcg::new(config.seed);
-    let mut net = FloatNet::new(config.hidden, &mut rng);
+    let mut net = FloatNet::new(schema, config.hidden, &mut rng);
     let initial_loss = net.mean_loss(samples);
 
     let mut order: Vec<usize> = (0..samples.len()).collect();
@@ -348,7 +360,9 @@ mod tests {
         let samples = generate_training_samples(SEEDS, 8, 1, None).expect("samples");
         assert!(!samples.is_empty());
         // Every sample records the pieces on the board from both perspectives.
-        assert!(samples.iter().all(|sample| !sample.own.is_empty() && !sample.opp.is_empty()));
+        assert!(samples
+            .iter()
+            .all(|sample| !sample.own.is_empty() && !sample.opp.is_empty()));
     }
 
     #[test]

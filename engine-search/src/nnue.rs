@@ -7,13 +7,65 @@
 //! deterministic seeded generator lets tests and CI exercise the whole pipeline
 //! — and the engine only uses it when a network is explicitly loaded.
 
-use engine_core::{Board, Color, Piece, PieceKind, Square};
+use engine_core::{Board, ChessMove, Color, Piece, PieceKind, Square};
 
 /// Number of input features: (own / their) x 6 piece kinds x 64 squares.
 pub const INPUT_DIMENSION: usize = 2 * 6 * 64;
 
 const MAGIC: &[u8; 4] = b"RFNN";
 const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION_V2: u32 = 2;
+const HALFKA_SCHEMA_TAG: u8 = 1;
+
+/// The feature encoding owned by an RFNN network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeatureSchema {
+    RelativePieceSquareV1,
+    HalfKaV2 { buckets: u8 },
+}
+
+impl FeatureSchema {
+    pub fn input_dimension(self) -> usize {
+        match self {
+            Self::RelativePieceSquareV1 => INPUT_DIMENSION,
+            Self::HalfKaV2 { buckets } => usize::from(buckets) * 2 * 5 * 64,
+        }
+    }
+
+    pub fn active_features(self, board: &Board, perspective: Color) -> Vec<usize> {
+        match self {
+            Self::RelativePieceSquareV1 => active_features(board, perspective),
+            Self::HalfKaV2 { buckets } => {
+                let king = (0..64u8).map(Square).find(|&square| {
+                    board.piece_at(square)
+                        == Some(Piece {
+                            color: perspective,
+                            kind: PieceKind::King,
+                        })
+                });
+                let Some(king) = king else { return Vec::new() };
+                (0..64u8)
+                    .filter_map(|index| {
+                        let square = Square(index);
+                        board.piece_at(square).and_then(|piece| {
+                            halfka_feature_index_with_buckets(
+                                perspective,
+                                king,
+                                piece,
+                                square,
+                                buckets,
+                            )
+                        })
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    pub fn requires_refresh_after(self, _mv: ChessMove, moved: Piece) -> bool {
+        matches!(self, Self::HalfKaV2 { .. }) && moved.kind == PieceKind::King
+    }
+}
 
 /// Clipped-ReLU upper bound for accumulator activations.
 const ACTIVATION_CLIP: i32 = 127;
@@ -47,6 +99,40 @@ pub fn feature_index(perspective: Color, piece: Piece, square: Square) -> usize 
     (relative_color * 6 + piece_kind_index(piece.kind)) * 64 + relative_square
 }
 
+/// Returns a 64-bucket HalfKA feature. Kings are the accumulator anchors and
+/// therefore deliberately have no feature of their own.
+pub fn halfka_feature_index(
+    perspective: Color,
+    king_square: Square,
+    piece: Piece,
+    square: Square,
+) -> Option<usize> {
+    halfka_feature_index_with_buckets(perspective, king_square, piece, square, 64)
+}
+
+fn halfka_feature_index_with_buckets(
+    perspective: Color,
+    king_square: Square,
+    piece: Piece,
+    square: Square,
+    buckets: u8,
+) -> Option<usize> {
+    if piece.kind == PieceKind::King || buckets == 0 {
+        return None;
+    }
+    let relative_square = match perspective {
+        Color::White => usize::from(square.0),
+        Color::Black => usize::from(square.0 ^ 56),
+    };
+    let relative_king = match perspective {
+        Color::White => usize::from(king_square.0),
+        Color::Black => usize::from(king_square.0 ^ 56),
+    };
+    let bucket = relative_king * usize::from(buckets) / 64;
+    let relative_color = usize::from(piece.color != perspective);
+    Some(((bucket * 2 + relative_color) * 5 + piece_kind_index(piece.kind)) * 64 + relative_square)
+}
+
 /// Returns the active feature indices for `board` from `perspective` (one per
 /// piece on the board). Exposed for the NNUE trainer.
 pub fn active_features(board: &Board, perspective: Color) -> Vec<usize> {
@@ -66,15 +152,23 @@ pub fn active_features(board: &Board, perspective: Color) -> Vec<usize> {
 pub struct Accumulator {
     white: Vec<i32>,
     black: Vec<i32>,
+    white_king: Square,
+    black_king: Square,
 }
 
 impl Accumulator {
     /// A zeroed accumulator seeded with the feature-transformer bias.
     fn empty(net: &Nnue) -> Self {
-        let bias: Vec<i32> = net.feature_bias.iter().map(|value| i32::from(*value)).collect();
+        let bias: Vec<i32> = net
+            .feature_bias
+            .iter()
+            .map(|value| i32::from(*value))
+            .collect();
         Self {
             white: bias.clone(),
             black: bias,
+            white_king: Square(0),
+            black_king: Square(0),
         }
     }
 
@@ -87,7 +181,19 @@ impl Accumulator {
 
     /// Adds a piece's contribution to one perspective's accumulator.
     pub fn add_feature(&mut self, net: &Nnue, perspective: Color, piece: Piece, square: Square) {
-        let feature = feature_index(perspective, piece, square);
+        if piece.kind == PieceKind::King && piece.color == perspective {
+            match perspective {
+                Color::White => self.white_king = square,
+                Color::Black => self.black_king = square,
+            }
+        }
+        let king = match perspective {
+            Color::White => self.white_king,
+            Color::Black => self.black_king,
+        };
+        let Some(feature) = net.feature_index(perspective, king, piece, square) else {
+            return;
+        };
         let hidden = net.hidden;
         let column = &net.feature_weights[feature * hidden..feature * hidden + hidden];
         for (value, weight) in self.perspective_mut(perspective).iter_mut().zip(column) {
@@ -99,7 +205,13 @@ impl Accumulator {
     /// inverse of [`Accumulator::add_feature`]; the search's make/unmake hook
     /// drives both to keep the accumulator in sync incrementally.
     pub fn remove_feature(&mut self, net: &Nnue, perspective: Color, piece: Piece, square: Square) {
-        let feature = feature_index(perspective, piece, square);
+        let king = match perspective {
+            Color::White => self.white_king,
+            Color::Black => self.black_king,
+        };
+        let Some(feature) = net.feature_index(perspective, king, piece, square) else {
+            return;
+        };
         let hidden = net.hidden;
         let column = &net.feature_weights[feature * hidden..feature * hidden + hidden];
         for (value, weight) in self.perspective_mut(perspective).iter_mut().zip(column) {
@@ -110,6 +222,19 @@ impl Accumulator {
     /// Rebuilds both accumulators from scratch for the given board.
     pub fn refresh(net: &Nnue, board: &Board) -> Self {
         let mut accumulator = Self::empty(net);
+        for index in 0..64u8 {
+            let square = Square(index);
+            if let Some(Piece {
+                color,
+                kind: PieceKind::King,
+            }) = board.piece_at(square)
+            {
+                match color {
+                    Color::White => accumulator.white_king = square,
+                    Color::Black => accumulator.black_king = square,
+                }
+            }
+        }
         for index in 0..64 {
             let square = Square(index);
             if let Some(piece) = board.piece_at(square) {
@@ -125,6 +250,7 @@ impl Accumulator {
 /// cheap to share across search threads behind an `Arc`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Nnue {
+    schema: FeatureSchema,
     hidden: usize,
     feature_weights: Vec<i16>,
     feature_bias: Vec<i16>,
@@ -133,6 +259,24 @@ pub struct Nnue {
 }
 
 impl Nnue {
+    pub fn schema(&self) -> FeatureSchema {
+        self.schema
+    }
+
+    fn feature_index(
+        &self,
+        perspective: Color,
+        king_square: Square,
+        piece: Piece,
+        square: Square,
+    ) -> Option<usize> {
+        match self.schema {
+            FeatureSchema::RelativePieceSquareV1 => Some(feature_index(perspective, piece, square)),
+            FeatureSchema::HalfKaV2 { buckets } => {
+                halfka_feature_index_with_buckets(perspective, king_square, piece, square, buckets)
+            }
+        }
+    }
     /// The hidden layer width of this network.
     pub fn hidden(&self) -> usize {
         self.hidden
@@ -169,7 +313,17 @@ impl Nnue {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        match self.schema {
+            FeatureSchema::RelativePieceSquareV1 => {
+                bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes())
+            }
+            FeatureSchema::HalfKaV2 { buckets } => {
+                bytes.extend_from_slice(&FORMAT_VERSION_V2.to_le_bytes());
+                bytes.push(HALFKA_SCHEMA_TAG);
+                bytes.push(buckets);
+                bytes.extend_from_slice(&(self.schema.input_dimension() as u32).to_le_bytes());
+            }
+        }
         bytes.extend_from_slice(&(self.hidden as u32).to_le_bytes());
         for weight in &self.feature_weights {
             bytes.extend_from_slice(&weight.to_le_bytes());
@@ -192,14 +346,34 @@ impl Nnue {
             return Err("not an RFNN network (bad magic)".to_string());
         }
         let version = cursor.read_u32()?;
-        if version != FORMAT_VERSION {
-            return Err(format!("unsupported RFNN version {version}"));
-        }
+        let schema = match version {
+            FORMAT_VERSION => FeatureSchema::RelativePieceSquareV1,
+            FORMAT_VERSION_V2 => {
+                if cursor.read_u8()? != HALFKA_SCHEMA_TAG {
+                    return Err("unsupported RFNN v2 schema tag".to_string());
+                }
+                let buckets = cursor.read_u8()?;
+                if buckets == 0 {
+                    return Err("RFNN v2 bucket count must be non-zero".to_string());
+                }
+                let input_dimension = cursor.read_u32()? as usize;
+                let schema = FeatureSchema::HalfKaV2 { buckets };
+                if input_dimension != schema.input_dimension() {
+                    return Err("RFNN v2 input dimension does not match schema".to_string());
+                }
+                schema
+            }
+            other => return Err(format!("unsupported RFNN version {other}")),
+        };
         let hidden = cursor.read_u32()? as usize;
         if hidden == 0 {
             return Err("RFNN hidden size must be non-zero".to_string());
         }
-        let feature_weights = cursor.read_i16s(INPUT_DIMENSION * hidden)?;
+        let feature_count = schema
+            .input_dimension()
+            .checked_mul(hidden)
+            .ok_or_else(|| "RFNN feature matrix size overflows".to_string())?;
+        let feature_weights = cursor.read_i16s(feature_count)?;
         let feature_bias = cursor.read_i16s(hidden)?;
         let output_weights = cursor.read_i16s(2 * hidden)?;
         let output_bias = cursor.read_i32()?;
@@ -207,6 +381,7 @@ impl Nnue {
             return Err("trailing bytes after RFNN network".to_string());
         }
         Ok(Self {
+            schema,
             hidden,
             feature_weights,
             feature_bias,
@@ -232,13 +407,31 @@ impl Nnue {
         output_weights: Vec<i16>,
         output_bias: i32,
     ) -> Result<Self, String> {
+        Self::from_parameters_with_schema(
+            FeatureSchema::RelativePieceSquareV1,
+            hidden,
+            feature_weights,
+            feature_bias,
+            output_weights,
+            output_bias,
+        )
+    }
+
+    pub fn from_parameters_with_schema(
+        schema: FeatureSchema,
+        hidden: usize,
+        feature_weights: Vec<i16>,
+        feature_bias: Vec<i16>,
+        output_weights: Vec<i16>,
+        output_bias: i32,
+    ) -> Result<Self, String> {
         if hidden == 0 {
             return Err("hidden size must be non-zero".to_string());
         }
-        if feature_weights.len() != INPUT_DIMENSION * hidden {
+        if feature_weights.len() != schema.input_dimension() * hidden {
             return Err(format!(
                 "feature_weights must have {} entries",
-                INPUT_DIMENSION * hidden
+                schema.input_dimension() * hidden
             ));
         }
         if feature_bias.len() != hidden {
@@ -248,6 +441,7 @@ impl Nnue {
             return Err(format!("output_weights must have {} entries", 2 * hidden));
         }
         Ok(Self {
+            schema,
             hidden,
             feature_weights,
             feature_bias,
@@ -259,15 +453,20 @@ impl Nnue {
     /// Builds a deterministic network with small pseudo-random weights. This is
     /// for tests and pipeline exercise only — it is not a trained network.
     pub fn from_seed(seed: u64, hidden: usize) -> Self {
+        Self::from_seed_with_schema(seed, hidden, FeatureSchema::RelativePieceSquareV1)
+    }
+
+    pub fn from_seed_with_schema(seed: u64, hidden: usize, schema: FeatureSchema) -> Self {
         assert!(hidden > 0, "hidden size must be non-zero");
         let mut rng = SplitMix64::new(seed);
-        let feature_weights = (0..INPUT_DIMENSION * hidden)
+        let feature_weights = (0..schema.input_dimension() * hidden)
             .map(|_| rng.small_weight(8))
             .collect();
         let feature_bias = (0..hidden).map(|_| rng.small_weight(4)).collect();
         let output_weights = (0..2 * hidden).map(|_| rng.small_weight(16)).collect();
         let output_bias = i32::from(rng.small_weight(32));
         Self {
+            schema,
             hidden,
             feature_weights,
             feature_bias,
@@ -308,13 +507,20 @@ impl<'a> Cursor<'a> {
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
+    fn read_u8(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+
     fn read_i32(&mut self) -> Result<i32, String> {
         let bytes = self.take(4)?;
         Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
     fn read_i16s(&mut self, count: usize) -> Result<Vec<i16>, String> {
-        let bytes = self.take(count * 2)?;
+        let byte_count = count
+            .checked_mul(2)
+            .ok_or_else(|| "RFNN network is truncated".to_string())?;
+        let bytes = self.take(byte_count)?;
         Ok(bytes
             .chunks_exact(2)
             .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
@@ -354,7 +560,7 @@ impl SplitMix64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{feature_index, Accumulator, Nnue, INPUT_DIMENSION};
+    use super::{feature_index, Accumulator, FeatureSchema, Nnue, INPUT_DIMENSION};
     use engine_core::{Board, Color, Piece, PieceKind, Square};
 
     fn white_pawn() -> Piece {
@@ -428,6 +634,33 @@ mod tests {
         let net = Nnue::from_seed(99, 48);
         let restored = Nnue::from_bytes(&net.to_bytes()).expect("valid network round-trips");
         assert_eq!(net, restored);
+    }
+
+    #[test]
+    fn v1_round_trips_and_v2_rejects_wrong_dimension() {
+        let v1 = Nnue::from_seed(9, 16);
+        assert_eq!(Nnue::from_bytes(&v1.to_bytes()).unwrap(), v1);
+
+        let v2 = Nnue::from_seed_with_schema(9, 16, FeatureSchema::HalfKaV2 { buckets: 64 });
+        assert_eq!(Nnue::from_bytes(&v2.to_bytes()).unwrap(), v2);
+        let mut malformed = v2.to_bytes();
+        // RFNN v2: magic, version, schema tag, bucket count, input dimension.
+        malformed[10..14].copy_from_slice(&768u32.to_le_bytes());
+        assert!(Nnue::from_bytes(&malformed).is_err());
+    }
+
+    #[test]
+    fn halfka_king_move_refresh_matches_full_refresh() {
+        let net = Nnue::from_seed_with_schema(7, 32, FeatureSchema::HalfKaV2 { buckets: 64 });
+        let mut board = Board::from_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1").unwrap();
+        let mv = board.parse_uci_move("e1g1").unwrap();
+        let moved = board.piece_at(mv.from).unwrap();
+        assert!(net.schema().requires_refresh_after(mv, moved));
+        board.make_move(mv).unwrap();
+        assert_eq!(
+            Accumulator::refresh(&net, &board),
+            Accumulator::refresh(&net, &board)
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ use pyrrhic_rs::{
 
 mod nnue;
 
-pub use nnue::{active_features, Nnue, INPUT_DIMENSION};
+pub use nnue::{active_features, halfka_feature_index, FeatureSchema, Nnue, INPUT_DIMENSION};
 
 const MATE_SCORE: i32 = 100_000;
 const MAX_KILLER_PLY: usize = 128;
@@ -430,6 +430,7 @@ type NnueChange = (Square, Option<Piece>, Option<Piece>);
 struct NnueDelta {
     changes: [NnueChange; 4],
     len: usize,
+    refreshed: bool,
 }
 
 impl Default for Searcher {
@@ -1374,6 +1375,7 @@ impl Searcher {
             return board.make_move(mv).expect("generated move must be legal");
         }
         let (squares, square_count) = nnue_changed_squares(board, mv);
+        let moved = board.piece_at(mv.from).expect("generated move has a piece");
         let before: [Option<Piece>; 4] =
             std::array::from_fn(|index| board.piece_at(squares[index]));
         let undo = board.make_move(mv).expect("generated move must be legal");
@@ -1386,7 +1388,13 @@ impl Searcher {
         let mut delta = NnueDelta {
             changes: [(Square(0), None, None); 4],
             len: 0,
+            refreshed: nnue.schema().requires_refresh_after(mv, moved),
         };
+        if delta.refreshed {
+            *accumulator = nnue::Accumulator::refresh(&nnue, board);
+            self.nnue_stack.push(delta);
+            return undo;
+        }
         for index in 0..square_count {
             let square = squares[index];
             let old = before[index];
@@ -1422,6 +1430,10 @@ impl Searcher {
             .nnue_accumulator
             .as_mut()
             .expect("nnue accumulator is initialised while a network is loaded");
+        if delta.refreshed {
+            *accumulator = nnue::Accumulator::refresh(&nnue, board);
+            return;
+        }
         for &(square, old, new) in delta.changes.iter().take(delta.len) {
             // Reverse of nnue_make: we removed `old` and added `new`, so now
             // remove `new` and restore `old`.
@@ -2288,7 +2300,7 @@ mod tests {
     use pyrrhic_rs::{Piece as TbPiece, WdlProbeResult};
 
     use super::{
-        Bound, ClockControl, MATE_SCORE, Nnue, OpeningBook, SearchLimits, SearchOptions,
+        Bound, ClockControl, FeatureSchema, MATE_SCORE, Nnue, OpeningBook, SearchLimits, SearchOptions,
         SearchParams, Searcher, SharedTranspositionTable, SyzygyRootProbe,
         SyzygyTablebases, SyzygyWdl, TaperedScore, TranspositionEntry, TranspositionTable,
         evaluate_position, history_index, late_move_reduction, passed_pawn_extension,
@@ -2598,6 +2610,31 @@ mod tests {
                 },
             );
             assert!(result.best_move.is_some(), "search returns a move for {fen}");
+        }
+    }
+
+    #[test]
+    fn halfka_special_moves_keep_incremental_accumulator_equivalent() {
+        let net = Arc::new(Nnue::from_seed_with_schema(
+            7, 32, FeatureSchema::HalfKaV2 { buckets: 64 },
+        ));
+        let cases = [
+            ("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1", "e1g1"),
+            ("4k3/8/8/3pPp2/8/8/8/4K3 w - f6 0 1", "e5f6"),
+            ("4k3/P7/8/8/8/8/8/4K3 w - - 0 1", "a7a8q"),
+            ("4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1", "e4d5"),
+        ];
+        for (fen, uci) in cases {
+            let mut board = Board::from_fen(fen).unwrap();
+            let mv = board.parse_uci_move(uci).unwrap();
+            let mut searcher = Searcher::default();
+            searcher.set_nnue(Some(Arc::clone(&net)));
+            searcher.nnue_refresh(&board);
+            let undo = searcher.nnue_make(&mut board, mv);
+            // evaluate contains the permanent refresh-equivalence assertion.
+            let _ = searcher.evaluate(&board);
+            searcher.nnue_unmake(&mut board, mv, undo);
+            let _ = searcher.evaluate(&board);
         }
     }
 
