@@ -36,21 +36,35 @@ WDL_SCALE = 400.0        # centipawns -> win-probability steepness
 
 
 def _load_samples(path: str, expected_schema: str = "v1", input_dimension: int = INPUT_DIMENSION):
-    """Load schema-tagged labels, rejecting rows outside the manifest contract."""
+    """Load a schema-headered TSV, rejecting incompatible or mixed datasets."""
     owns, opps, targets = [], [], []
     with open(path, "r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
+        header_fields = handle.readline().rstrip("\r\n").split("\t")
+        if len(header_fields) != 4 or header_fields[:2] != ["rfnn_tsv", "1"]:
+            raise ValueError("missing or invalid RFNN TSV header")
+        schema, dimension = header_fields[2:]
+        if schema != expected_schema:
+            raise ValueError(
+                f"schema mismatch in TSV header: expected {expected_schema}, got {schema}"
+            )
+        try:
+            declared_dimension = int(dimension)
+        except ValueError as error:
+            raise ValueError("invalid input dimension in TSV header") from error
+        if declared_dimension != input_dimension:
+            raise ValueError(
+                f"feature dimension mismatch in TSV header: expected {input_dimension}, got {declared_dimension}"
+            )
+        for line_number, line in enumerate(handle, start=2):
             line = line.rstrip("\r\n")
             if not line.strip():
                 continue
             fields = line.split("\t")
-            if len(fields) < 4:
-                raise ValueError(f"invalid schema-tagged sample at line {line_number}")
-            schema, target_str, own_str, opp_str = fields[:4]
-            if schema != expected_schema:
-                raise ValueError(
-                    f"schema mismatch at line {line_number}: expected {expected_schema}, got {schema}"
-                )
+            if len(fields) < 3:
+                raise ValueError(f"invalid sample at line {line_number}")
+            if fields[0] == "rfnn_tsv":
+                raise ValueError(f"schema mismatch: mixed TSV headers at line {line_number}")
+            target_str, own_str, opp_str = fields[:3]
             own = [int(x) for x in own_str.split(",") if x != ""]
             opp = [int(x) for x in opp_str.split(",") if x != ""]
             if any(index < 0 or index >= input_dimension for index in own + opp):

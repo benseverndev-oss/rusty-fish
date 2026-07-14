@@ -49,3 +49,30 @@
   all special move classes under HalfKA, including unmake.
 - The pre-existing `unused_mut` warning in `engine-search/src/lib.rs:787` is
   unrelated to this task; the touched code introduces no warnings.
+
+## Review-fix report
+
+- `gen-data` accepts an optional schema (`v1` or `halfka-v2-64`) and
+  `stockfish-label` accepts the same optional schema argument. Both derive
+  features with `FeatureSchema::active_features` and prepend the immutable TSV
+  header `rfnn_tsv\t1\t<schema>\t<input_dimension>`.
+- The Modal TSV reader now requires that header, validates both declared schema
+  and dimension before reading rows, and rejects a second header as a mixed
+  dataset. The label handoff preserves the producer header instead of adding
+  per-row schema prefixes.
+- Added the static `engine-search/testdata/rfnn-v1-known-parameters.hex`
+  fixture. A network built from independently specified, deterministic v1
+  parameters must serialize byte-for-byte to that fixture.
+- Added focused Rust coverage for schema parsing/header dimensions and HalfKA
+  sample generation, plus the pinned v1 fixture regression. `python` is not
+  installed in this environment, so the updated Modal pytest file could not be
+  executed locally.
+
+### Review-fix verification
+
+- `cargo test -p engine-search` — 47 passed.
+- `cargo test -p engine-bench` — 39 passed.
+- `cargo run -q -p engine-bench -- gen-data 1 0 1 halfka-v2-64` — emitted
+  `rfnn_tsv\t1\thalfka-v2-64\t40960` and valid HalfKA feature rows.
+- `git diff --check` — clean (the existing `unused_mut` warning remains
+  unrelated).

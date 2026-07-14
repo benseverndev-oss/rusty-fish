@@ -9,7 +9,11 @@ from train_nnue import _load_samples
 
 def test_load_samples_rejects_mixed_schema_or_feature_dimension(tmp_path):
     path = tmp_path / "mixed.tsv"
-    path.write_text("v1\t1\t0\t\nHalfKA\t1\t0\t\n", encoding="utf-8")
+    path.write_text(
+        "rfnn_tsv\t1\tv1\t768\n1\t0\t\n"
+        "rfnn_tsv\t1\thalfka-v2-64\t40960\n1\t0\t\n",
+        encoding="utf-8",
+    )
 
     with pytest.raises(ValueError, match="schema"):
         _load_samples(path, expected_schema="v1", input_dimension=768)
@@ -17,7 +21,7 @@ def test_load_samples_rejects_mixed_schema_or_feature_dimension(tmp_path):
 
 def test_load_samples_rejects_out_of_range_feature_index(tmp_path):
     path = tmp_path / "out-of-range.tsv"
-    path.write_text("v1\t1\t768\t0\n", encoding="utf-8")
+    path.write_text("rfnn_tsv\t1\tv1\t768\n1\t768\t0\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="feature dimension"):
         _load_samples(path, expected_schema="v1", input_dimension=768)
@@ -36,7 +40,7 @@ def test_quantization_error_is_maximum_sealed_prediction_delta(tmp_path):
             return self.bias.expand(own_offsets.numel())
 
     path = tmp_path / "sealed-test.tsv"
-    path.write_text("v1\t1\t0\t0\nv1\t1\t1\t1\n", encoding="utf-8")
+    path.write_text("rfnn_tsv\t1\tv1\t768\n1\t0\t0\n1\t1\t1\n", encoding="utf-8")
     assert train_nnue.quantization_max_error_cp(
         ConstantModel(), path, "cpu", schema="v1", input_dimension=768
     ) == pytest.approx(0.25)

@@ -12,9 +12,7 @@
 //! that exceeds it.
 
 use engine_core::{Board, Color};
-use engine_search::{
-    active_features, hand_crafted_evaluation, FeatureSchema, Nnue, SearchLimits, Searcher,
-};
+use engine_search::{FeatureSchema, Nnue, SearchLimits, Searcher, hand_crafted_evaluation};
 
 /// Search scores can reach mate values; training targets are clamped to this
 /// magnitude so the regression stays well-conditioned.
@@ -62,6 +60,7 @@ pub fn generate_training_samples(
     plies: u32,
     seed: u64,
     label_depth: Option<u8>,
+    schema: FeatureSchema,
 ) -> Result<Vec<TrainingSample>, String> {
     let mut rng = Lcg::new(seed);
     let mut labeler = Searcher::default();
@@ -84,9 +83,9 @@ pub fn generate_training_samples(
                     .clamp(-TARGET_CLAMP, TARGET_CLAMP),
             };
             samples.push(TrainingSample {
-                schema: FeatureSchema::RelativePieceSquareV1,
-                own: active_features(&board, stm),
-                opp: active_features(&board, opposite(stm)),
+                schema,
+                own: schema.active_features(&board, stm),
+                opp: schema.active_features(&board, opposite(stm)),
                 target: target as f32,
             });
             let moves = board.generate_legal_move_list();
@@ -348,7 +347,8 @@ impl Lcg {
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_training_samples, train_nnue, TrainConfig};
+    use super::{TrainConfig, generate_training_samples, train_nnue};
+    use engine_search::FeatureSchema;
 
     const SEEDS: &[&str] = &[
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
@@ -357,18 +357,26 @@ mod tests {
 
     #[test]
     fn training_generates_labelled_samples() {
-        let samples = generate_training_samples(SEEDS, 8, 1, None).expect("samples");
+        let samples =
+            generate_training_samples(SEEDS, 8, 1, None, FeatureSchema::RelativePieceSquareV1)
+                .expect("samples");
         assert!(!samples.is_empty());
         // Every sample records the pieces on the board from both perspectives.
-        assert!(samples
-            .iter()
-            .all(|sample| !sample.own.is_empty() && !sample.opp.is_empty()));
+        assert!(
+            samples
+                .iter()
+                .all(|sample| !sample.own.is_empty() && !sample.opp.is_empty())
+        );
     }
 
     #[test]
     fn deep_search_labels_differ_from_the_static_evaluation() {
-        let static_samples = generate_training_samples(SEEDS, 6, 3, None).expect("static");
-        let search_samples = generate_training_samples(SEEDS, 6, 3, Some(3)).expect("search");
+        let static_samples =
+            generate_training_samples(SEEDS, 6, 3, None, FeatureSchema::RelativePieceSquareV1)
+                .expect("static");
+        let search_samples =
+            generate_training_samples(SEEDS, 6, 3, Some(3), FeatureSchema::RelativePieceSquareV1)
+                .expect("search");
         assert_eq!(static_samples.len(), search_samples.len());
         // Same positions (identical features), but the depth-3 search labels
         // reflect tactics the static evaluation misses, so some targets differ.
@@ -386,7 +394,9 @@ mod tests {
         // Depth-labelled targets are large and high-variance; before gradient
         // clipping they made SGD diverge (loss increasing). Training must now
         // reduce the loss on them.
-        let samples = generate_training_samples(SEEDS, 8, 11, Some(2)).expect("samples");
+        let samples =
+            generate_training_samples(SEEDS, 8, 11, Some(2), FeatureSchema::RelativePieceSquareV1)
+                .expect("samples");
         let config = TrainConfig {
             hidden: 32,
             epochs: 30,
@@ -404,7 +414,9 @@ mod tests {
 
     #[test]
     fn training_reduces_loss_and_beats_a_zero_predictor() {
-        let samples = generate_training_samples(SEEDS, 12, 7, None).expect("samples");
+        let samples =
+            generate_training_samples(SEEDS, 12, 7, None, FeatureSchema::RelativePieceSquareV1)
+                .expect("samples");
         // A zero-centipawn predictor maps to a 0.5 win probability everywhere.
         let zero_loss: f32 = samples
             .iter()
@@ -441,5 +453,18 @@ mod tests {
             engine_search::Nnue::from_bytes(&net.to_bytes()).expect("exported net round-trips");
         let board = engine_core::Board::startpos();
         assert!(restored.evaluate(&board, engine_core::Color::White).abs() <= 20_000);
+    }
+
+    #[test]
+    fn generated_samples_use_the_requested_feature_schema() {
+        let schema = FeatureSchema::HalfKaV2 { buckets: 64 };
+        let samples = generate_training_samples(SEEDS, 2, 1, None, schema).expect("samples");
+        assert!(samples.iter().all(|sample| sample.schema == schema));
+        assert!(
+            samples
+                .iter()
+                .flat_map(|sample| sample.own.iter().chain(&sample.opp))
+                .all(|&feature| feature < schema.input_dimension())
+        );
     }
 }

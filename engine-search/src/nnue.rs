@@ -560,7 +560,7 @@ impl SplitMix64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{feature_index, Accumulator, FeatureSchema, Nnue, INPUT_DIMENSION};
+    use super::{Accumulator, FeatureSchema, INPUT_DIMENSION, Nnue, feature_index};
     use engine_core::{Board, Color, Piece, PieceKind, Square};
 
     fn white_pawn() -> Piece {
@@ -637,6 +637,15 @@ mod tests {
     }
 
     #[test]
+    fn v1_serialization_matches_the_pinned_known_parameter_fixture() {
+        let net = Nnue::from_parameters(1, vec![0; INPUT_DIMENSION], vec![123], vec![-7, 8], -9)
+            .expect("known v1 parameters are valid");
+        let fixture = decode_hex(include_str!("../testdata/rfnn-v1-known-parameters.hex"));
+        assert_eq!(net.to_bytes(), fixture);
+        assert_eq!(Nnue::from_bytes(&fixture).expect("fixture loads"), net);
+    }
+
+    #[test]
     fn v1_round_trips_and_v2_rejects_wrong_dimension() {
         let v1 = Nnue::from_seed(9, 16);
         assert_eq!(Nnue::from_bytes(&v1.to_bytes()).unwrap(), v1);
@@ -677,5 +686,14 @@ mod tests {
         fn empty_for_test(net: &Nnue) -> Self {
             Self::empty(net)
         }
+    }
+
+    fn decode_hex(value: &str) -> Vec<u8> {
+        let value = value.trim();
+        assert_eq!(value.len() % 2, 0, "fixture must contain complete bytes");
+        (0..value.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&value[index..index + 2], 16).unwrap())
+            .collect()
     }
 }

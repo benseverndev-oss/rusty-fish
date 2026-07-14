@@ -119,7 +119,7 @@ def label_manifest(run_id: str, manifest_text: str, stockfish_config_text: str) 
         for split in ("train", "validation", "test"):
             output = root / f"{split}-labels.tsv"
             subprocess.run([BIN, "stockfish-label", str(manifest_path), split, str(config), str(output)], check=True)
-            result[split] = "".join(f"{SCHEMA}\t{line}\n" for line in output.read_text(encoding="utf-8").splitlines())
+            result[split] = output.read_text(encoding="utf-8")
     _write_artifact(run_id, "labels", manifest_text + stockfish_config_text, json.dumps(result, sort_keys=True))
     return result
 
