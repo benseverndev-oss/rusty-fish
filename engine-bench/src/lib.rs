@@ -347,10 +347,30 @@ pub fn run_nnue_gauntlet(
     net: Arc<Nnue>,
     config: MatchConfig,
 ) -> Result<Vec<GameRecord>, String> {
+    run_nnue_gauntlet_with_optional_move_time(positions, net, config, None)
+}
+
+/// Plays a bounded NNUE gauntlet. Every search receives the same per-move
+/// deadline so an unusually expensive position cannot stall a whole campaign.
+pub fn run_nnue_gauntlet_with_move_time(
+    positions: &[&str],
+    net: Arc<Nnue>,
+    config: MatchConfig,
+    move_time: Duration,
+) -> Result<Vec<GameRecord>, String> {
+    run_nnue_gauntlet_with_optional_move_time(positions, net, config, Some(move_time))
+}
+
+fn run_nnue_gauntlet_with_optional_move_time(
+    positions: &[&str],
+    net: Arc<Nnue>,
+    config: MatchConfig,
+    move_time: Option<Duration>,
+) -> Result<Vec<GameRecord>, String> {
     let mut records = Vec::with_capacity(positions.len() * 2);
     for fen in positions {
         for candidate_color in [Color::White, Color::Black] {
-            records.push(play_nnue_game(fen, candidate_color, &net, config)?);
+            records.push(play_nnue_game(fen, candidate_color, &net, config, move_time)?);
         }
     }
     Ok(records)
@@ -404,6 +424,7 @@ fn play_nnue_game(
     candidate_color: Color,
     net: &Arc<Nnue>,
     config: MatchConfig,
+    move_time: Option<Duration>,
 ) -> Result<GameRecord, String> {
     let mut board = Board::from_fen(fen)?;
     let mut candidate = Searcher::default();
@@ -419,6 +440,7 @@ fn play_nnue_game(
             &board,
             SearchLimits {
                 depth: Some(depth),
+                movetime: move_time,
                 ..SearchLimits::default()
             },
         );
