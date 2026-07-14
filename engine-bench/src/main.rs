@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 
 use engine_bench::{
     DEFAULT_TACTICAL_SUITE, ExternalMatchConfig, MatchConfig, MatchScore, SpsaConfig, SprtConfig,
@@ -8,6 +8,10 @@ use engine_bench::{
     spsa_tsv_report, sprt, sprt_tsv_report, summarize, tactical_tsv_report, throughput_tsv_report,
 };
 use engine_bench::train::{generate_training_samples, train_nnue, TrainConfig};
+use engine_bench::dataset::{
+    DatasetManifest, PositionRecord, TEST_SPLIT, TRAIN_SPLIT, VALIDATION_SPLIT,
+    canonical_fen, deduplicate_and_split, sha256_hex, write_manifest,
+};
 use engine_search::{Nnue, SearchParams};
 
 const BENCHMARKS: &[(&str, u8)] = &[
@@ -46,6 +50,9 @@ const EXTERNAL_SPRT_POSITIONS: &[&str] = &[
 ];
 
 fn main() -> Result<(), String> {
+    if std::env::args().nth(1).as_deref() == Some("dataset-build") {
+        return dataset_build();
+    }
     if std::env::args().nth(1).as_deref() == Some("tactical") {
         let results = run_tactical_suite(DEFAULT_TACTICAL_SUITE)?;
         print!("{}", tactical_tsv_report(&results));
@@ -225,6 +232,87 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
+fn dataset_build() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 8 && args.len() != 9 {
+        return Err("usage: dataset-build <run_id> <out_dir> <random_count> <opening_count> <quiet_count> <seed> [--smoke]".to_string());
+    }
+    let run_id = &args[2];
+    let out_dir = Path::new(&args[3]);
+    let random_count = args[4].parse::<usize>().map_err(|_| "random_count must be an integer".to_string())?;
+    let opening_count = args[5].parse::<usize>().map_err(|_| "opening_count must be an integer".to_string())?;
+    let quiet_count = args[6].parse::<usize>().map_err(|_| "quiet_count must be an integer".to_string())?;
+    let seed = args[7].parse::<u64>().map_err(|_| "seed must be an integer".to_string())?;
+    let smoke = args.get(8).is_some_and(|arg| arg == "--smoke");
+    if args.len() == 9 && !smoke {
+        return Err("the only optional dataset-build flag is --smoke".to_string());
+    }
+    let total = random_count.saturating_add(opening_count).saturating_add(quiet_count);
+    if (!smoke && (random_count, opening_count, quiet_count) != (400_000, 400_000, 200_000))
+        || (smoke && total > 1_000)
+    {
+        return Err("dataset-build requires counts 400000 400000 200000; --smoke permits a total of at most 1000".to_string());
+    }
+
+    let mut records = Vec::with_capacity(total);
+    append_records(&mut records, "random", random_count, 8, seed);
+    append_records(&mut records, "opening", opening_count, 16, seed ^ 0x9E37_79B9_7F4A_7C15);
+    append_records(&mut records, "quiet", quiet_count, 24, seed ^ 0xD1B5_4A32_D192_ED03);
+    let splits = deduplicate_and_split(records)?;
+    std::fs::create_dir_all(out_dir)
+        .map_err(|error| format!("failed to create {}: {error}", out_dir.display()))?;
+
+    let mut source_counts = BTreeMap::new();
+    let mut split_counts = BTreeMap::new();
+    let mut shard_sha256 = Vec::new();
+    let mut dataset_bytes = Vec::new();
+    for split in [TRAIN_SPLIT, VALIDATION_SPLIT, TEST_SPLIT] {
+        let records = splits.get(split).expect("all dataset splits are initialized");
+        let mut shard = String::from("fen\tsource\n");
+        for record in records {
+            shard.push_str(&record.fen);
+            shard.push('\t');
+            shard.push_str(&record.source);
+            shard.push('\n');
+            *source_counts.entry(record.source.clone()).or_insert(0) += 1;
+        }
+        split_counts.insert(split.to_string(), records.len());
+        shard_sha256.push(sha256_hex(shard.as_bytes()));
+        dataset_bytes.extend_from_slice(shard.as_bytes());
+        std::fs::write(out_dir.join(format!("{split}.tsv")), shard)
+            .map_err(|error| format!("failed to write {split} shard: {error}"))?;
+    }
+    let manifest = DatasetManifest {
+        run_id: run_id.to_string(),
+        source_counts,
+        split_counts,
+        shard_sha256,
+        dataset_sha256: sha256_hex(&dataset_bytes),
+        stockfish_config_sha256: None,
+    };
+    write_manifest(&out_dir.join("manifest.tsv"), &manifest)
+}
+
+fn append_records(records: &mut Vec<PositionRecord>, source: &str, count: usize, plies: u32, seed: u64) {
+    let target_len = records.len().saturating_add(count);
+    let mut batch = 0_u64;
+    while records.len() < target_len {
+        let remaining = target_len - records.len();
+        for fen in random_opening_fens(remaining.saturating_mul(2).max(16), plies, seed.wrapping_add(batch)) {
+            if let Ok(fen) = canonical_fen(&fen) {
+                records.push(PositionRecord {
+                    fen,
+                    source: source.to_string(),
+                });
+                if records.len() == target_len {
+                    return;
+                }
+            }
+        }
+        batch = batch.wrapping_add(1);
+    }
+}
+
 fn arg_u32(index: usize) -> Option<u32> {
     std::env::args().nth(index).and_then(|arg| arg.parse::<u32>().ok())
 }
@@ -239,4 +327,19 @@ fn join_usize(values: &[usize]) -> String {
         .map(|value| value.to_string())
         .collect::<Vec<_>>()
         .join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{append_records, deduplicate_and_split};
+
+    #[test]
+    fn generated_dataset_records_exclude_terminal_positions() {
+        let mut records = Vec::new();
+        append_records(&mut records, "random", 400, 8, 1);
+        append_records(&mut records, "opening", 400, 16, 1 ^ 0x9E37_79B9_7F4A_7C15);
+        append_records(&mut records, "quiet", 200, 24, 1 ^ 0xD1B5_4A32_D192_ED03);
+        assert_eq!(records.len(), 1_000);
+        assert!(deduplicate_and_split(records).is_ok());
+    }
 }

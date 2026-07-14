@@ -8,6 +8,7 @@ use std::time::Duration;
 use engine_core::{Board, Color, GameStatus};
 use engine_search::{Nnue, SearchLimits, SearchParams, Searcher};
 
+pub mod dataset;
 pub mod train;
 
 #[derive(Clone, Debug)]
