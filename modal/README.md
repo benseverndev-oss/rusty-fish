@@ -34,6 +34,18 @@ modal run --write-result stockfish-config.tsv modal/app.py::calibrate_run --run-
 Then use that exact config for the matching run. Do not create it with a local
 Windows Stockfish binary: label jobs verify the executable hash inside Modal.
 
+For a production v1 campaign that survives a Windows client disconnect, start
+the durable Modal coordinator directly and inspect its persisted state later:
+
+```bash
+modal run --detach modal/app.py::run_v1_pipeline --run-id full-v1
+modal run modal/app.py::pipeline_status --run-id full-v1
+```
+
+The coordinator owns corpus/calibration, bounded parallel labels, GPU training,
+eligibility, screens, and full gates. It writes immutable status artifacts at
+each stage; restarting the same run reuses completed content-addressed stages.
+
 ```bash
 modal run modal/app.py --run-id smoke-v1 --smoke --schema v1 --widths 128,256,512 \
   --stockfish-config stockfish-config.tsv --seed 1

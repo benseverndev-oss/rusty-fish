@@ -542,6 +542,73 @@ def read_report(run_id: str, width: int, input_hash: str) -> dict:
     return json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
 
 
+def _write_pipeline_status(run_id: str, stage: str, **details) -> str:
+    status = {"run_id": run_id, "stage": stage, **details}
+    return _write_artifact(
+        run_id, "pipeline-status", json.dumps(status, sort_keys=True),
+        json.dumps(status, sort_keys=True, indent=2), "status.json",
+    )
+
+
+@app.function(volumes={"/artifacts": artifacts})
+def pipeline_status(run_id: str) -> dict:
+    """Return the most recently persisted durable pipeline state for a run."""
+    artifacts.reload()
+    paths = list(pathlib.Path(f"/artifacts/runs/{run_id}").glob("pipeline-status-*/status.json"))
+    if not paths:
+        raise ValueError(f"no pipeline status for run {run_id}")
+    return json.loads(max(paths, key=lambda path: path.stat().st_mtime_ns).read_text(encoding="utf-8"))
+
+
+@app.function(image=rust_image, volumes={"/artifacts": artifacts}, timeout=24 * 60 * 60)
+def run_v1_pipeline(run_id: str, smoke: bool = False, widths: str = "128,256,512",
+                    epochs: int = 40, seed: int = 1) -> dict:
+    """Durably coordinate corpus, labels, GPU training, and v1 gates in Modal."""
+    _write_pipeline_status(run_id, "corpus")
+    manifest, positions = _build_corpus_artifacts(run_id, smoke)
+    _write_pipeline_status(run_id, "calibration", manifest_sha256=_sha256(manifest))
+    with tempfile.TemporaryDirectory() as directory:
+        config = _calibrate_remote_stockfish_config(manifest, positions, pathlib.Path(directory))
+    _write_artifact(run_id, "stockfish-config", manifest + config, config, "stockfish-config.tsv")
+    _write_pipeline_status(run_id, "labels")
+    labels = label_manifest.remote(run_id, manifest, config, SCHEMA)
+    data_text = json.dumps(labels, sort_keys=True)
+    control_hash = _sha256(data_text + f"{SCHEMA}:{INPUT_DIMENSION}:128:{epochs}:{seed}")
+    _write_pipeline_status(run_id, "control", input_hash=control_hash)
+    control_net = train_net.remote(data_text, SCHEMA, INPUT_DIMENSION, 128, epochs, run_id, seed)
+    control = read_report.remote(run_id, 128, control_hash)
+    manifest_sha256, config_sha256 = _sha256(manifest), _sha256(config)
+    candidates = []
+    for width in [int(value) for value in widths.split(",") if value]:
+        _write_pipeline_status(run_id, f"candidate-{width}")
+        net = control_net if width == 128 else train_net.remote(
+            data_text, SCHEMA, INPUT_DIMENSION, width, epochs, run_id, seed
+        )
+        input_hash = _sha256(data_text + f"{SCHEMA}:{INPUT_DIMENSION}:{width}:{epochs}:{seed}")
+        report = read_report.remote(run_id, width, input_hash)
+        eligible = (
+            report["validation_wdl_loss"] <= control["validation_wdl_loss"] * 0.98
+            and report["test_wdl_loss"] <= control["test_wdl_loss"] * 0.99
+            and report["quantization_max_error_cp"] <= 32
+        )
+        if not eligible:
+            candidates.append({"width": width, "stage": "offline-rejected"})
+            continue
+        _write_pipeline_status(run_id, f"screen-{width}")
+        rust_parity_check.remote(net)
+        screen = run_screen.remote(net, run_id, report, control, manifest_sha256, config_sha256)
+        wdl = screen["wdl"]
+        if not promotes(report, control, (wdl["wins"], wdl["draws"], wdl["losses"])):
+            candidates.append({"width": width, "stage": "screen-rejected", "screen": screen})
+            continue
+        _write_pipeline_status(run_id, f"full-gate-{width}")
+        verdict = run_full_gate.remote(net, run_id, report, control, manifest_sha256, config_sha256)
+        candidates.append({"width": width, "stage": "full-gate", "verdict": verdict})
+    result = {"run_id": run_id, "stage": "complete", "candidates": candidates}
+    _write_pipeline_status(run_id, "complete", candidates=candidates)
+    return result
+
+
 @app.local_entrypoint()
 def calibrate(run_id: str = "calibration-v1", smoke: bool = False,
               output: str = "stockfish-config.tsv"):

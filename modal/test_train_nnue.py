@@ -222,6 +222,36 @@ def test_label_scheduler_caps_each_wave_at_eighty_workers():
     assert [job for wave in waves for job in wave] == jobs
 
 
+def test_v1_pipeline_remote_coordinator_owns_stages_and_records_progress(monkeypatch):
+    import app
+
+    stages = []
+
+    class Remote:
+        def __init__(self, result):
+            self.result = result
+
+        def remote(self, *_args):
+            return self.result
+
+    labels = {"train": "rfnn_tsv\t1\tv1\t768\n", "validation": "rfnn_tsv\t1\tv1\t768\n", "test": "rfnn_tsv\t1\tv1\t768\n"}
+    report = {"validation_wdl_loss": 0.0, "test_wdl_loss": 0.0, "quantization_max_error_cp": 0}
+    monkeypatch.setattr(app, "_build_corpus_artifacts", lambda *_args: ("manifest", "positions"))
+    monkeypatch.setattr(app, "_calibrate_remote_stockfish_config", lambda *_args: "config")
+    monkeypatch.setattr(app, "label_manifest", Remote(labels))
+    monkeypatch.setattr(app, "train_net", Remote(b"net"))
+    monkeypatch.setattr(app, "read_report", Remote(report))
+    monkeypatch.setattr(app, "rust_parity_check", Remote(None))
+    monkeypatch.setattr(app, "run_screen", Remote({"wdl": {"wins": 0, "draws": 0, "losses": 384}}))
+    monkeypatch.setattr(app, "_write_artifact", lambda *_args, **_kwargs: "artifact")
+    monkeypatch.setattr(app, "_write_pipeline_status", lambda _run, stage, **_details: stages.append(stage))
+
+    result = app.run_v1_pipeline.local("durable-v1", True, "128", 1, 1)
+
+    assert result["stage"] == "complete"
+    assert stages == ["corpus", "calibration", "labels", "control", "candidate-128", "screen-128", "complete"]
+
+
 def test_label_shard_reuses_its_immutable_artifact(tmp_path, monkeypatch):
     import app
 

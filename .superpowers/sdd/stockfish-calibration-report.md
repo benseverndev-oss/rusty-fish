@@ -143,6 +143,23 @@ while reserving container headroom for orchestration and unrelated work.
   passed: 22 passed, 2 existing local-execution warnings. The scheduler test
   proves 161 jobs are dispatched as stable 80/80/1 waves.
 
+## Durable full-v1 orchestration
+
+`run_v1_pipeline` is a long-running Modal coordinator (no GPU itself) that
+owns corpus/calibration, sharded labels, GPU control/candidate training,
+eligibility, screens, and full gates. It writes immutable status artifacts at
+every stage; `pipeline_status` retrieves the latest durable state. Start it
+without a Windows-client dependency using
+`modal run --detach modal/app.py::run_v1_pipeline --run-id full-v1`.
+
+- RED: the focused coordinator test failed because durable status writing and
+  the direct pipeline function did not exist.
+- GREEN: `C:\Users\bsevern\AppData\Local\Programs\Python\Python312\python.exe -m pytest modal/test_train_nnue.py -q`
+  passed: 23 passed, 3 expected local-execution warnings. The focused test
+  proves the remote coordinator owns each v1 stage and records progress.
+- CLI verification confirmed `run_v1_pipeline` exposes run ID/smoke/widths/
+  epochs/seed and `pipeline_status` exposes run ID. No Modal run was launched.
+
 ## Modal image-path remediation
 
 Real Modal image construction exposed a path collision: the Stockfish archive
