@@ -38,7 +38,7 @@ impl Visitor for Builder {
             let uci = UciMove::from_standard(mv.clone()).to_string();
             let signature = game.board.position_signature();
             let side = game.board.side_to_move;
-            match game.board.parse_uci_move(&uci).and_then(|m| game.board.make_move(m)) { Ok(()) => game.moves.push((signature, uci, side)), Err(_) => game.valid = false }
+            match game.board.parse_uci_move(&uci).and_then(|m| game.board.make_move(m)) { Ok(_) => game.moves.push((signature, uci, side)), Err(_) => game.valid = false }
         }
         game.chess.play_unchecked(mv);
         ControlFlow::Continue(())
