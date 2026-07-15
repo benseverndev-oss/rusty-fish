@@ -1,0 +1,9 @@
+[package]
+name = "book-tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+engine-core = { path = "../engine-core" }
+pgn-reader = "0.29"

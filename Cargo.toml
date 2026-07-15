@@ -1,5 +1,5 @@
 [workspace]
-members = ["engine-core", "engine-search", "engine-uci", "engine-bench", "app-desktop"]
+members = ["engine-core", "engine-search", "engine-uci", "engine-bench", "app-desktop", "book-tool"]
 resolver = "2"
 
 [workspace.package]
