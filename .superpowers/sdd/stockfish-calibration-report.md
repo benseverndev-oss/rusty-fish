@@ -129,6 +129,20 @@ the coordinator only orchestrates and validates shard output.
 - No Modal run was launched for this change. Operators rerun the same command
   after a failed batch; completed shard artifacts are reused automatically.
 
+## Bounded label-worker scheduling
+
+The workspace reached its 100-container limit when all label shards were
+submitted at once, causing saturation and preemptions. The label coordinator
+now submits deterministic waves of at most 80 shard workers, preserving each
+shard's existing content address, reuse behavior, and final aggregation order
+while reserving container headroom for orchestration and unrelated work.
+
+- RED: `C:\Users\bsevern\AppData\Local\Programs\Python\Python312\python.exe -m pytest modal/test_train_nnue.py::test_label_scheduler_caps_each_wave_at_eighty_workers -q`
+  failed because the bounded scheduler did not exist.
+- GREEN: `C:\Users\bsevern\AppData\Local\Programs\Python\Python312\python.exe -m pytest modal/test_train_nnue.py -q`
+  passed: 22 passed, 2 existing local-execution warnings. The scheduler test
+  proves 161 jobs are dispatched as stable 80/80/1 waves.
+
 ## Modal image-path remediation
 
 Real Modal image construction exposed a path collision: the Stockfish archive

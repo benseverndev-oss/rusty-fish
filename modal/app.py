@@ -20,6 +20,7 @@ STOCKFISH_18_ARCHIVE_SHA256 = "5c6f38b02a4da5f3ffe763f27da6c3e743eebefd92b50cb36
 REMOTE_STOCKFISH = "/opt/stockfish/stockfish-bin"
 RUST_IMAGE_BASE = "debian@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df"
 LABEL_SHARD_ROWS = 1_000
+MAX_LABEL_WORKERS = 80
 STOCKFISH_INSTALL_COMMAND = (
     "stockfish=$(find /opt/stockfish -type f -name stockfish-ubuntu-x86-64 -print -quit) "
     "&& test -n \"$stockfish\" && chmod +x \"$stockfish\" "
@@ -149,6 +150,14 @@ def _partition_label_rows(split_text: str, rows_per_shard: int = LABEL_SHARD_ROW
         raise ValueError("invalid split row for labeling")
     return ["fen\tsource\n" + "\n".join(rows[index:index + rows_per_shard]) + "\n"
             for index in range(0, len(rows), rows_per_shard)]
+
+
+def _label_worker_waves(jobs, max_workers: int = MAX_LABEL_WORKERS):
+    """Yield stable submission waves that leave Modal container headroom."""
+    if max_workers <= 0:
+        raise ValueError("label worker limit must be positive")
+    for index in range(0, len(jobs), max_workers):
+        yield jobs[index:index + max_workers]
 
 
 def _expected_label_header(schema: str) -> str:
@@ -359,7 +368,9 @@ def label_manifest(run_id: str, manifest_text: str, stockfish_config_text: str,
     for split in ("train", "validation", "test"):
         for shard_index, shard_text in enumerate(_partition_label_rows(payload[split])):
             jobs.append((run_id, manifest_text, stockfish_config_text, schema, split, shard_index, shard_text))
-    shard_results = list(label_manifest_shard.starmap(jobs, order_outputs=False))
+    shard_results = []
+    for wave in _label_worker_waves(jobs):
+        shard_results.extend(label_manifest_shard.starmap(wave, order_outputs=False))
     expected = {(split, shard_index) for *_prefix, split, shard_index, _text in jobs}
     received = {(split, shard_index) for split, shard_index, _path in shard_results}
     if received != expected or len(shard_results) != len(expected):

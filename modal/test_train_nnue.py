@@ -211,6 +211,17 @@ def test_label_batches_are_deterministic_bounded_and_keep_the_split_header():
     ]
 
 
+def test_label_scheduler_caps_each_wave_at_eighty_workers():
+    import app
+
+    jobs = list(range(161))
+    waves = list(app._label_worker_waves(jobs))
+
+    assert [len(wave) for wave in waves] == [80, 80, 1]
+    assert max(len(wave) for wave in waves) == 80
+    assert [job for wave in waves for job in wave] == jobs
+
+
 def test_label_shard_reuses_its_immutable_artifact(tmp_path, monkeypatch):
     import app
 

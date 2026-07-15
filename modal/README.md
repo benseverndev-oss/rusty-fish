@@ -61,7 +61,9 @@ stage—there is no module-level run state.
 ## Labeling at production scale
 
 Each train/validation/test split is deterministically cut into contiguous
-1,000-row batches. Modal runs those CPU label batches in parallel; each batch
+1,000-row batches. Modal runs those CPU label batches in deterministic waves of
+at most 80 workers (leaving headroom below the 100-container workspace limit);
+each batch
 checks the pinned Stockfish config and writes an immutable content-addressed
 artifact before the coordinator aggregates them. Re-running the same run/schema
 reuses completed batch artifacts. Aggregation sorts by split and batch index,
