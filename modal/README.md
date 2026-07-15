@@ -58,6 +58,20 @@ dimension 40,960; a Rust one-opening gate confirms the file loads before the
 corpus. The manifest and its split shards are passed explicitly between every
 stage—there is no module-level run state.
 
+## Labeling at production scale
+
+Each train/validation/test split is deterministically cut into contiguous
+1,000-row batches. Modal runs those CPU label batches in parallel; each batch
+checks the pinned Stockfish config and writes an immutable content-addressed
+artifact before the coordinator aggregates them. Re-running the same run/schema
+reuses completed batch artifacts. Aggregation sorts by split and batch index,
+then emits one schema header followed by the original split row order.
+
+Individual label workers are capped at 30 minutes. The coordinator only
+dispatches, waits for, and validates batches, so a large corpus is not searched
+inside one 60-minute Stockfish process. A failed batch leaves its completed
+siblings reusable; rerun the identical command to resume from those artifacts.
+
 Every width receives the supplied deterministic seed (default `1`) before model
 initialization and minibatch permutation, and the report records it. For each
 width, the GPU stage writes a `report.json` artifact containing the

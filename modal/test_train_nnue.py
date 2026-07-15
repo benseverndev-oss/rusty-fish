@@ -201,6 +201,71 @@ def test_calibrate_run_builds_and_calibrates_within_one_remote_function(monkeypa
     assert calls[2] == ("artifact", "direct-run", "stockfish-config", "config-tsv\n", "stockfish-config.tsv")
 
 
+def test_label_batches_are_deterministic_bounded_and_keep_the_split_header():
+    import app
+
+    split = "fen\tsource\nfen-0\trandom\nfen-1\trandom\nfen-2\topening\n"
+    assert app._partition_label_rows(split, 2) == [
+        "fen\tsource\nfen-0\trandom\nfen-1\trandom\n",
+        "fen\tsource\nfen-2\topening\n",
+    ]
+
+
+def test_label_shard_reuses_its_immutable_artifact(tmp_path, monkeypatch):
+    import app
+
+    class FakeVolume:
+        def __init__(self):
+            self.reloads = 0
+
+        def reload(self):
+            self.reloads += 1
+
+        def commit(self):
+            pass
+
+    volume = FakeVolume()
+    monkeypatch.setattr(app, "artifacts", volume)
+    monkeypatch.setattr(
+        app, "_artifact_path",
+        lambda _run_id, _stage, _input_hash, name="artifact": str(tmp_path / name),
+    )
+    produced = []
+    label = "rfnn_tsv\t1\tv1\t768\n31\t0\t1\tfen\t6624\n"
+
+    first = app._reuse_or_write_label_shard(
+        "run", "v1", "train", 0, "manifest", "config", "fen\tsource\nfen\trandom\n",
+        lambda: produced.append(True) or label,
+    )
+    second = app._reuse_or_write_label_shard(
+        "run", "v1", "train", 0, "manifest", "config", "fen\tsource\nfen\trandom\n",
+        lambda: produced.append(True) or label,
+    )
+
+    assert first == second
+    assert produced == [True]
+    assert volume.reloads == 2
+    assert pathlib.Path(first).read_text(encoding="utf-8") == label
+
+
+def test_aggregate_label_shards_orders_rows_and_keeps_one_schema_header():
+    import app
+
+    header = "rfnn_tsv\t1\tv1\t768\n"
+    files = {
+        "train-1": header + "2\t\t\tfen-2\t2\n",
+        "train-0": header + "1\t\t\tfen-1\t1\n",
+        "validation-0": header + "3\t\t\tfen-3\t3\n",
+    }
+    results = [("validation", 0, "validation-0"), ("train", 1, "train-1"), ("train", 0, "train-0")]
+
+    aggregate = app._aggregate_label_shards(results, lambda path: files[path], "v1")
+
+    assert aggregate["train"] == header + "1\t\t\tfen-1\t1\n2\t\t\tfen-2\t2\n"
+    assert aggregate["validation"] == header + "3\t\t\tfen-3\t3\n"
+    assert aggregate["test"] == header
+
+
 def test_load_samples_rejects_mixed_schema_or_feature_dimension(tmp_path):
     path = tmp_path / "mixed.tsv"
     path.write_text(

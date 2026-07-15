@@ -107,6 +107,28 @@ count without treating an early valid completion as an error.
   (42 passed); and `C:\Users\bsevern\AppData\Local\Programs\Python\Python312\python.exe -m pytest modal/test_train_nnue.py -q`
   (18 passed, 2 existing local-execution warnings).
 
+## Parallel labeling remediation
+
+The production label stage previously attempted to label an entire manifest
+split in one 60-minute CPU function. A real 1M-position run timed out during
+the first 400k-node split, before training or gates began. Labeling now divides
+each split into deterministic contiguous 1,000-row shards, runs the shard
+functions in parallel, persists/reuses each content-addressed shard before
+aggregation, and sorts by split/shard index to restore the original row order
+under one validated RFNN schema header. Workers are capped at 30 minutes;
+the coordinator only orchestrates and validates shard output.
+
+- RED: `C:\Users\bsevern\AppData\Local\Programs\Python\Python312\python.exe -m pytest modal/test_train_nnue.py -q`
+  failed for the missing deterministic partition, immutable shard reuse, and
+  ordered aggregation helpers; the artifact-reuse regression then failed until
+  each worker reloaded the Modal Volume before checking its existing artifact.
+- GREEN: the same command passed: 21 passed, 2 existing Modal local-execution
+  warnings. It covers bounded deterministic partitioning, one-write shard
+  reuse, Volume reload, unordered shard-result aggregation, header validation,
+  and original row order.
+- No Modal run was launched for this change. Operators rerun the same command
+  after a failed batch; completed shard artifacts are reused automatically.
+
 ## Modal image-path remediation
 
 Real Modal image construction exposed a path collision: the Stockfish archive

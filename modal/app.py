@@ -19,6 +19,7 @@ STOCKFISH_18_URL = "https://github.com/official-stockfish/Stockfish/releases/dow
 STOCKFISH_18_ARCHIVE_SHA256 = "5c6f38b02a4da5f3ffe763f27da6c3e743eebefd92b50cb3661623b96696adff"
 REMOTE_STOCKFISH = "/opt/stockfish/stockfish-bin"
 RUST_IMAGE_BASE = "debian@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df"
+LABEL_SHARD_ROWS = 1_000
 STOCKFISH_INSTALL_COMMAND = (
     "stockfish=$(find /opt/stockfish -type f -name stockfish-ubuntu-x86-64 -print -quit) "
     "&& test -n \"$stockfish\" && chmod +x \"$stockfish\" "
@@ -136,6 +137,98 @@ def _corpus_payload(directory: str) -> str:
                        for split in ("train", "validation", "test")}, sort_keys=True)
 
 
+def _partition_label_rows(split_text: str, rows_per_shard: int = LABEL_SHARD_ROWS) -> list[str]:
+    """Partition a split into ordered, header-preserving bounded batches."""
+    if rows_per_shard <= 0:
+        raise ValueError("label shard size must be positive")
+    lines = split_text.splitlines()
+    if not lines or lines[0] != "fen\tsource":
+        raise ValueError("invalid split header for labeling")
+    rows = lines[1:]
+    if any("\t" not in row for row in rows):
+        raise ValueError("invalid split row for labeling")
+    return ["fen\tsource\n" + "\n".join(rows[index:index + rows_per_shard]) + "\n"
+            for index in range(0, len(rows), rows_per_shard)]
+
+
+def _expected_label_header(schema: str) -> str:
+    dimensions = {SCHEMA: INPUT_DIMENSION, HALFKA_SCHEMA: HALFKA_INPUT_DIMENSION}
+    try:
+        return f"rfnn_tsv\t1\t{schema}\t{dimensions[schema]}\n"
+    except KeyError as error:
+        raise ValueError(f"unsupported schema: {schema}") from error
+
+
+def _label_shard_input(manifest_text: str, stockfish_config_text: str, schema: str,
+                       split: str, shard_index: int, shard_text: str) -> str:
+    return json.dumps({
+        "manifest_sha256": _sha256(manifest_text),
+        "config_sha256": _sha256(stockfish_config_text),
+        "schema": schema,
+        "split": split,
+        "shard_index": shard_index,
+        "shard_sha256": _sha256(shard_text),
+    }, sort_keys=True)
+
+
+def _reuse_or_write_label_shard(run_id: str, schema: str, split: str, shard_index: int,
+                                manifest_text: str, stockfish_config_text: str, shard_text: str,
+                                produce) -> str:
+    """Return a content-addressed shard artifact, producing it only once."""
+    artifacts.reload()
+    input_text = _label_shard_input(
+        manifest_text, stockfish_config_text, schema, split, shard_index, shard_text
+    )
+    stage = f"labels-{schema}-{split}-shard"
+    name = f"{shard_index:06d}.tsv"
+    path = pathlib.Path(_artifact_path(run_id, stage, _sha256(input_text), name))
+    if path.exists():
+        return str(path)
+    label_text = produce()
+    if not label_text.startswith(_expected_label_header(schema)):
+        raise ValueError(f"label shard schema header mismatch: {split} shard {shard_index}")
+    return _write_artifact(run_id, stage, input_text, label_text, name)
+
+
+def _aggregate_label_shards(shard_results, read_artifact, schema: str) -> dict[str, str]:
+    """Reassemble immutable shard files in original split and row order."""
+    header = _expected_label_header(schema)
+    grouped = {split: [] for split in ("train", "validation", "test")}
+    for split, shard_index, path in shard_results:
+        if split not in grouped:
+            raise ValueError(f"unknown label shard split: {split}")
+        grouped[split].append((shard_index, path))
+    result = {}
+    for split, shards in grouped.items():
+        body = []
+        for shard_index, path in sorted(shards):
+            text = read_artifact(path)
+            if not text.startswith(header):
+                raise ValueError(f"label shard schema header mismatch: {split} shard {shard_index}")
+            body.append(text[len(header):])
+        result[split] = header + "".join(body)
+    return result
+
+
+def _shard_manifest(run_id: str, split: str, shard_index: int, shard_text: str) -> tuple[str, dict[str, str]]:
+    """Build a self-consistent manifest for one shard so Rust retains hash checks."""
+    splits = {name: "fen\tsource\n" for name in ("train", "validation", "test")}
+    splits[split] = shard_text
+    source_counts = {}
+    for row in shard_text.splitlines()[1:]:
+        _fen, source = row.split("\t", 1)
+        source_counts[source] = source_counts.get(source, 0) + 1
+    names = ("train", "validation", "test")
+    hashes = [_sha256(splits[name]) for name in names]
+    dataset_sha256 = _sha256(b"".join(splits[name].encode("utf-8") for name in names))
+    lines = ["dataset_manifest\t1", f"run_id\t{run_id}-{split}-{shard_index}"]
+    lines.extend(f"source_count\t{source}\t{count}" for source, count in sorted(source_counts.items()))
+    lines.extend(f"split_count\t{name}\t{len(splits[name].splitlines()) - 1}" for name in names)
+    lines.extend(f"shard_sha256\t{digest}" for digest in hashes)
+    lines.append(f"dataset_sha256\t{dataset_sha256}")
+    return "\n".join(lines) + "\n", splits
+
+
 def _remote_stockfish_config(stockfish_config_text: str) -> str:
     """Bind a calibrated config to the pinned engine installed in this image."""
     fields = {}
@@ -225,27 +318,58 @@ def calibrate_run(run_id: str, smoke: bool = False) -> str:
     return config
 
 
-@app.function(image=rust_image, volumes={"/artifacts": artifacts}, timeout=60 * 60)
+@app.function(image=rust_image, volumes={"/artifacts": artifacts}, timeout=30 * 60)
+def label_manifest_shard(run_id: str, manifest_text: str, stockfish_config_text: str,
+                         schema: str, split: str, shard_index: int, shard_text: str) -> tuple[str, int, str]:
+    """Label one bounded split shard and persist it before returning its location."""
+    remote_config = _remote_stockfish_config(stockfish_config_text)
+
+    def produce() -> str:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            shard_manifest, splits = _shard_manifest(run_id, split, shard_index, shard_text)
+            manifest_path = root / "manifest.tsv"
+            manifest_path.write_text(shard_manifest, encoding="utf-8")
+            for name, content in splits.items():
+                (root / f"{name}.tsv").write_text(content, encoding="utf-8")
+            config = root / "stockfish-config.tsv"
+            config.write_text(remote_config, encoding="utf-8")
+            output = root / "labels.tsv"
+            subprocess.run(
+                [BIN, "stockfish-label", str(manifest_path), split, str(config), str(output), schema],
+                check=True,
+            )
+            return output.read_text(encoding="utf-8")
+
+    path = _reuse_or_write_label_shard(
+        run_id, schema, split, shard_index, manifest_text, stockfish_config_text, shard_text, produce
+    )
+    return split, shard_index, path
+
+
+@app.function(image=rust_image, volumes={"/artifacts": artifacts}, timeout=24 * 60 * 60)
 def label_manifest(run_id: str, manifest_text: str, stockfish_config_text: str,
                    schema: str = SCHEMA) -> dict[str, str]:
-    """Label every immutable manifest split; return schema-tagged training rows."""
-    # The corpus is recovered by its manifest digest, never by hidden process state.
+    """Dispatch bounded label shards in parallel and reassemble ordered split rows."""
+    _expected_label_header(schema)
     artifacts.reload()
     positions_path = _artifact_path(run_id, "corpus-positions", _sha256(manifest_text))
     payload = json.loads(pathlib.Path(positions_path).read_text(encoding="utf-8"))
-    with tempfile.TemporaryDirectory() as directory:
-        root = pathlib.Path(directory)
-        manifest_path = root / "manifest.tsv"
-        manifest_path.write_text(manifest_text, encoding="utf-8")
-        for split, content in payload.items():
-            (root / f"{split}.tsv").write_text(content, encoding="utf-8")
-        config = root / "stockfish-config.tsv"
-        config.write_text(_remote_stockfish_config(stockfish_config_text), encoding="utf-8")
-        result = {}
-        for split in ("train", "validation", "test"):
-            output = root / f"{split}-labels.tsv"
-            subprocess.run([BIN, "stockfish-label", str(manifest_path), split, str(config), str(output), schema], check=True)
-            result[split] = output.read_text(encoding="utf-8")
+    jobs = []
+    for split in ("train", "validation", "test"):
+        for shard_index, shard_text in enumerate(_partition_label_rows(payload[split])):
+            jobs.append((run_id, manifest_text, stockfish_config_text, schema, split, shard_index, shard_text))
+    shard_results = list(label_manifest_shard.starmap(jobs, order_outputs=False))
+    expected = {(split, shard_index) for *_prefix, split, shard_index, _text in jobs}
+    received = {(split, shard_index) for split, shard_index, _path in shard_results}
+    if received != expected or len(shard_results) != len(expected):
+        raise RuntimeError("label shard results are incomplete or duplicated")
+    artifacts.reload()
+    result = _aggregate_label_shards(
+        shard_results,
+        lambda path: pathlib.Path(path).read_text(encoding="utf-8"),
+        schema,
+    )
     _write_artifact(run_id, f"labels-{schema}", manifest_text + stockfish_config_text + schema,
                     json.dumps(result, sort_keys=True))
     return result
