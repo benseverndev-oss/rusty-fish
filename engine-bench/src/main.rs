@@ -66,6 +66,9 @@ fn main() -> Result<(), String> {
     if std::env::args().nth(1).as_deref() == Some("rfnn-reencode") {
         return rfnn_reencode();
     }
+    if std::env::args().nth(1).as_deref() == Some("nnue-score") {
+        return nnue_score();
+    }
     if std::env::args().nth(1).as_deref() == Some("dataset-build") {
         return dataset_build();
     }
@@ -379,6 +382,41 @@ fn reencode_label_text(input: &str, schema: FeatureSchema) -> Result<String, Str
         let opp = join_usize(&schema.active_features(&board, board.side_to_move.opposite()));
         output.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\n", fields[0], own, opp, fields[3], fields[4]
+        ));
+    }
+    Ok(output)
+}
+
+fn nnue_score() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 5 {
+        return Err("usage: nnue-score <network> <input_tsv> <out_tsv>".into());
+    }
+    let output = Path::new(&args[4]);
+    if output.exists() {
+        return Err(format!("refusing to overwrite score trace {}", output.display()));
+    }
+    let network = Nnue::from_file(Path::new(&args[2]))?;
+    let input = std::fs::read_to_string(&args[3])
+        .map_err(|error| format!("failed to read {}: {error}", args[3]))?;
+    std::fs::write(output, nnue_score_tsv(&network, &input)?)
+        .map_err(|error| format!("failed to write {}: {error}", output.display()))
+}
+
+fn nnue_score_tsv(network: &Nnue, input: &str) -> Result<String, String> {
+    if !input.lines().next().is_some_and(|line| line.starts_with("rfnn_tsv\t1\t")) {
+        return Err("NNUE score trace requires an RFNN TSV input".into());
+    }
+    let mut output = String::from("target_cp\tprediction_cp\tfen\n");
+    for (line_number, line) in input.lines().enumerate().skip(1) {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() < 4 {
+            return Err(format!("invalid RFNN row at line {}", line_number + 1));
+        }
+        let board = Board::from_fen(fields[3])
+            .map_err(|error| format!("invalid FEN at line {}: {error}", line_number + 1))?;
+        output.push_str(&format!(
+            "{}\t{}\t{}\n", fields[0], network.evaluate(&board, board.side_to_move), fields[3]
         ));
     }
     Ok(output)
