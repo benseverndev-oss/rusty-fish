@@ -15,6 +15,9 @@ INPUT_DIMENSION = 768
 HALFKA_SCHEMA = "halfka-v2-64"
 HALFKA_INPUT_DIMENSION = 64 * 2 * 5 * 64
 LEARNING_RATE = 1e-3
+TRAINING_METHOD = "qat-soft-label-bce-ranking-v1"
+MIN_PEARSON_IMPROVEMENT = 0.01
+MIN_RANKING_ACCURACY_IMPROVEMENT = 0.005
 STOCKFISH_18_URL = "https://github.com/official-stockfish/Stockfish/releases/download/sf_18/stockfish-ubuntu-x86-64.tar"
 STOCKFISH_18_ARCHIVE_SHA256 = "5c6f38b02a4da5f3ffe763f27da6c3e743eebefd92b50cb3661623b96696adff"
 REMOTE_STOCKFISH = "/opt/stockfish/stockfish-bin"
@@ -53,6 +56,17 @@ def _sha256(text: str | bytes) -> str:
 
 def _artifact_path(run_id: str, stage: str, input_hash: str, name: str = "artifact") -> str:
     return f"/artifacts/runs/{run_id}/{stage}-{input_hash}/{name}"
+
+
+def _source_label_artifact_path(source_run_id: str, source_label_input_hash: str) -> str:
+    """Address the immutable v1 label aggregate selected for HalfKA re-encoding."""
+    return _artifact_path(source_run_id, "labels-v1", source_label_input_hash)
+
+
+def _training_artifact_input(data_text: str, schema: str, input_dimension: int, hidden: int,
+                             epochs: int, seed: int) -> str:
+    """Version a trained artifact by every training behavior that affects its bytes."""
+    return data_text + f"{schema}:{input_dimension}:{hidden}:{epochs}:{seed}:{TRAINING_METHOD}"
 
 
 def _write_artifact(run_id: str, stage: str, input_text: str, contents: str | bytes,
@@ -386,9 +400,38 @@ def label_manifest(run_id: str, manifest_text: str, stockfish_config_text: str,
     return result
 
 
+@app.function(image=rust_image, volumes={"/artifacts": artifacts}, timeout=2 * 60 * 60)
+def reencode_v1_labels(run_id: str, source_run_id: str, source_label_input_hash: str) -> dict[str, str]:
+    """Reuse immutable Stockfish scores while regenerating only HalfKA features."""
+    artifacts.reload()
+    source = pathlib.Path(_source_label_artifact_path(source_run_id, source_label_input_hash))
+    if not source.exists():
+        raise ValueError(f"source v1 labels do not exist: {source}")
+    v1_labels = json.loads(source.read_text(encoding="utf-8"))
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        result = {}
+        for split, text in v1_labels.items():
+            input_path = root / f"{split}-v1.tsv"
+            output_path = root / f"{split}-halfka.tsv"
+            input_path.write_text(text, encoding="utf-8")
+            subprocess.run(
+                [BIN, "rfnn-reencode", str(input_path), str(output_path), HALFKA_SCHEMA],
+                check=True,
+            )
+            result[split] = output_path.read_text(encoding="utf-8")
+    input_text = json.dumps({
+        "source_run_id": source_run_id,
+        "source_label_input_hash": source_label_input_hash,
+        "schema": HALFKA_SCHEMA,
+    }, sort_keys=True)
+    _write_artifact(run_id, f"labels-{HALFKA_SCHEMA}", input_text, json.dumps(result, sort_keys=True))
+    return result
+
+
 @app.function(image=torch_image, gpu="A10G", volumes={"/artifacts": artifacts}, timeout=60 * 60)
 def train_net(data_text: str, schema: str, input_dimension: int, hidden: int, epochs: int,
-              run_id: str, seed: int = 1) -> bytes:
+              run_id: str, seed: int = 1) -> tuple[bytes, dict]:
     import train_nnue
 
     splits = json.loads(data_text)
@@ -403,6 +446,12 @@ def train_net(data_text: str, schema: str, input_dimension: int, hidden: int, ep
         train_loss = model.train_wdl_loss
         validation_loss = train_nnue.wdl_loss(model, str(paths["validation"]), "cuda", schema, input_dimension)
         test_loss = train_nnue.wdl_loss(model, str(paths["test"]), "cuda", schema, input_dimension)
+        validation_alignment = train_nnue.teacher_alignment_metrics(
+            model, str(paths["validation"]), "cuda", schema, input_dimension,
+        )
+        test_alignment = train_nnue.teacher_alignment_metrics(
+            model, str(paths["test"]), "cuda", schema, input_dimension,
+        )
         quantization_error = train_nnue.quantization_max_error_cp(
             model, str(paths["test"]), "cuda", schema, input_dimension,
         )
@@ -416,11 +465,17 @@ def train_net(data_text: str, schema: str, input_dimension: int, hidden: int, ep
         "schema": schema, "buckets": buckets, "hidden": hidden,
         "epochs": epochs, "learning_rate": LEARNING_RATE,
         "quantization_max_error_cp": quantization_error, "seed": seed,
+        "training_method": TRAINING_METHOD,
+        "training_objective": train_nnue.TRAINING_OBJECTIVE,
+        "validation_alignment": validation_alignment,
+        "test_alignment": test_alignment,
     }
-    input_hash = _sha256(data_text + f"{schema}:{input_dimension}:{hidden}:{epochs}:{seed}")
+    input_hash = _sha256(_training_artifact_input(
+        data_text, schema, input_dimension, hidden, epochs, seed,
+    ))
     _write_artifact(run_id, f"net-{hidden}", input_hash, net_bytes, "net.rfnn")
     _write_artifact(run_id, f"report-{hidden}", input_hash, json.dumps(report, sort_keys=True, indent=2), "report.json")
-    return net_bytes
+    return net_bytes, report
 
 
 @app.function(image=rust_image, volumes={"/artifacts": artifacts}, timeout=60 * 60)
@@ -507,10 +562,29 @@ def run_full_gate(net_bytes: bytes, run_id: str, candidate_report: dict, control
 
 def promotes(report: dict, control: dict, screen: tuple[int, int, int]) -> bool:
     return (
+        offline_promotes(report, control)
+        and screen[0] + 0.5 * screen[1] >= 192
+    )
+
+
+def offline_promotes(report: dict, control: dict) -> bool:
+    """Require calibrated WDL loss plus better held-out teacher alignment."""
+    if report["quantization_max_error_cp"] > 32:
+        return False
+    # The 128-wide control establishes the baseline; it does not need to beat itself.
+    if report == control:
+        return True
+    return (
         report["validation_wdl_loss"] <= control["validation_wdl_loss"] * 0.98
         and report["test_wdl_loss"] <= control["test_wdl_loss"] * 0.99
-        and report["quantization_max_error_cp"] <= 32
-        and screen[0] + 0.5 * screen[1] >= 192
+        and report["validation_alignment"]["pearson_correlation"]
+        >= control["validation_alignment"]["pearson_correlation"] + MIN_PEARSON_IMPROVEMENT
+        and report["test_alignment"]["pearson_correlation"]
+        >= control["test_alignment"]["pearson_correlation"] + MIN_PEARSON_IMPROVEMENT
+        and report["validation_alignment"]["pairwise_ranking_accuracy"]
+        >= control["validation_alignment"]["pairwise_ranking_accuracy"] + MIN_RANKING_ACCURACY_IMPROVEMENT
+        and report["test_alignment"]["pairwise_ranking_accuracy"]
+        >= control["test_alignment"]["pairwise_ranking_accuracy"] + MIN_RANKING_ACCURACY_IMPROVEMENT
     )
 
 
@@ -521,6 +595,21 @@ def selected_halfka_widths(capacity_selection_report: dict[str, int]) -> list[in
         return {128: [128, 256], 256: [256, 512], 512: [512]}[int(selected)]
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("capacity selection report must name selected_width 128, 256, or 512") from error
+
+
+def select_halfka_candidate(candidates):
+    """Choose capacity by mean held-out teacher correlation before chess screening."""
+    if not candidates:
+        raise ValueError("HalfKA selection requires at least one candidate")
+    return max(
+        candidates,
+        key=lambda candidate: (
+            candidate[2]["validation_alignment"]["pearson_correlation"]
+            + candidate[2]["test_alignment"]["pearson_correlation"],
+            candidate[2]["validation_alignment"].get("pairwise_ranking_accuracy", 0.0),
+            candidate[2]["test_alignment"].get("pairwise_ranking_accuracy", 0.0),
+        ),
+    )
 
 
 def _run_ordered_ladder(widths, train_candidate, evaluate_candidate, *, stop_on_failure: bool):
@@ -573,24 +662,16 @@ def run_v1_pipeline(run_id: str, smoke: bool = False, widths: str = "128,256,512
     _write_pipeline_status(run_id, "labels")
     labels = label_manifest.remote(run_id, manifest, config, SCHEMA)
     data_text = json.dumps(labels, sort_keys=True)
-    control_hash = _sha256(data_text + f"{SCHEMA}:{INPUT_DIMENSION}:128:{epochs}:{seed}")
-    _write_pipeline_status(run_id, "control", input_hash=control_hash)
-    control_net = train_net.remote(data_text, SCHEMA, INPUT_DIMENSION, 128, epochs, run_id, seed)
-    control = read_report.remote(run_id, 128, control_hash)
+    _write_pipeline_status(run_id, "control")
+    control_net, control = train_net.remote(data_text, SCHEMA, INPUT_DIMENSION, 128, epochs, run_id, seed)
     manifest_sha256, config_sha256 = _sha256(manifest), _sha256(config)
     candidates = []
     for width in [int(value) for value in widths.split(",") if value]:
         _write_pipeline_status(run_id, f"candidate-{width}")
-        net = control_net if width == 128 else train_net.remote(
+        net, report = (control_net, control) if width == 128 else train_net.remote(
             data_text, SCHEMA, INPUT_DIMENSION, width, epochs, run_id, seed
         )
-        input_hash = _sha256(data_text + f"{SCHEMA}:{INPUT_DIMENSION}:{width}:{epochs}:{seed}")
-        report = read_report.remote(run_id, width, input_hash)
-        eligible = (
-            report["validation_wdl_loss"] <= control["validation_wdl_loss"] * 0.98
-            and report["test_wdl_loss"] <= control["test_wdl_loss"] * 0.99
-            and report["quantization_max_error_cp"] <= 32
-        )
+        eligible = offline_promotes(report, control)
         if not eligible:
             candidates.append({"width": width, "stage": "offline-rejected"})
             continue
@@ -606,6 +687,43 @@ def run_v1_pipeline(run_id: str, smoke: bool = False, widths: str = "128,256,512
         candidates.append({"width": width, "stage": "full-gate", "verdict": verdict})
     result = {"run_id": run_id, "stage": "complete", "candidates": candidates}
     _write_pipeline_status(run_id, "complete", candidates=candidates)
+    return result
+
+
+@app.function(image=rust_image, volumes={"/artifacts": artifacts}, timeout=24 * 60 * 60)
+def run_halfka_pipeline(run_id: str, source_run_id: str, source_label_input_hash: str,
+                        source_manifest_sha256: str, source_config_sha256: str,
+                        widths: str = "256,512", epochs: int = 80, seed: int = 1) -> dict:
+    """Durably re-encode paid teacher labels, select HalfKA capacity, and screen once."""
+    _write_pipeline_status(run_id, "halfka-reencode", source_run_id=source_run_id)
+    labels = reencode_v1_labels.remote(run_id, source_run_id, source_label_input_hash)
+    data_text = json.dumps(labels, sort_keys=True)
+    candidates = []
+    for width in [int(value) for value in widths.split(",") if value]:
+        _write_pipeline_status(run_id, f"halfka-candidate-{width}")
+        net, report = train_net.remote(
+            data_text, HALFKA_SCHEMA, HALFKA_INPUT_DIMENSION, width, epochs, run_id, seed,
+        )
+        candidates.append((width, net, report))
+    width, net, report = select_halfka_candidate(candidates)
+    selection = {"selected_width": width, "candidates": [
+        {"width": item[0], "report": item[2]} for item in candidates
+    ]}
+    _write_artifact(run_id, "halfka-capacity-selection", data_text + widths + str(epochs) + str(seed),
+                    json.dumps(selection, sort_keys=True, indent=2), "report.json")
+    _write_pipeline_status(run_id, f"halfka-screen-{width}")
+    rust_parity_check.remote(net)
+    screen = run_screen.remote(
+        net, run_id, report, report, source_manifest_sha256, source_config_sha256,
+    )
+    wdl = screen["wdl"]
+    result = {"run_id": run_id, "stage": "complete", "selection": selection, "screen": screen}
+    if wdl["wins"] + 0.5 * wdl["draws"] >= 192:
+        _write_pipeline_status(run_id, f"halfka-full-gate-{width}")
+        result["full_gate"] = run_full_gate.remote(
+            net, run_id, report, report, source_manifest_sha256, source_config_sha256,
+        )
+    _write_pipeline_status(run_id, "complete", selection=selection, screen=screen)
     return result
 
 
@@ -643,26 +761,18 @@ def run(run_id: str = "smoke-v1", smoke: bool = False, schema: str = SCHEMA,
         candidate_widths = selected_halfka_widths(selected)
     else:
         candidate_widths = [int(value) for value in widths.split(",") if value]
-    control_net = train_net.remote(control_data, SCHEMA, INPUT_DIMENSION, 128, epochs, run_id, seed)
-    control_hash = _sha256(control_data + f"{SCHEMA}:{INPUT_DIMENSION}:128:{epochs}:{seed}")
-    control = read_report.remote(run_id, 128, control_hash)
+    control_net, control = train_net.remote(control_data, SCHEMA, INPUT_DIMENSION, 128, epochs, run_id, seed)
     manifest_sha256 = _sha256(manifest)
     config_sha256 = _sha256(config_text)
     def train_candidate(width: int) -> tuple[bytes, dict]:
-        net = control_net if schema == SCHEMA and width == 128 else train_net.remote(
+        net, report = (control_net, control) if schema == SCHEMA and width == 128 else train_net.remote(
             data_text, schema, input_dimension, width, epochs, run_id, seed)
-        input_hash = _sha256(data_text + f"{schema}:{input_dimension}:{width}:{epochs}:{seed}")
-        report = read_report.remote(run_id, width, input_hash)
         print(f"manifest SHA {manifest_sha256}; seed {seed}; width {width}: {json.dumps(report, sort_keys=True)}")
         return net, report
 
     def evaluate_candidate(width: int, candidate: tuple[bytes, dict]) -> bool:
         net, report = candidate
-        offline_ok = (
-            report["validation_wdl_loss"] <= control["validation_wdl_loss"] * 0.98
-            and report["test_wdl_loss"] <= control["test_wdl_loss"] * 0.99
-            and report["quantization_max_error_cp"] <= 32
-        )
+        offline_ok = offline_promotes(report, control)
         if not offline_ok:
             print(f"width {width} promotion: rejected before screen")
             return False

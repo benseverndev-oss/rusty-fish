@@ -33,6 +33,9 @@ ACTIVATION_CLIP = 127.0  # clipped-ReLU upper bound
 OUTPUT_SCALE = 64.0      # inference divides the integer output by this
 EVAL_CLAMP = 20000       # inference clamps the centipawn score to +/- this
 WDL_SCALE = 400.0        # centipawns -> win-probability steepness
+RANKING_LOSS_WEIGHT = 0.25
+RANKING_MIN_GAP_CP = 50.0
+TRAINING_OBJECTIVE = "soft-label-bce-plus-ranking-v1"
 
 
 def _load_samples(path: str, expected_schema: str = "v1", input_dimension: int = INPUT_DIMENSION):
@@ -108,7 +111,7 @@ def _bucket_count(schema: str, buckets: int | None = None) -> int:
     return parsed
 
 
-def tiny_model(schema: str, input_dimension: int, hidden: int):
+def tiny_model(schema: str, input_dimension: int, hidden: int, quantization_aware: bool = False):
     """Build the RFNN-shaped PyTorch module used by training and export tests."""
     import torch
     from torch import nn
@@ -122,18 +125,33 @@ def tiny_model(schema: str, input_dimension: int, hidden: int):
             self.transformer = nn.EmbeddingBag(input_dimension, hidden, mode="sum")
             self.feature_bias = nn.Parameter(torch.zeros(hidden))
             self.output = nn.Linear(2 * hidden, 1)
-            nn.init.uniform_(self.transformer.weight, -0.1, 0.1)
-            nn.init.uniform_(self.output.weight, -0.1, 0.1)
+            init_scale = 4.0 if quantization_aware else 0.1
+            nn.init.uniform_(self.transformer.weight, -init_scale, init_scale)
+            nn.init.uniform_(self.output.weight, -init_scale, init_scale)
             nn.init.zeros_(self.output.bias)
 
         def forward(self, own_v, own_o, opp_v, opp_o):
-            acc_own = self.transformer(own_v, own_o) + self.feature_bias
-            acc_opp = self.transformer(opp_v, opp_o) + self.feature_bias
+            def parameter(value):
+                if not quantization_aware:
+                    return value
+                rounded = torch.clamp(torch.round(value), -32768, 32767)
+                return value + (rounded - value).detach()
+
+            weight = parameter(self.transformer.weight)
+            bias = parameter(self.feature_bias)
+            acc_own = torch.nn.functional.embedding_bag(
+                own_v, weight, own_o, mode="sum",
+            ) + bias
+            acc_opp = torch.nn.functional.embedding_bag(
+                opp_v, weight, opp_o, mode="sum",
+            ) + bias
             a_own = torch.clamp(acc_own, 0.0, ACTIVATION_CLIP)
             a_opp = torch.clamp(acc_opp, 0.0, ACTIVATION_CLIP)
             features = torch.cat([a_own, a_opp], dim=1)
             # pred is centipawns (inference divides the integer output by 64).
-            return self.output(features).squeeze(1) / OUTPUT_SCALE
+            return torch.nn.functional.linear(
+                features, parameter(self.output.weight), parameter(self.output.bias),
+            ).squeeze(1) / OUTPUT_SCALE
 
     _bucket_count(schema)
     if input_dimension <= 0 or hidden <= 0:
@@ -155,7 +173,7 @@ def train(data_path: str, schema: str, input_dimension: int, hidden: int, epochs
     own_values, own_offsets = _ragged_to_bag(owns)
     opp_values, opp_offsets = _ragged_to_bag(opps)
     target = torch.tensor(targets, dtype=torch.float32)
-    model = tiny_model(schema, input_dimension, hidden).to(device)
+    model = tiny_model(schema, input_dimension, hidden, quantization_aware=True).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     own_values, own_offsets = own_values.to(device), own_offsets.to(device)
@@ -173,13 +191,15 @@ def train(data_path: str, schema: str, input_dimension: int, hidden: int, epochs
             ov, oo = _ragged_to_bag([owns[i] for i in idx.tolist()])
             pv, po = _ragged_to_bag([opps[i] for i in idx.tolist()])
             pred_cp = model(ov.to(device), oo.to(device), pv.to(device), po.to(device))
-            pred_wp = torch.sigmoid(pred_cp / WDL_SCALE)
-            loss = ((pred_wp - target_wp[idx]) ** 2).mean()
+            wdl = torch.nn.functional.binary_cross_entropy_with_logits(
+                pred_cp / WDL_SCALE, target_wp[idx],
+            )
+            loss = wdl + RANKING_LOSS_WEIGHT * pairwise_ranking_loss(pred_cp, target[idx])
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             total += loss.item() * len(idx)
-        print(f"epoch {epoch + 1}/{epochs}: wdl_loss {total / count:.6f}", file=sys.stderr)
+        print(f"epoch {epoch + 1}/{epochs}: objective_loss {total / count:.6f}", file=sys.stderr)
 
     model.train_wdl_loss = wdl_loss(model, data_path, device, schema, input_dimension)
     model.training_seed = seed
@@ -202,7 +222,71 @@ def wdl_loss(model, data_path: str, device: str, schema: str = "v1",
             opp_values.to(device), opp_offsets.to(device),
         )
         target = torch.tensor(targets, dtype=torch.float32, device=device)
-        return float(((torch.sigmoid(prediction / WDL_SCALE) - torch.sigmoid(target / WDL_SCALE)) ** 2).mean().item())
+        return float(torch.nn.functional.binary_cross_entropy_with_logits(
+            prediction / WDL_SCALE, torch.sigmoid(target / WDL_SCALE),
+        ).item())
+
+
+def pairwise_ranking_loss(prediction, target):
+    """Logistic relative-order loss for decisive, deterministic adjacent pairs."""
+    import torch
+
+    prediction_delta = prediction[::2] - prediction[1::2]
+    target_delta = target[::2] - target[1::2]
+    decisive = target_delta.abs() >= RANKING_MIN_GAP_CP
+    if not torch.any(decisive):
+        return prediction.sum() * 0.0
+    teacher_order = torch.sign(target_delta[decisive])
+    return torch.nn.functional.softplus(
+        -teacher_order * prediction_delta[decisive] / WDL_SCALE,
+    ).mean()
+
+
+def teacher_alignment_metrics_from_predictions(prediction, target) -> dict:
+    """Return held-out linear alignment and decisive-pair ordering metrics."""
+    import torch
+
+    prediction = prediction.detach().float()
+    target = target.detach().float()
+    centered_prediction = prediction - prediction.mean()
+    centered_target = target - target.mean()
+    denominator = torch.sqrt(
+        centered_prediction.square().mean() * centered_target.square().mean()
+    )
+    pearson = 0.0 if denominator.item() == 0.0 else float(
+        (centered_prediction * centered_target).mean().div(denominator).item()
+    )
+    prediction_delta = prediction[::2] - prediction[1::2]
+    target_delta = target[::2] - target[1::2]
+    decisive = target_delta.abs() >= RANKING_MIN_GAP_CP
+    pair_count = int(decisive.sum().item())
+    ranking_accuracy = 0.0 if pair_count == 0 else float(
+        (prediction_delta[decisive] * target_delta[decisive] > 0).float().mean().item()
+    )
+    return {
+        "pearson_correlation": pearson,
+        "pairwise_ranking_accuracy": ranking_accuracy,
+        "decisive_pair_count": pair_count,
+    }
+
+
+def teacher_alignment_metrics(model, data_path: str, device: str, schema: str = "v1",
+                              input_dimension: int = INPUT_DIMENSION) -> dict:
+    """Evaluate an exported-model-equivalent prediction against one held-out split."""
+    import torch
+
+    owns, opps, targets = _load_samples(data_path, schema, input_dimension)
+    if not owns:
+        raise ValueError(f"no evaluation samples in {data_path}")
+    own_values, own_offsets = _ragged_to_bag(owns)
+    opp_values, opp_offsets = _ragged_to_bag(opps)
+    with torch.no_grad():
+        prediction = model(
+            own_values.to(device), own_offsets.to(device),
+            opp_values.to(device), opp_offsets.to(device),
+        )
+        target = torch.tensor(targets, dtype=torch.float32, device=device)
+        return teacher_alignment_metrics_from_predictions(prediction, target)
 
 
 def quantization_max_error_cp(model, data_path: str, device: str, schema: str = "v1",

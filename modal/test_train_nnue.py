@@ -222,6 +222,27 @@ def test_label_scheduler_caps_each_wave_at_eighty_workers():
     assert [job for wave in waves for job in wave] == jobs
 
 
+def test_halfka_reencoding_addresses_the_exact_source_label_artifact():
+    import app
+
+    assert app._source_label_artifact_path("v1-run", "label-input") == (
+        "/artifacts/runs/v1-run/labels-v1-label-input/artifact"
+    )
+
+
+def test_halfka_selection_prefers_the_stronger_held_out_alignment():
+    import app
+
+    candidates = [
+        (256, b"narrow", {"validation_alignment": {"pearson_correlation": 0.30},
+                            "test_alignment": {"pearson_correlation": 0.29}}),
+        (512, b"wide", {"validation_alignment": {"pearson_correlation": 0.34},
+                          "test_alignment": {"pearson_correlation": 0.33}}),
+    ]
+
+    assert app.select_halfka_candidate(candidates)[0] == 512
+
+
 def test_v1_pipeline_remote_coordinator_owns_stages_and_records_progress(monkeypatch):
     import app
 
@@ -239,8 +260,7 @@ def test_v1_pipeline_remote_coordinator_owns_stages_and_records_progress(monkeyp
     monkeypatch.setattr(app, "_build_corpus_artifacts", lambda *_args: ("manifest", "positions"))
     monkeypatch.setattr(app, "_calibrate_remote_stockfish_config", lambda *_args: "config")
     monkeypatch.setattr(app, "label_manifest", Remote(labels))
-    monkeypatch.setattr(app, "train_net", Remote(b"net"))
-    monkeypatch.setattr(app, "read_report", Remote(report))
+    monkeypatch.setattr(app, "train_net", Remote((b"net", report)))
     monkeypatch.setattr(app, "rust_parity_check", Remote(None))
     monkeypatch.setattr(app, "run_screen", Remote({"wdl": {"wins": 0, "draws": 0, "losses": 384}}))
     monkeypatch.setattr(app, "_write_artifact", lambda *_args, **_kwargs: "artifact")
@@ -250,6 +270,39 @@ def test_v1_pipeline_remote_coordinator_owns_stages_and_records_progress(monkeyp
 
     assert result["stage"] == "complete"
     assert stages == ["corpus", "calibration", "labels", "control", "candidate-128", "screen-128", "complete"]
+
+
+def test_v1_pipeline_uses_training_report_without_rereading_its_artifact(monkeypatch):
+    import app
+
+    class Remote:
+        def __init__(self, result):
+            self.result = result
+
+        def remote(self, *_args):
+            return self.result
+
+    class MustNotRead:
+        def remote(self, *_args):
+            pytest.fail("pipeline must use train_net's report")
+
+    labels = {
+        "train": "rfnn_tsv\t1\tv1\t768\n",
+        "validation": "rfnn_tsv\t1\tv1\t768\n",
+        "test": "rfnn_tsv\t1\tv1\t768\n",
+    }
+    report = {"validation_wdl_loss": 0.0, "test_wdl_loss": 0.0, "quantization_max_error_cp": 0}
+    monkeypatch.setattr(app, "_build_corpus_artifacts", lambda *_args: ("manifest", "positions"))
+    monkeypatch.setattr(app, "_calibrate_remote_stockfish_config", lambda *_args: "config")
+    monkeypatch.setattr(app, "label_manifest", Remote(labels))
+    monkeypatch.setattr(app, "train_net", Remote((b"net", report)))
+    monkeypatch.setattr(app, "read_report", MustNotRead())
+    monkeypatch.setattr(app, "rust_parity_check", Remote(None))
+    monkeypatch.setattr(app, "run_screen", Remote({"wdl": {"wins": 0, "draws": 0, "losses": 384}}))
+    monkeypatch.setattr(app, "_write_artifact", lambda *_args, **_kwargs: "artifact")
+    monkeypatch.setattr(app, "_write_pipeline_status", lambda *_args, **_kwargs: None)
+
+    assert app.run_v1_pipeline.local("durable-v1", True, "128", 1, 1)["stage"] == "complete"
 
 
 def test_label_shard_reuses_its_immutable_artifact(tmp_path, monkeypatch):
@@ -344,6 +397,99 @@ def test_quantization_error_is_maximum_sealed_prediction_delta(tmp_path):
     assert train_nnue.quantization_max_error_cp(
         ConstantModel(), path, "cpu", schema="v1", input_dimension=768
     ) == pytest.approx(0.25)
+
+
+def test_wdl_loss_uses_soft_label_logistic_objective(tmp_path):
+    torch = pytest.importorskip("torch")
+    import train_nnue
+
+    class ConstantModel(torch.nn.Module):
+        def forward(self, own_values, own_offsets, opp_values, opp_offsets):
+            return torch.zeros(own_offsets.numel())
+
+    path = tmp_path / "soft-label.tsv"
+    path.write_text("rfnn_tsv\t1\tv1\t2\n400\t0\t1\n", encoding="utf-8")
+
+    expected = torch.nn.functional.binary_cross_entropy_with_logits(
+        torch.tensor([0.0]), torch.sigmoid(torch.tensor([1.0])),
+    ).item()
+    assert train_nnue.wdl_loss(ConstantModel(), path, "cpu", "v1", 2) == pytest.approx(expected)
+
+
+def test_teacher_alignment_metrics_measure_correlation_and_decisive_pair_ordering():
+    torch = pytest.importorskip("torch")
+    import train_nnue
+
+    metrics = train_nnue.teacher_alignment_metrics_from_predictions(
+        torch.tensor([-400.0, -100.0, 100.0, 400.0]),
+        torch.tensor([-400.0, -100.0, 100.0, 400.0]),
+    )
+
+    assert metrics["pearson_correlation"] == pytest.approx(1.0)
+    assert metrics["pairwise_ranking_accuracy"] == pytest.approx(1.0)
+    assert metrics["decisive_pair_count"] == 2
+
+
+def test_pairwise_ranking_loss_prefers_the_teacher_order():
+    torch = pytest.importorskip("torch")
+    import train_nnue
+
+    targets = torch.tensor([400.0, -400.0])
+    correctly_ordered = train_nnue.pairwise_ranking_loss(torch.tensor([100.0, -100.0]), targets)
+    reversed_order = train_nnue.pairwise_ranking_loss(torch.tensor([-100.0, 100.0]), targets)
+
+    assert correctly_ordered < reversed_order
+
+
+def test_offline_promotion_requires_improved_held_out_teacher_alignment():
+    import app
+
+    control = {
+        "validation_wdl_loss": 0.70,
+        "test_wdl_loss": 0.70,
+        "quantization_max_error_cp": 0.0,
+        "validation_alignment": {"pearson_correlation": 0.30, "pairwise_ranking_accuracy": 0.70},
+        "test_alignment": {"pearson_correlation": 0.30, "pairwise_ranking_accuracy": 0.70},
+    }
+    candidate = {
+        **control,
+        "validation_wdl_loss": 0.68,
+        "test_wdl_loss": 0.69,
+        "validation_alignment": {"pearson_correlation": 0.30, "pairwise_ranking_accuracy": 0.70},
+        "test_alignment": {"pearson_correlation": 0.30, "pairwise_ranking_accuracy": 0.70},
+    }
+
+    assert not app.offline_promotes(candidate, control)
+    candidate["validation_alignment"] = {"pearson_correlation": 0.32, "pairwise_ranking_accuracy": 0.71}
+    candidate["test_alignment"] = {"pearson_correlation": 0.32, "pairwise_ranking_accuracy": 0.71}
+    assert app.offline_promotes(candidate, control)
+
+
+def test_quantization_aware_model_has_no_parameter_rounding_drift(tmp_path):
+    torch = pytest.importorskip("torch")
+    import train_nnue
+
+    path = tmp_path / "sealed-test.tsv"
+    path.write_text(
+        "rfnn_tsv\t1\tv1\t2\n1\t0\t1\n-1\t1\t0\n",
+        encoding="utf-8",
+    )
+    torch.manual_seed(1)
+    model = train_nnue.tiny_model(
+        schema="v1", input_dimension=2, hidden=2, quantization_aware=True,
+    )
+
+    assert train_nnue.quantization_max_error_cp(
+        model, path, "cpu", schema="v1", input_dimension=2
+    ) == pytest.approx(0.0)
+
+
+def test_training_artifact_input_includes_the_quantization_method_version():
+    import app
+
+    assert app._training_artifact_input("labels", "v1", 768, 128, 40, 1).endswith(
+        app.TRAINING_METHOD
+    )
 
 
 def test_halfka_export_header_matches_rust_v2_contract(tmp_path):
