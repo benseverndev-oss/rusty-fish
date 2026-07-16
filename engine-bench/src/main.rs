@@ -396,7 +396,7 @@ fn nnue_score() -> Result<(), String> {
     if output.exists() {
         return Err(format!("refusing to overwrite score trace {}", output.display()));
     }
-    let network = Nnue::from_file(Path::new(&args[2]))?;
+    let network = Nnue::from_file(&args[2])?;
     let input = std::fs::read_to_string(&args[3])
         .map_err(|error| format!("failed to read {}: {error}", args[3]))?;
     std::fs::write(output, nnue_score_tsv(&network, &input)?)
