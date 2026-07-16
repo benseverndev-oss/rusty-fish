@@ -777,4 +777,23 @@ mod tests {
         assert!(parse_feature_schema("halfka-v2-65").is_err());
         assert!(parse_feature_schema("v2").is_err());
     }
+
+    #[test]
+    fn reencode_label_text_preserves_teacher_scores_and_rebuilds_halfka_features() {
+        let input = concat!(
+            "rfnn_tsv\t1\tv1\t768\n",
+            "37\t0\t1\trnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1\t400\n",
+        );
+
+        let output = reencode_label_text(input, FeatureSchema::HalfKaV2 { buckets: 64 })
+            .expect("HalfKA re-encoding should succeed");
+        let mut lines = output.lines();
+        assert_eq!(lines.next(), Some("rfnn_tsv\t1\thalfka-v2-64\t40960"));
+        let fields = lines.next().expect("one re-encoded row").split('\t').collect::<Vec<_>>();
+        assert_eq!(fields[0], "37");
+        assert!(!fields[1].is_empty());
+        assert!(!fields[2].is_empty());
+        assert_eq!(fields[3], "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        assert_eq!(fields[4], "400");
+    }
 }
