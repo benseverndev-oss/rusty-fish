@@ -743,7 +743,7 @@ fn feature_schema_header(schema: FeatureSchema) -> String {
 mod tests {
     use super::{
         append_records, calibration_sample, canonical_label_fen, deduplicate_and_split,
-        feature_schema_header, parse_feature_schema, reserve_output_directory,
+        feature_schema_header, parse_feature_schema, reencode_label_text, reserve_output_directory,
     };
     use engine_search::FeatureSchema;
 
