@@ -743,9 +743,11 @@ fn feature_schema_header(schema: FeatureSchema) -> String {
 mod tests {
     use super::{
         append_records, calibration_sample, canonical_label_fen, deduplicate_and_split,
-        feature_schema_header, parse_feature_schema, reencode_label_text, reserve_output_directory,
+        feature_schema_header, nnue_score_tsv, parse_feature_schema, reencode_label_text,
+        reserve_output_directory,
     };
-    use engine_search::FeatureSchema;
+    use engine_core::Board;
+    use engine_search::{FeatureSchema, Nnue};
 
     #[test]
     fn generated_dataset_records_exclude_terminal_positions() {
@@ -837,5 +839,20 @@ mod tests {
         assert!(!fields[2].is_empty());
         assert_eq!(fields[3], "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
         assert_eq!(fields[4], "400");
+    }
+
+    #[test]
+    fn nnue_score_trace_uses_rust_inference_on_the_label_fen() {
+        let input = concat!(
+            "rfnn_tsv\t1\tv1\t768\n",
+            "37\t0\t1\trnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1\t400\n",
+        );
+        let net = Nnue::from_seed(7, 8);
+        let output = nnue_score_tsv(&net, input).expect("trace succeeds");
+        let fields = output.lines().nth(1).unwrap().split('\t').collect::<Vec<_>>();
+        let board = Board::from_fen(fields[2]).unwrap();
+
+        assert_eq!(fields[0], "37");
+        assert_eq!(fields[1].parse::<i32>().unwrap(), net.evaluate(&board, board.side_to_move));
     }
 }
