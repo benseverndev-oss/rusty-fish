@@ -63,6 +63,9 @@ fn main() -> Result<(), String> {
     if std::env::args().nth(1).as_deref() == Some("stockfish-label") {
         return stockfish_label();
     }
+    if std::env::args().nth(1).as_deref() == Some("rfnn-reencode") {
+        return rfnn_reencode();
+    }
     if std::env::args().nth(1).as_deref() == Some("dataset-build") {
         return dataset_build();
     }
@@ -340,6 +343,45 @@ fn stockfish_label() -> Result<(), String> {
     }
     std::fs::write(out, output)
         .map_err(|error| format!("failed to write {}: {error}", out.display()))
+}
+
+fn rfnn_reencode() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 5 {
+        return Err("usage: rfnn-reencode <input_tsv> <out_tsv> <schema>".into());
+    }
+    let input = Path::new(&args[2]);
+    let out = Path::new(&args[3]);
+    if out.exists() {
+        return Err(format!("refusing to overwrite re-encoded output {}", out.display()));
+    }
+    let schema = parse_feature_schema(&args[4])?;
+    let text = std::fs::read_to_string(input)
+        .map_err(|error| format!("failed to read {}: {error}", input.display()))?;
+    let output = reencode_label_text(&text, schema)?;
+    std::fs::write(out, output)
+        .map_err(|error| format!("failed to write {}: {error}", out.display()))
+}
+
+fn reencode_label_text(input: &str, schema: FeatureSchema) -> Result<String, String> {
+    if input.lines().next() != Some("rfnn_tsv\t1\tv1\t768") {
+        return Err("re-encoding requires a v1 RFNN TSV input".into());
+    }
+    let mut output = feature_schema_header(schema);
+    for (line_number, line) in input.lines().enumerate().skip(1) {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 5 {
+            return Err(format!("invalid v1 RFNN row at line {}", line_number + 1));
+        }
+        let board = Board::from_fen(fields[3])
+            .map_err(|error| format!("invalid FEN at line {}: {error}", line_number + 1))?;
+        let own = join_usize(&schema.active_features(&board, board.side_to_move));
+        let opp = join_usize(&schema.active_features(&board, board.side_to_move.opposite()));
+        output.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\n", fields[0], own, opp, fields[3], fields[4]
+        ));
+    }
+    Ok(output)
 }
 
 fn manifest_fens(
