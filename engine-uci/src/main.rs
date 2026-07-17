@@ -447,6 +447,55 @@ mod tests {
     }
 
     #[test]
+    fn book_options_are_advertised_and_keep_the_prior_book_on_error() {
+        let mut state = EngineState::default();
+        let path =
+            std::env::temp_dir().join(format!("rusty-fish-book-{}.txt", std::process::id()));
+        std::fs::write(
+            &path,
+            "rusty-fish-book v2\nrnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -\te2e4:9 d2d4:1\n",
+        )
+        .unwrap();
+
+        let command = format!("setoption name BookPath value {}", path.display());
+        apply_option(&mut state, &command).unwrap();
+        assert!(state.book.is_some());
+
+        // A missing file errors and keeps the previously loaded book.
+        assert!(
+            apply_option(&mut state, "setoption name BookPath value /nonexistent/book.txt").is_err()
+        );
+        assert!(state.book.is_some());
+
+        // An empty value disables the book and restores ordinary search.
+        apply_option(&mut state, "setoption name BookPath value").unwrap();
+        assert!(state.book.is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn book_variety_is_advertised_and_clamped() {
+        let mut state = EngineState::default();
+        assert_eq!(state.options.book_variety, 0);
+
+        apply_option(&mut state, "setoption name Book Variety value 100").unwrap();
+        assert_eq!(state.options.book_variety, 100);
+
+        apply_option(&mut state, "setoption name Book Variety value 999").unwrap();
+        assert_eq!(state.options.book_variety, 100);
+
+        assert!(apply_option(&mut state, "setoption name Book Variety value abc").is_err());
+        assert_eq!(state.options.book_variety, 100);
+
+        let mut header = Vec::new();
+        write_uci_header(&mut header, &state.options).unwrap();
+        let header = String::from_utf8(header).unwrap();
+        assert!(header.contains("option name BookPath type string default"));
+        assert!(header.contains("option name Book Variety type spin default 100 min 0 max 100"));
+    }
+
+    #[test]
     fn syzygy_path_keeps_the_previous_path_on_error() {
         let mut state = EngineState::default();
         apply_option(&mut state, "setoption name SyzygyPath value .").unwrap();
