@@ -137,15 +137,31 @@ pub struct SearchResult {
 
 #[derive(Clone, Debug, Default)]
 pub struct OpeningBook {
-    entries: HashMap<u64, Vec<ChessMove>>,
+    entries: HashMap<u64, Vec<BookMove>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BookMove {
+    mv: ChessMove,
+    weight: u32,
 }
 
 impl OpeningBook {
     pub fn from_text(text: &str) -> Result<Self, String> {
         let mut lines = text.lines().filter(|line| !line.trim().is_empty());
-        if lines.next() != Some("rusty-fish-book v1") {
-            return Err("opening book must start with `rusty-fish-book v1`".to_string());
-        }
+        let version = lines
+            .next()
+            .ok_or_else(|| "opening book is empty".to_string())?;
+        let v2 = match version {
+            "rusty-fish-book v1" => false,
+            "rusty-fish-book v2" => true,
+            _ => {
+                return Err(
+                    "opening book must start with `rusty-fish-book v1` or `rusty-fish-book v2`"
+                        .to_string(),
+                );
+            }
+        };
 
         let mut entries = HashMap::new();
         for (line_number, line) in lines.enumerate() {
@@ -158,13 +174,50 @@ impl OpeningBook {
             let board = Board::from_fen(fen)?;
             let moves = moves
                 .split_whitespace()
-                .map(|uci| board.parse_uci_move(uci))
+                .map(|entry| {
+                    let (uci, weight) = if v2 {
+                        let (uci, weight) = entry.split_once(':').ok_or_else(|| {
+                            format!(
+                                "opening book v2 line {} move must have `uci:weight`",
+                                line_number + 2
+                            )
+                        })?;
+                        let weight = weight.parse::<u32>().map_err(|_| {
+                            format!(
+                                "opening book v2 line {} move weight must be a positive integer",
+                                line_number + 2
+                            )
+                        })?;
+                        if weight == 0 {
+                            return Err(format!(
+                                "opening book v2 line {} move weight must be positive",
+                                line_number + 2
+                            ));
+                        }
+                        (uci, weight)
+                    } else {
+                        (entry, 1)
+                    };
+                    Ok(BookMove {
+                        mv: board.parse_uci_move(uci)?,
+                        weight,
+                    })
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             if moves.is_empty() {
                 return Err(format!(
                     "opening book line {} has no moves",
                     line_number + 2
                 ));
+            }
+            let mut moves = moves;
+            if v2 {
+                moves.sort_unstable_by(|left, right| {
+                    right
+                        .weight
+                        .cmp(&left.weight)
+                        .then_with(|| left.mv.to_uci().cmp(&right.mv.to_uci()))
+                });
             }
             entries.insert(board.position_hash(), moves);
         }
@@ -175,8 +228,32 @@ impl OpeningBook {
         self.entries.get(&board.position_hash()).and_then(|moves| {
             moves
                 .iter()
-                .copied()
-                .find(|mv| board.parse_uci_move(&mv.to_uci()).is_ok())
+                .find(|entry| board.parse_uci_move(&entry.mv.to_uci()).is_ok())
+                .map(|entry| entry.mv)
+        })
+    }
+
+    pub fn select_with_variety(&self, board: &Board, variety: u8) -> Option<ChessMove> {
+        if variety == 0 {
+            return self.select(board);
+        }
+        let moves = self.entries.get(&board.position_hash())?;
+        let total_weight = moves
+            .iter()
+            .filter(|entry| board.parse_uci_move(&entry.mv.to_uci()).is_ok())
+            .map(|entry| u64::from(entry.weight))
+            .sum::<u64>();
+        if total_weight == 0 {
+            return None;
+        }
+        let ticket = (board.position_hash() ^ u64::from(variety)) % total_weight;
+        let mut upper_bound = 0_u64;
+        moves.iter().find_map(|entry| {
+            if board.parse_uci_move(&entry.mv.to_uci()).is_err() {
+                return None;
+            }
+            upper_bound += u64::from(entry.weight);
+            (ticket < upper_bound).then_some(entry.mv)
         })
     }
 }
@@ -2531,6 +2608,32 @@ mod tests {
             book.select(&Board::startpos()).map(|mv| mv.to_uci()),
             Some("e2e4".to_string())
         );
+    }
+
+    #[test]
+    fn v2_opening_book_uses_the_highest_weight_move_at_zero_variety() {
+        let book = OpeningBook::from_text(
+            "rusty-fish-book v2\nrnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -\te2e4:9 d2d4:1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            book.select(&Board::startpos()).map(|mv| mv.to_uci()),
+            Some("e2e4".to_string())
+        );
+    }
+
+    #[test]
+    fn v2_opening_book_selects_a_weighted_legal_move_at_nonzero_variety() {
+        let book = OpeningBook::from_text(
+            "rusty-fish-book v2\nrnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -\te2e4:9 d2d4:1\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            book.select_with_variety(&Board::startpos(), 100)
+                .map(|mv| mv.to_uci())
+                .as_deref(),
+            Some("e2e4" | "d2d4")
+        ));
     }
 
     #[test]
