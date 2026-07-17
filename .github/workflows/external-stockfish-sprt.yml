@@ -24,10 +24,18 @@ jobs:
           echo "RUSTY_FISH_EXTERNAL_UCI=$PWD/$stockfish" >> "$GITHUB_ENV"
       - name: Run 32-game external SPRT campaign
         run: |
+          set +e
           cargo run --release -p engine-bench -- external-sprt \
             > artifacts/external-stockfish-sprt.tsv \
             2> artifacts/external-stockfish-games.tsv
+          status=$?
+          echo "=== external-stockfish-sprt.tsv (stdout) ==="
+          cat artifacts/external-stockfish-sprt.tsv
+          echo "=== external-stockfish-games.tsv (stderr, tail) ==="
+          tail -n 60 artifacts/external-stockfish-games.tsv
+          exit $status
       - name: Upload external SPRT reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: external-stockfish-sprt-tsv
