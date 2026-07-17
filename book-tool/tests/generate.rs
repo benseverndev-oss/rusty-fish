@@ -3,8 +3,8 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const FIXTURE: &str = include_str!("../../assets/opening-book/lichess-cc0-fixture.pgn");
-const EXPECTED_BOOK: &str = include_str!("../../assets/opening-book/rusty-fish-book-v2.txt");
-const EXPECTED_METRICS: &str = include_str!("../../assets/opening-book/metrics.tsv");
+const EXPECTED_BOOK: &str = include_str!("../../assets/opening-book/fixture-book-v2.txt");
+const EXPECTED_METRICS: &str = include_str!("../../assets/opening-book/fixture-metrics.tsv");
 
 fn test_directory() -> std::path::PathBuf {
     let suffix = SystemTime::now()

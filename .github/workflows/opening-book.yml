@@ -20,6 +20,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Run the book generator tests
+        run: cargo test -p book-tool
       - name: Regenerate the book from the committed fixture
         run: |
           cargo run --release -p book-tool -- generate \
@@ -28,8 +30,8 @@ jobs:
             regenerated-metrics.tsv
       - name: Verify the committed book and metrics are byte-identical
         run: |
-          diff --unified assets/opening-book/rusty-fish-book-v2.txt regenerated-book.txt
-          diff --unified assets/opening-book/metrics.tsv regenerated-metrics.tsv
+          diff --unified assets/opening-book/fixture-book-v2.txt regenerated-book.txt
+          diff --unified assets/opening-book/fixture-metrics.tsv regenerated-metrics.tsv
       - name: Report book metrics
         run: |
           {
