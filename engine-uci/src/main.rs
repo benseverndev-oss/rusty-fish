@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use engine_core::{Board, CLASSIC_STARTPOS_FEN};
 use engine_search::{
-    ClockControl, Nnue, SearchLimits, SearchOptions, SearchResult, Searcher, SyzygyTablebases,
+    ClockControl, Nnue, OpeningBook, SearchLimits, SearchOptions, SearchResult, Searcher,
+    SyzygyTablebases,
 };
 
 fn main() -> io::Result<()> {
@@ -77,6 +78,7 @@ fn main() -> io::Result<()> {
                 state.options.clone(),
                 state.syzygy_path.clone(),
                 state.nnue.clone(),
+                state.book.clone(),
                 parse_go(trimmed),
             ));
         } else if trimmed == "stop" {
@@ -104,6 +106,7 @@ fn start_search(
     options: SearchOptions,
     syzygy_path: Option<String>,
     nnue: Option<Arc<Nnue>>,
+    book: Option<OpeningBook>,
     limits: SearchLimits,
 ) -> ActiveSearch {
     let stop_signal = Arc::new(AtomicBool::new(false));
@@ -117,6 +120,7 @@ fn start_search(
             syzygy_path.and_then(|path| SyzygyTablebases::load(&path, syzygy_probe_limit).ok()),
         );
         searcher.set_nnue(nnue);
+        searcher.set_opening_book(book);
         let result = searcher.search_with_stop_signal(&board, limits, worker_signal);
         let _ = result_tx.send(result);
     });
@@ -155,6 +159,7 @@ struct EngineState {
     options: SearchOptions,
     syzygy_path: Option<String>,
     nnue: Option<Arc<Nnue>>,
+    book: Option<OpeningBook>,
 }
 
 fn write_uci_header(mut stdout: impl Write, options: &SearchOptions) -> io::Result<()> {
@@ -184,6 +189,12 @@ fn write_uci_header(mut stdout: impl Write, options: &SearchOptions) -> io::Resu
         options.threads
     )?;
     writeln!(stdout, "option name EvalFile type string default")?;
+    writeln!(stdout, "option name BookPath type string default")?;
+    writeln!(
+        stdout,
+        "option name Book Variety type spin default {} min 0 max 100",
+        options.book_variety
+    )?;
     writeln!(stdout, "uciok")
 }
 
@@ -284,6 +295,23 @@ fn apply_option(state: &mut EngineState, command: &str) -> Result<(), String> {
                     state.nnue = Some(Arc::new(nnue));
                 }
             }
+        }
+        "BookPath" => {
+            match value {
+                None => state.book = None,
+                Some(path) => {
+                    let text = std::fs::read_to_string(&path)
+                        .map_err(|err| format!("cannot read opening book {path}: {err}"))?;
+                    state.book = Some(OpeningBook::from_text(&text)?);
+                }
+            }
+        }
+        "Book Variety" => {
+            let value = value.ok_or_else(|| "missing option value".to_string())?;
+            let variety = value
+                .parse::<u32>()
+                .map_err(|_| format!("invalid Book Variety value: {value}"))?;
+            state.options.book_variety = variety.min(100) as u8;
         }
         _ => return Err(format!("unsupported option: {name}")),
     }

@@ -71,6 +71,9 @@ pub struct SearchOptions {
     pub syzygy_probe_depth: u8,
     pub syzygy_probe_limit: u8,
     pub threads: usize,
+    /// 0 always plays the highest-weight book move; higher values widen
+    /// deterministic weighted selection among book alternatives.
+    pub book_variety: u8,
 }
 
 impl Default for SearchOptions {
@@ -82,6 +85,7 @@ impl Default for SearchOptions {
             syzygy_probe_depth: 1,
             syzygy_probe_limit: 7,
             threads: 1,
+            book_variety: 0,
         }
     }
 }
@@ -898,7 +902,7 @@ impl Searcher {
         if let Some(best_move) = self
             .opening_book
             .as_ref()
-            .and_then(|book| book.select(board))
+            .and_then(|book| book.select_with_variety(board, self.options.book_variety))
         {
             return SearchResult {
                 best_move: Some(best_move),
