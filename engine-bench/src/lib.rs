@@ -1006,7 +1006,8 @@ mod tests {
         run_spsa_campaign, run_tactical_suite, search_params_to_vector, spsa_tsv_report,
         spsa_update, sprt, tactical_solve_rate, tactical_tsv_report, throughput_tsv_report,
         vector_to_search_params, MatchConfig, SprtConfig, SprtDecision, random_opening_fens,
-        run_nnue_gauntlet, run_nnue_gauntlet_with_move_time, summarize,
+        run_mobility_gate, run_nnue_gauntlet, run_nnue_gauntlet_with_move_time, sprt_tsv_report,
+        summarize,
     };
     use engine_search::{Nnue, SearchParams};
     use std::{sync::Arc, time::Duration};
@@ -1033,6 +1034,15 @@ mod tests {
         // The walks diverge, so not every opening is identical.
         let unique: std::collections::HashSet<&String> = fens.iter().collect();
         assert!(unique.len() > 1, "openings should vary");
+    }
+
+    #[test]
+    fn mobility_gate_plays_games_and_reports() {
+        let config = MatchConfig { candidate_depth: 2, baseline_depth: 2, max_plies: 20 };
+        let records = run_mobility_gate(2, 0xC0FFEE, config).expect("gate runs");
+        assert_eq!(records.len(), 4); // 2 openings x 2 colors
+        let report = sprt_tsv_report(summarize(&records), SprtConfig::default());
+        assert!(report.contains("decision"));
     }
 
     #[test]
