@@ -43,11 +43,11 @@ positional arguments and rejects any others with a usage string.
 The book file is the v2 text format: line 1 is the literal header
 `rusty-fish-book v2`; every later line is `<signature>\t<uci>:<weight> ...`,
 where `<signature>` is a position signature (a FEN with the halfmove and
-fullmove counters stripped). `hitrate` skips the header line and collects the
-substring before the first tab on each remaining line into a set of signatures.
-It reads only signatures; move weights are irrelevant to coverage. A line
-without a tab is malformed and fails the command loudly rather than being
-silently skipped.
+fullmove counters stripped). `hitrate` asserts line 1 equals `rusty-fish-book v2`
+and fails loudly otherwise, then collects the substring before the first tab on
+each remaining line into a set of signatures. It reads only signatures; move
+weights are irrelevant to coverage. A line without a tab is malformed and fails
+the command loudly rather than being silently skipped.
 
 ## How the suite is replayed
 
@@ -69,8 +69,10 @@ contributes `min(L, 16)` checked positions (the positions before moves one
 through `min(L, 16)`).
 
 A malformed or illegal suite move (SAN that does not parse or is not legal in
-the reached position) fails the command loudly, matching how the generator
-treats a corrupt input.
+the reached position) fails the command loudly. This is a deliberate departure
+from the bulk generator, which marks a bad game invalid and silently skips it:
+the hit-rate suite is small and hand-curated, so a move that does not replay is
+a mistake to surface, not tolerate.
 
 ## Metrics emitted
 
@@ -89,8 +91,12 @@ A `metric\tvalue` TSV, byte-deterministic so it can be asserted exactly:
 entry for it, regardless of whether the book's move equals the suite's move.
 Agreement is a stricter, separate metric and is out of scope. Floats use a fixed
 six-decimal format (matching the existing tactical-suite solve-rate style, e.g.
-`1.000000`) so output is reproducible. `mean_book_depth` and `hit_rate` are
-computed over `plies_checked`; when a suite is empty (`plies_checked == 0`) the
+`1.000000`) so output is reproducible.
+
+The two floats have different denominators, and they are not interchangeable:
+`hit_rate` divides `plies_in_book` by `plies_checked`, while `mean_book_depth`
+divides the summed per-line depths by `lines`. When the suite is empty
+(`plies_checked == 0`, equivalently `lines == 0` or every line has no moves) the
 command fails loudly rather than dividing by zero, since an empty suite is a
 mistake.
 
@@ -108,15 +114,20 @@ and a coverage regression is visible.
 ## CI: report-only
 
 `.github/workflows/opening-book.yml` gains a step that runs `hitrate` against the
-committed *production* book and the committed suite, then writes the TSV to
-`$GITHUB_STEP_SUMMARY` and uploads it as an artifact:
+committed *production* book and the committed suite, captures its stdout to a
+named file, writes that file to `$GITHUB_STEP_SUMMARY`, and uploads it as an
+artifact. `cargo run --release` build chatter goes to stderr, so redirecting
+stdout captures only the TSV:
 
 ```
 cargo run --release -p book-tool -- hitrate \
   assets/opening-book/rusty-fish-book-v2.txt \
-  assets/opening-book/hitrate-suite.pgn
+  assets/opening-book/hitrate-suite.pgn > hitrate.tsv
+{ echo '### Opening book hit rate'; echo; echo '```'; cat hitrate.tsv; echo '```'; } \
+  >> "$GITHUB_STEP_SUMMARY"
 ```
 
+followed by an `actions/upload-artifact` step for `hitrate.tsv`.
 The production book is committed (about 459 KB), so this reads a local file and
 downloads nothing; ordinary PR CI stays light, honoring the constraint that it
 never fetches the full database. The step is report-only: no byte-assertion and
@@ -133,9 +144,11 @@ against which coverage would be near zero and uninformative.
 
 - A unit test drives the compiled `book-tool` binary over a tiny fixture book
   and a tiny suite PGN with a hand-computed expected TSV, asserting the exact
-  bytes. The fixture exercises a partial hit (a line the book covers for some
-  plies then misses) so `hit_rate`, `mean_book_depth`, and `fully_covered_lines`
-  are all non-trivial.
+  bytes. Because `hitrate` prints to stdout (unlike `generate`, whose tests read
+  output files and check `.status()`), these tests capture stdout with
+  `Command::output()`. The fixture exercises a partial hit (a line the book
+  covers for some plies then misses) so `hit_rate`, `mean_book_depth`, and
+  `fully_covered_lines` are all non-trivial.
 - A test pins that a suite move outside the book still counts as a checked miss
   rather than an error, and that a genuinely malformed book or illegal suite
   move fails loudly.
