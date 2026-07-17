@@ -41,6 +41,18 @@ jobs:
             cat regenerated-metrics.tsv
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Report opening book hit rate
+        run: |
+          cargo run --release -p book-tool -- hitrate \
+            assets/opening-book/rusty-fish-book-v2.txt \
+            assets/opening-book/hitrate-suite.pgn > hitrate.tsv
+          {
+            echo '### Opening book hit rate'
+            echo
+            echo '```'
+            cat hitrate.tsv
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload book and metrics
         uses: actions/upload-artifact@v4
         with:
@@ -48,3 +60,4 @@ jobs:
           path: |
             regenerated-book.txt
             regenerated-metrics.tsv
+            hitrate.tsv
