@@ -1,10 +1,15 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::ControlFlow;
 use std::path::Path;
 
 use engine_core::{Board, Color};
 use pgn_reader::shakmaty::{Chess, Position, uci::UciMove};
 use pgn_reader::{RawTag, Reader, SanPlus, Visitor};
+
+/// The generator records the position before each of the first this-many plies,
+/// so `hitrate` checks at most this many positions per line. Both uses must stay
+/// equal or the metric misreports.
+const BOOK_MAX_PLIES: u32 = 16;
 
 #[derive(Clone, Copy)]
 struct BookFilter {
@@ -150,6 +155,148 @@ impl Visitor for Builder {
     }
 }
 
+fn load_book_signatures(book: &str) -> Result<HashSet<String>, String> {
+    let mut lines = book.lines();
+    match lines.next() {
+        Some("rusty-fish-book v2") => {}
+        _ => return Err("book is missing the rusty-fish-book v2 header".to_string()),
+    }
+    let mut signatures = HashSet::new();
+    for line in lines {
+        let Some((signature, _)) = line.split_once('\t') else {
+            return Err(format!("malformed book line: {line}"));
+        };
+        signatures.insert(signature.to_string());
+    }
+    Ok(signatures)
+}
+
+struct HitRate {
+    signatures: HashSet<String>,
+    lines: u32,
+    plies_checked: u64,
+    plies_in_book: u64,
+    depth_sum: u64,
+    fully_covered_lines: u32,
+    error: Option<String>,
+}
+
+struct HitLine {
+    chess: Chess,
+    board: Board,
+    checked: u32,
+    in_book: u32,
+    depth: u32,
+    consecutive: bool,
+    valid: bool,
+}
+
+impl Visitor for HitRate {
+    type Tags = ();
+    type Movetext = HitLine;
+    type Output = ();
+
+    fn begin_tags(&mut self) -> ControlFlow<Self::Output, Self::Tags> {
+        ControlFlow::Continue(())
+    }
+
+    fn begin_movetext(&mut self, _tags: ()) -> ControlFlow<Self::Output, Self::Movetext> {
+        ControlFlow::Continue(HitLine {
+            chess: Chess::default(),
+            board: Board::startpos(),
+            checked: 0,
+            in_book: 0,
+            depth: 0,
+            consecutive: true,
+            valid: true,
+        })
+    }
+
+    fn san(&mut self, line: &mut HitLine, san: SanPlus) -> ControlFlow<Self::Output> {
+        if !line.valid || line.checked >= BOOK_MAX_PLIES {
+            return ControlFlow::Continue(());
+        }
+        let Ok(mv) = san.san.to_move(&line.chess) else {
+            self.error = Some(format!("illegal or unparsable suite move: {}", san.san));
+            line.valid = false;
+            return ControlFlow::Continue(());
+        };
+        let signature = line.board.position_signature();
+        let hit = self.signatures.contains(&signature);
+        line.checked += 1;
+        if hit {
+            line.in_book += 1;
+            if line.consecutive {
+                line.depth += 1;
+            }
+        } else {
+            line.consecutive = false;
+        }
+        let uci = UciMove::from_standard(mv.clone()).to_string();
+        match line
+            .board
+            .parse_uci_move(&uci)
+            .and_then(|parsed| line.board.make_move(parsed))
+        {
+            Ok(_) => line.chess.play_unchecked(mv),
+            Err(_) => {
+                self.error = Some(format!("illegal suite move: {uci}"));
+                line.valid = false;
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn end_game(&mut self, line: HitLine) -> Self::Output {
+        if !line.valid {
+            return;
+        }
+        self.lines += 1;
+        self.plies_checked += u64::from(line.checked);
+        self.plies_in_book += u64::from(line.in_book);
+        self.depth_sum += u64::from(line.depth);
+        if line.checked > 0 && line.in_book == line.checked {
+            self.fully_covered_lines += 1;
+        }
+    }
+}
+
+fn hitrate(book_path: &Path, suite_path: &Path) -> Result<(), String> {
+    let book = std::fs::read_to_string(book_path)
+        .map_err(|error| format!("could not read {}: {error}", book_path.display()))?;
+    let signatures = load_book_signatures(&book)?;
+
+    let suite = std::fs::read_to_string(suite_path)
+        .map_err(|error| format!("could not read {}: {error}", suite_path.display()))?;
+    let mut visitor = HitRate {
+        signatures,
+        lines: 0,
+        plies_checked: 0,
+        plies_in_book: 0,
+        depth_sum: 0,
+        fully_covered_lines: 0,
+        error: None,
+    };
+    let mut reader = Reader::new(suite.as_bytes());
+    reader
+        .visit_all_games(&mut visitor)
+        .map_err(|error| error.to_string())?;
+    if let Some(error) = visitor.error {
+        return Err(error);
+    }
+    if visitor.plies_checked == 0 {
+        return Err("suite checked no positions".to_string());
+    }
+
+    let hit_rate = visitor.plies_in_book as f64 / visitor.plies_checked as f64;
+    let mean_book_depth = visitor.depth_sum as f64 / f64::from(visitor.lines);
+    print!(
+        "metric\tvalue\nlines\t{}\nplies_checked\t{}\nplies_in_book\t{}\nhit_rate\t{hit_rate:.6}\nmean_book_depth\t{mean_book_depth:.6}\nfully_covered_lines\t{}\n",
+        visitor.lines, visitor.plies_checked, visitor.plies_in_book, visitor.fully_covered_lines
+    );
+    Ok(())
+}
+
 fn build_book<R: std::io::Read>(
     pgn: R,
     filter: BookFilter,
@@ -229,7 +376,7 @@ fn generate(
 ) -> Result<(), String> {
     let filter = BookFilter {
         min_rating: 2200,
-        max_plies: 16,
+        max_plies: BOOK_MAX_PLIES,
     };
     let report = if input == Path::new("-") {
         build_book(std::io::stdin().lock(), filter, max_positions)?
@@ -249,38 +396,45 @@ fn generate(
 fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let program = args.next().unwrap_or_else(|| "book-tool".to_string());
     let usage = format!(
-        "usage: {program} generate <input.pgn> <book.txt> <metrics.tsv> [--max-positions N]"
+        "usage: {program} generate <input.pgn> <book.txt> <metrics.tsv> [--max-positions N]\n       {program} hitrate <book.txt> <suite.pgn>"
     );
     let Some(command) = args.next() else {
         return Err(usage);
     };
-    if command != "generate" {
-        return Err(format!("unknown command: {command}"));
-    }
-
-    let mut positional = Vec::new();
-    let mut max_positions = None;
-    while let Some(arg) = args.next() {
-        if arg == "--max-positions" {
-            let value = args.next().ok_or_else(|| usage.clone())?;
-            let parsed = value
-                .parse::<usize>()
-                .map_err(|_| format!("invalid --max-positions value: {value}"))?;
-            max_positions = Some(parsed);
-        } else {
-            positional.push(arg);
+    match command.as_str() {
+        "generate" => {
+            let mut positional = Vec::new();
+            let mut max_positions = None;
+            while let Some(arg) = args.next() {
+                if arg == "--max-positions" {
+                    let value = args.next().ok_or_else(|| usage.clone())?;
+                    let parsed = value
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid --max-positions value: {value}"))?;
+                    max_positions = Some(parsed);
+                } else {
+                    positional.push(arg);
+                }
+            }
+            let [input, book, metrics] = positional.as_slice() else {
+                return Err(usage);
+            };
+            generate(
+                Path::new(input),
+                Path::new(book),
+                Path::new(metrics),
+                max_positions,
+            )
         }
+        "hitrate" => {
+            let positional: Vec<String> = args.collect();
+            let [book, suite] = positional.as_slice() else {
+                return Err(usage);
+            };
+            hitrate(Path::new(book), Path::new(suite))
+        }
+        other => Err(format!("unknown command: {other}")),
     }
-
-    let [input, book, metrics] = positional.as_slice() else {
-        return Err(usage);
-    };
-    generate(
-        Path::new(input),
-        Path::new(book),
-        Path::new(metrics),
-        max_positions,
-    )
 }
 
 fn main() -> Result<(), String> {
