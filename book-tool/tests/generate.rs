@@ -1,5 +1,7 @@
 use std::fs;
+use std::io::Write;
 use std::process::Command;
+use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const FIXTURE: &str = include_str!("../../assets/opening-book/lichess-cc0-fixture.pgn");
@@ -121,6 +123,40 @@ fn max_positions_keeps_the_most_observed_positions() {
     assert_eq!(
         fs::read_to_string(&metrics).expect("generated metrics"),
         "metric\tvalue\nsource_games\t6\naccepted_games\t6\npositions\t3\nentries\t1\nalternatives\t2\n"
+    );
+
+    fs::remove_dir_all(root).expect("remove temporary directory");
+}
+
+#[test]
+fn a_dash_input_path_reads_the_pgn_from_stdin() {
+    let root = test_directory();
+    fs::create_dir_all(&root).expect("create temporary directory");
+    let book = root.join("book.txt");
+    let metrics = root.join("metrics.tsv");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_book-tool"))
+        .args([
+            "generate",
+            "-",
+            book.to_str().unwrap(),
+            metrics.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("start book generator");
+    child
+        .stdin
+        .take()
+        .expect("generator stdin")
+        .write_all(FIXTURE.as_bytes())
+        .expect("stream fixture to stdin");
+    let status = child.wait().expect("run book generator");
+
+    assert!(status.success());
+    assert_eq!(
+        fs::read_to_string(&book).expect("generated book"),
+        EXPECTED_BOOK
     );
 
     fs::remove_dir_all(root).expect("remove temporary directory");
