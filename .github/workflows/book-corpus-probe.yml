@@ -1,0 +1,55 @@
+name: Book Corpus Probe
+
+# Throwaway diagnostic: given a Lichess export URL, print its SHA-256 and the
+# entries the generator yields at the 5000 cap, so a new month can be pinned in
+# manifest.toml. Lives only on the scratch/book-corpus-probe branch; never merged.
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Lichess standard rated .pgn.zst URL to probe
+        required: true
+        default: https://database.lichess.org/standard/lichess_db_standard_rated_2017-01.pgn.zst
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install zstd
+        run: sudo apt-get update && sudo apt-get install --yes zstd
+      - name: Download the candidate export
+        run: |
+          set -euo pipefail
+          curl --location --fail --retry 5 --retry-delay 10 --retry-all-errors \
+            --output export.pgn.zst "${{ inputs.url }}"
+      - name: Compute SHA-256 and size
+        run: |
+          set -euo pipefail
+          sha256sum export.pgn.zst
+          ls -l export.pgn.zst
+      - name: Build the generator
+        run: cargo build --release -p book-tool
+      - name: Generate at the 5000 cap and report metrics
+        run: |
+          set -euo pipefail
+          zstdcat export.pgn.zst \
+            | ./target/release/book-tool generate - probe-book.txt probe-metrics.tsv \
+                --max-positions 5000
+          echo '--- probe-metrics.tsv ---'
+          cat probe-metrics.tsv
+      - name: Summarize
+        run: |
+          {
+            echo '### Book corpus probe'
+            echo
+            echo "URL: ${{ inputs.url }}"
+            echo
+            echo '```'
+            sha256sum export.pgn.zst
+            cat probe-metrics.tsv
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
