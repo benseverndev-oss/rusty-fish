@@ -1432,6 +1432,24 @@ mod tests {
     }
 
     #[test]
+    fn attacks_reports_pseudo_legal_targets() {
+        use crate::{Color, Piece, PieceKind, Square};
+        let knight = Piece { color: Color::White, kind: PieceKind::Knight };
+        // Central knight on d4 reaches 8 squares; a cornered knight on a1 reaches 2.
+        let central = Board::from_fen("8/8/8/8/3N4/8/8/8 w - - 0 1").unwrap();
+        assert_eq!(central.attacks(Square(27), knight).count_ones(), 8);
+        let corner = Board::from_fen("8/8/8/8/8/8/8/N7 w - - 0 1").unwrap();
+        assert_eq!(corner.attacks(Square(0), knight).count_ones(), 2);
+        // A rook's slide stops at the first blocker (own pawn on d6 blocks past it).
+        let rook = Piece { color: Color::White, kind: PieceKind::Rook };
+        let blocked = Board::from_fen("8/8/3P4/8/8/8/8/3R4 w - - 0 1").unwrap();
+        let up_file = blocked.attacks(Square(3), rook); // rook on d1
+        assert!(up_file & (1 << 19) != 0, "attacks d3");   // d3 reachable
+        assert!(up_file & (1 << 43) != 0, "attacks d6");   // d6 (the blocker) reachable
+        assert!(up_file & (1 << 51) == 0, "stops at d6");  // d7 not reachable
+    }
+
+    #[test]
     fn startpos_perft_regression() {
         let mut board = Board::startpos();
         assert_eq!(board.perft(1), 20);
