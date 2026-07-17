@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::io::Cursor;
 use std::ops::ControlFlow;
 use std::path::Path;
 
@@ -151,12 +150,12 @@ impl Visitor for Builder {
     }
 }
 
-fn build_book(
-    pgn: &str,
+fn build_book<R: std::io::Read>(
+    pgn: R,
     filter: BookFilter,
     max_positions: Option<usize>,
 ) -> Result<BookReport, String> {
-    let mut reader = Reader::new(Cursor::new(pgn.as_bytes()));
+    let mut reader = Reader::new(pgn);
     let mut builder = Builder {
         filter,
         source_games: 0,
@@ -228,16 +227,17 @@ fn generate(
     metrics: &Path,
     max_positions: Option<usize>,
 ) -> Result<(), String> {
-    let pgn = std::fs::read_to_string(input)
-        .map_err(|error| format!("could not read {}: {error}", input.display()))?;
-    let report = build_book(
-        &pgn,
-        BookFilter {
-            min_rating: 2200,
-            max_plies: 16,
-        },
-        max_positions,
-    )?;
+    let filter = BookFilter {
+        min_rating: 2200,
+        max_plies: 16,
+    };
+    let report = if input == Path::new("-") {
+        build_book(std::io::stdin().lock(), filter, max_positions)?
+    } else {
+        let file = std::fs::File::open(input)
+            .map_err(|error| format!("could not read {}: {error}", input.display()))?;
+        build_book(std::io::BufReader::new(file), filter, max_positions)?
+    };
     let metrics_tsv = report.metrics_tsv();
     std::fs::write(book, report.book)
         .map_err(|error| format!("could not write {}: {error}", book.display()))?;
