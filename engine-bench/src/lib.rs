@@ -270,7 +270,8 @@ pub struct MatchConfig {
 #[derive(Clone, Debug)]
 pub struct ExternalMatchConfig {
     pub uci_path: Option<String>,
-    pub candidate_depth: u8,
+    pub candidate_movetime: Duration,
+    pub candidate_move_overhead: Duration,
     pub opponent_movetime: Duration,
     pub max_plies: u32,
     pub response_timeout: Duration,
@@ -280,7 +281,8 @@ impl Default for ExternalMatchConfig {
     fn default() -> Self {
         Self {
             uci_path: std::env::var("RUSTY_FISH_EXTERNAL_UCI").ok(),
-            candidate_depth: 5,
+            candidate_movetime: Duration::from_millis(100),
+            candidate_move_overhead: Duration::from_millis(10),
             opponent_movetime: Duration::from_millis(100),
             max_plies: 160,
             response_timeout: Duration::from_secs(10),
@@ -511,13 +513,13 @@ pub fn tsv_report(records: &[GameRecord], config: MatchConfig) -> String {
 
 pub fn external_tsv_report(records: &[GameRecord], config: &ExternalMatchConfig) -> String {
     let opponent = config.uci_path.as_deref().unwrap_or("");
-    let mut report = "engine_version\topponent_uci\tcandidate_depth\topponent_movetime_ms\tmax_plies\tfen\tcandidate_color\toutcome\tplies\n".to_string();
+    let mut report = "engine_version\topponent_uci\tcandidate_movetime_ms\topponent_movetime_ms\tmax_plies\tfen\tcandidate_color\toutcome\tplies\n".to_string();
     for record in records {
         report.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{:?}\t{}\n",
             env!("CARGO_PKG_VERSION"),
             opponent,
-            config.candidate_depth,
+            config.candidate_movetime.as_millis(),
             config.opponent_movetime.as_millis(),
             config.max_plies,
             record.fen,
@@ -596,6 +598,12 @@ fn play_external_game(
         .ok_or_else(|| "external UCI path disappeared after validation".to_string())?;
     let mut board = Board::from_fen(fen)?;
     let mut candidate = Searcher::default();
+    // Trim the candidate's move overhead: this is an automated harness with no
+    // GUI latency to reserve for, so the default 25 ms would under-spend the
+    // time budget and break parity with the opponent's full movetime.
+    let mut candidate_options = candidate.options().clone();
+    candidate_options.move_overhead = config.candidate_move_overhead;
+    candidate.set_options(candidate_options);
     let mut opponent = UciProcess::start(opponent_path, config.response_timeout)?;
     for ply in 0..config.max_plies {
         let mv = if board.side_to_move == candidate_color {
@@ -603,7 +611,7 @@ fn play_external_game(
                 .search(
                     &board,
                     SearchLimits {
-                        depth: Some(config.candidate_depth),
+                        movetime: Some(config.candidate_movetime),
                         ..SearchLimits::default()
                     },
                 )
@@ -1246,8 +1254,18 @@ mod tests {
             }],
             &config,
         );
-        assert!(report.contains("opponent_uci\tcandidate_depth\topponent_movetime_ms"));
+        // Time parity: the candidate is reported by its movetime, not a depth.
+        assert!(report.contains("opponent_uci\tcandidate_movetime_ms\topponent_movetime_ms"));
+        assert!(!report.contains("candidate_depth"));
         assert!(report.contains("/opt/stockfish"));
+    }
+
+    #[test]
+    fn external_match_defaults_to_equal_time_for_both_engines() {
+        let config = ExternalMatchConfig::default();
+        assert_eq!(config.candidate_movetime, Duration::from_millis(100));
+        assert_eq!(config.opponent_movetime, Duration::from_millis(100));
+        assert_eq!(config.candidate_move_overhead, Duration::from_millis(10));
     }
 
     #[test]
