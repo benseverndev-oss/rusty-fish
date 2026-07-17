@@ -48,6 +48,51 @@ fn generate_writes_deterministic_book_and_metrics() {
     fs::remove_dir_all(root).expect("remove temporary directory");
 }
 
+const HITRATE_BOOK: &str = concat!(
+    "rusty-fish-book v2\n",
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -\te2e4:9\n",
+    "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3\te7e5:5\n",
+);
+
+// Line one checks three positions (start, after e4, after e4 e5); the book has
+// the first two, so 2/3 with an in-book depth of 2 and no full coverage. Line
+// two checks one position (start), a hit, fully covered. Totals: 2 lines, 4
+// checked, 3 in book, hit_rate 3/4, mean_book_depth (2+1)/2, 1 fully covered.
+const HITRATE_SUITE: &str = concat!(
+    "[Event \"line one\"]\n\n1. e4 e5 2. Nf3 *\n\n",
+    "[Event \"line two\"]\n\n1. e4 *\n",
+);
+
+const HITRATE_EXPECTED: &str = concat!(
+    "metric\tvalue\n",
+    "lines\t2\n",
+    "plies_checked\t4\n",
+    "plies_in_book\t3\n",
+    "hit_rate\t0.750000\n",
+    "mean_book_depth\t1.500000\n",
+    "fully_covered_lines\t1\n",
+);
+
+#[test]
+fn hitrate_reports_coverage_over_a_suite() {
+    let root = test_directory();
+    fs::create_dir_all(&root).expect("create temporary directory");
+    let book = root.join("book.txt");
+    let suite = root.join("suite.pgn");
+    fs::write(&book, HITRATE_BOOK).expect("write book");
+    fs::write(&suite, HITRATE_SUITE).expect("write suite");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_book-tool"))
+        .args(["hitrate", book.to_str().unwrap(), suite.to_str().unwrap()])
+        .output()
+        .expect("run book generator");
+
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8(output.stdout).expect("utf8 stdout"), HITRATE_EXPECTED);
+
+    fs::remove_dir_all(root).expect("remove temporary directory");
+}
+
 const SINGLE_WIN: &str = "[Event \"Rated fixture\"]\n[WhiteElo \"2300\"]\n[BlackElo \"2300\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0\n";
 
 #[test]
