@@ -75,11 +75,12 @@ therefore stays exactly as it is today, and that invariance is the regression
 evidence.
 
 `fixture-metrics.tsv` is regenerated and three of its counters move:
-`source_games` and `accepted_games` rise to seven, and `positions` rises
-because it is `builder.counts.len()`, captured before the min-three filter, so
-the new game's fresh positions are counted even though their moves never reach
-the book. `entries` and `alternatives` are post-filter and stay at three and
-four. That diff is expected, not a defect.
+`source_games` and `accepted_games` rise to seven, and `positions` rises from
+three to four because it is `builder.counts.len()`, captured before the
+min-three filter, so the one fresh signature the new game reaches (the
+position after `c4`) is counted even though its moves never reach the book.
+`entries` and `alternatives` are post-filter and stay at three and four. That
+diff is expected, not a defect.
 
 Note for readers of the earlier spec: `2026-07-13-licensed-opening-book-design.md`
 describes the weight as `frequency * (0.5 + score_fraction)`. The generator
@@ -103,8 +104,14 @@ ascending FEN, so the retained set is stable across runs. The default is
 unlimited, so the flag alone does not alter fixture output. The refresh uses
 `N = 5000`.
 
+`entries` and `alternatives` are counted after the cap, so the production
+`metrics.tsv` describes the book that was actually emitted and its `entries`
+matches the committed book's record count. `positions` remains the pre-filter
+signature count, which is the corpus reach rather than the book's size.
+
 `run` currently rejects any fourth argument, so its argument parsing accepts
-the flag alongside the three existing positional arguments.
+the flag alongside the three existing positional arguments. The flag is
+accepted in any position; the refresh workflow passes it last.
 
 ## Streaming
 
