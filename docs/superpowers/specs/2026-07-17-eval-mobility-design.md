@@ -22,8 +22,15 @@ pub fn attacks(&self, square: Square, piece: Piece) -> Bitboard
 It returns the piece's pseudo-legal attack bitboard given the current all-piece
 occupancy (`occupancy(White) | occupancy(Black)`), dispatching to the existing
 private attack routines. Knight and king use their step tables; bishop, rook, and
-queen use the sliding routines with occupancy; pawns return their capture-attack
-squares. This is a pure read-only accessor and changes no existing behavior.
+queen use the sliding routines with occupancy. The mobility term only ever calls
+it for knight, bishop, rook, and queen, so those four are the accessor's
+contract; king is included because its step table is already at hand. Pawns are
+out of the accessor's scope — there is no existing `pawn_attacks(square)` helper
+(pawn captures are inlined per color in move generation), the term does not use
+pawn mobility, and adding per-color pawn-attack code is unrequested. The accessor
+either excludes the pawn kind from its contract or returns an empty bitboard for
+it; it is never called with a pawn. This is a pure read-only accessor and changes
+no existing behavior.
 
 ## The mobility term
 
@@ -65,18 +72,45 @@ so it participates in tapering exactly like the other terms.
 ## The runtime scale and default-off
 
 Evaluation gains a mobility scale in the range 0–100. The mobility contribution is
-multiplied by `scale` and divided by 100, so `scale = 100` is full strength and
-`scale = 0` removes the term entirely.
+multiplied by `scale` and divided by 100 (integer), so `scale = 100` is full
+strength (`x * 100 / 100 = x`) and `scale = 0` removes the term entirely
+(`x * 0 / 100 = 0`).
 
-- The scale lives where the self-play harness can set it per side, so a game can
-  pit `scale = 100` against `scale = 0` with everything else identical. It is
-  threaded from the searcher into `evaluate_position`; the public
-  `hand_crafted_evaluation` keeps its current signature by evaluating at the
-  default scale.
-- The default scale is **0**. Mobility therefore ships disabled: `main`'s engine
-  behavior is unchanged until the gate proves the term, at which point a one-line
-  change flips the default to 100. When the scale is 0, evaluation is byte-for-byte
-  identical to today's, which a test pins.
+**Where the scale lives — `SearchParams`.** The scale is a new
+`SearchParams.mobility_scale` field. This is the deliberate, load-bearing choice:
+the self-play harness's `play_parameter_game` sets `SearchParams` per side (via
+`set_search_params`) and nothing else, so `SearchParams` is the only per-side
+lever, and putting the scale there is what lets the gate pit `scale = 100` against
+`scale = 0` without changing the harness. It must **not** go in `SearchOptions`
+(which `play_parameter_game` leaves at default for both sides, so it could not
+differ per game).
+
+`SearchParams` is also the SPSA-tunable struct, projected onto a fixed
+`[f64; SPSA_DIMENSIONS]` by `search_params_to_vector` / `vector_to_search_params`.
+To keep SPSA-tuning of mobility out of this slice:
+
+- `SPSA_DIMENSIONS` stays at its current value and `search_params_to_vector` is
+  unchanged — `mobility_scale` is **excluded from the SPSA vector**, so the SPSA
+  search-parameter tuner never perturbs it.
+- `vector_to_search_params` reconstructs `SearchParams` from the vector; since the
+  vector does not carry `mobility_scale`, that function sets it to the default
+  (0). This is correct: the vector round-trip is used only inside SPSA
+  search-parameter tuning, where mobility is off anyway, and the existing
+  `spsa_vector_round_trips_default_params` test still passes because the default
+  is 0. The mobility gate never round-trips through the vector — it sets
+  `mobility_scale` directly on each side's `SearchParams`.
+
+**Threading and default.** `Searcher::evaluate` passes `self.params.mobility_scale`
+into `evaluate_position`, which gains a scale parameter. The public
+`hand_crafted_evaluation(board)` keeps its signature by evaluating at scale 0 (its
+callers — tests, NNUE labeling — want the stable hand-crafted baseline).
+
+The default `mobility_scale` is **0**. Mobility therefore ships disabled:
+`SearchParams::default()` stays byte-identical (preserving the existing
+"Default reproduces the hand-set constants exactly" invariant and its guarding
+test), and `main`'s engine behavior is unchanged until the gate proves the term,
+at which point a one-line change flips the default to 100. When the scale is 0,
+evaluation is byte-for-byte identical to today's, which a test pins.
 
 Exposing the scale over UCI is out of scope; the harness sets it in-process.
 
@@ -89,10 +123,13 @@ term's Elo. It plays the existing opening suite color-swapped, summarizes into a
 `MatchScore`, and emits `sprt_tsv_report` (wins/draws/losses, Elo estimate, LLR,
 bounds, decision) plus a per-game TSV, matching the other campaigns.
 
-Reuse the existing self-play machinery: the harness already plays a candidate
-configuration against a baseline configuration and summarizes/SPRTs the result.
-The mobility gate is that machinery with the two configurations differing only in
-mobility scale.
+Reuse the existing self-play machinery: `play_parameter_game` already plays a
+candidate `SearchParams` against a baseline `SearchParams` and the surrounding
+code summarizes into a `MatchScore` and runs `sprt`. The mobility gate is that
+machinery with the candidate params equal to `SearchParams::default()` but
+`mobility_scale = 100` and the baseline equal to `SearchParams::default()`
+(`mobility_scale = 0`) — identical in every other field, so the SPRT isolates the
+mobility term.
 
 A dispatch-only workflow runs it, like the other strength campaigns — self-play
 over many games is CPU-heavy and must not run on ordinary PR CI. The acceptance
