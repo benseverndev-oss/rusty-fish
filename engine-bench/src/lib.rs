@@ -808,6 +808,7 @@ pub fn vector_to_search_params(vector: &[f64; SPSA_DIMENSIONS]) -> SearchParams 
         late_move_pruning_base: clamped[5].round() as usize,
         late_move_pruning_scale: clamped[6].round() as usize,
         null_move_reduction: clamped[7].round() as u8,
+        mobility_scale: 0,
     }
 }
 
