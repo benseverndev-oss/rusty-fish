@@ -48,11 +48,17 @@ struct Game {
     valid: bool,
 }
 
+#[derive(Clone, Copy, Default)]
+struct MoveStats {
+    weight: u32,
+    observations: u32,
+}
+
 struct Builder {
     filter: BookFilter,
     source_games: u32,
     accepted_games: u32,
-    counts: BTreeMap<String, BTreeMap<String, u32>>,
+    counts: BTreeMap<String, BTreeMap<String, MoveStats>>,
 }
 
 impl Builder {
@@ -138,7 +144,9 @@ impl Visitor for Builder {
                 ("1/2-1/2", _) => 2,
                 _ => 1,
             };
-            *self.counts.entry(fen).or_default().entry(mv).or_default() += points;
+            let stats = self.counts.entry(fen).or_default().entry(mv).or_default();
+            stats.weight += points;
+            stats.observations += 1;
         }
     }
 }
@@ -162,11 +170,12 @@ fn build_book(pgn: &str, filter: BookFilter) -> Result<BookReport, String> {
     for (fen, moves) in builder.counts {
         let mut moves: Vec<_> = moves
             .into_iter()
-            .filter(|(_, weight)| *weight >= 3)
+            .filter(|(_, stats)| stats.observations >= 3)
             .collect();
-        moves.sort_unstable_by(|(left_move, left_weight), (right_move, right_weight)| {
-            right_weight
-                .cmp(left_weight)
+        moves.sort_unstable_by(|(left_move, left), (right_move, right)| {
+            right
+                .weight
+                .cmp(&left.weight)
                 .then_with(|| left_move.cmp(right_move))
         });
         if moves.is_empty() {
@@ -176,7 +185,7 @@ fn build_book(pgn: &str, filter: BookFilter) -> Result<BookReport, String> {
         alternatives += moves.len();
         let alternatives = moves
             .into_iter()
-            .map(|(mv, weight)| format!("{mv}:{weight}"))
+            .map(|(mv, stats)| format!("{mv}:{}", stats.weight))
             .collect::<Vec<_>>()
             .join(" ");
         book.push_str(&format!("{fen}\t{alternatives}\n"));
