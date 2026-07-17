@@ -93,6 +93,72 @@ fn hitrate_reports_coverage_over_a_suite() {
     fs::remove_dir_all(root).expect("remove temporary directory");
 }
 
+// A minimal, valid v2 book: correct header plus the start position mapped to a
+// single legal move. Reused for the illegal-suite-move case so that the only
+// thing wrong is the suite, not the book.
+const VALID_BOOK: &str = concat!(
+    "rusty-fish-book v2\n",
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -\te2e4:9\n",
+);
+
+// Header is not `rusty-fish-book v2`, so signature loading must reject it.
+const MALFORMED_BOOK: &str = concat!(
+    "rusty-fish-book v1\n",
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -\te2e4:9\n",
+);
+
+// `e5` is illegal as White's first move from the start position, so the suite
+// replay must record an error and the command must fail.
+const ILLEGAL_SUITE: &str = "[Event \"illegal\"]\n\n1. e5 *\n";
+
+#[test]
+fn hitrate_fails_loudly_on_bad_input() {
+    let root = test_directory();
+    fs::create_dir_all(&root).expect("create temporary directory");
+
+    // Case 1: a malformed book header paired with an otherwise valid suite.
+    let malformed_book = root.join("malformed-book.txt");
+    let valid_suite = root.join("valid-suite.pgn");
+    fs::write(&malformed_book, MALFORMED_BOOK).expect("write malformed book");
+    fs::write(&valid_suite, HITRATE_SUITE).expect("write valid suite");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_book-tool"))
+        .args([
+            "hitrate",
+            malformed_book.to_str().unwrap(),
+            valid_suite.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run book generator");
+    assert!(
+        !output.status.success(),
+        "a malformed book must fail loudly; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    // Case 2: a valid book paired with a suite containing an illegal SAN move.
+    let valid_book = root.join("valid-book.txt");
+    let illegal_suite = root.join("illegal-suite.pgn");
+    fs::write(&valid_book, VALID_BOOK).expect("write valid book");
+    fs::write(&illegal_suite, ILLEGAL_SUITE).expect("write illegal suite");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_book-tool"))
+        .args([
+            "hitrate",
+            valid_book.to_str().unwrap(),
+            illegal_suite.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run book generator");
+    assert!(
+        !output.status.success(),
+        "an illegal suite move must fail loudly; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    fs::remove_dir_all(root).expect("remove temporary directory");
+}
+
 const SINGLE_WIN: &str = "[Event \"Rated fixture\"]\n[WhiteElo \"2300\"]\n[BlackElo \"2300\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0\n";
 
 #[test]
