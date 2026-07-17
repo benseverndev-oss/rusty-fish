@@ -779,7 +779,7 @@ Points worth understanding rather than copying blindly:
 - **`--retry-all-errors`** covers connection resets on a 259 MB download that plain `--retry` will not.
 - **120 minutes** is generous for parsing roughly a million games. Tune down only with a real timing from a completed run.
 - **The `entries` floor of 4000** catches a truncated or over-filtered corpus before a human reviews the PR. `entries` is counted after the cap, so a healthy run should sit at exactly 5000; anything far below means the rating filter or the decode admitted far less than expected. It is a smoke alarm, not a tuned threshold.
-- **The refresh PR does not touch the fixture pair**, so `opening-book.yml` (whose `assets/opening-book/**` trigger still fires on it) regenerates the fixture, finds both diffs empty, and passes. That is the whole reason Task 1 came first.
+- **The refresh PR arrives with no automated CI, and Task 1 is still what keeps a bad book out.** The PR is opened by `create-pull-request` using the default `GITHUB_TOKEN`, and GitHub deliberately does not fire `push`/`pull_request` workflows for `GITHUB_TOKEN`-authored events (its recursion guard). So `opening-book.yml` does **not** run on the refresh PR — do not expect a green fixture check on it. The production book is instead gated *inside the refresh job*, before the PR opens, by the SHA-256 verify, `pipefail`, and the `entries` floor; a whoever-merges human review is the only gate on the PR itself, so the PR body must say plainly that no workflow validated it. Task 1's rename split is still load-bearing for a different reason: without it the refresh would overwrite `rusty-fish-book-v2.txt`, the file `opening-book.yml` diffs the fixture against, and the *next human* PR touching `assets/opening-book/**` (which does trigger CI) would compare fixture output to a 5000-position production book and fail permanently. The split prevents that; the `GITHUB_TOKEN` suppression just means the check is deferred to that later human PR rather than firing on the bot PR.
 - **`add-paths` lists only the production pair.** The workflow never modifies `manifest.toml`; Task 5 commits that by hand. Adding it here would be dead config.
 - **Note that this workflow's own commit fires no CI at all** — `.github/workflows/opening-book-refresh.yml` matches no path filter in the repository. That is expected, not a gap. Step 3 below is the only check this task gets.
 
@@ -816,7 +816,7 @@ Expected: the spec and this plan under `docs/`, the two renamed assets, the modi
 
 - [ ] **Step 2: Open the PR**
 
-Use the superpowers:finishing-a-development-branch skill. The body should lead with the two things a reviewer cannot infer from the diff: that the fixture book staying byte-identical is the deliberate regression evidence for the filter fix, and that the production names hold no committed file until the first refresh PR lands.
+Use the superpowers:finishing-a-development-branch skill. The body should lead with the three things a reviewer cannot infer from the diff: that the fixture book staying byte-identical is the deliberate regression evidence for the filter fix; that the production names hold no committed file until the first refresh PR lands; and that the refresh workflow's own output PR will arrive with no automated CI (it is `GITHUB_TOKEN`-authored), gated only by the in-job SHA/pipefail/entries-floor guards and human review.
 
 - [ ] **Step 3: Watch every required check to completion**
 
@@ -824,12 +824,14 @@ Poll the specific run ID rather than the branch's latest — a stale poll will r
 
 - [ ] **Step 4: After merge, dispatch the first refresh**
 
+First confirm the repo setting **Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests"** is enabled. Without it the final `create-pull-request` step 403s at runtime even though the workflow's `permissions:` block is correct — the org/repo toggle is a separate gate the YAML cannot satisfy on its own. Check it with `gh api repos/benseverndev-oss/rusty-fish/actions/permissions/workflow` and look for `can_approve_pull_request_reviews` / the PR-creation allowance; enable in the UI if off.
+
 ```bash
 gh auth status
 gh workflow run "Opening Book Refresh" --ref main
 ```
 
-This produces the first real production book as its own reviewable PR. Read the run summary's metrics before approving it: `entries` should be at or near 5000 (it is post-cap), and `positions` should be far larger, since it measures corpus reach.
+This produces the first real production book as its own reviewable PR. That PR is **not validated by any workflow** (it is `GITHUB_TOKEN`-authored, so `push`/`pull_request` triggers are suppressed) — the in-job SHA/pipefail/entries-floor guards are what stand between it and a bad book, so review it by hand. Read the run summary's metrics before approving: `entries` should be at or near 5000 (it is post-cap), and `positions` should be far larger, since it measures corpus reach. If `entries` lands close to the 4000 floor, retune the floor to sit well below the observed healthy value before the next refresh.
 
 - [ ] **Step 5: Update the work tracker**
 
