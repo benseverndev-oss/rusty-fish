@@ -26,17 +26,24 @@ production pair is only ever written by the refresh workflow.
 | Path | Produced by | Verified by |
 |------|-------------|-------------|
 | `assets/opening-book/lichess-cc0-fixture.pgn` | committed by hand | - |
-| `assets/opening-book/fixture-book-v2.txt` | fixture generation | `opening-book.yml`, byte-identical |
-| `assets/opening-book/fixture-metrics.tsv` | fixture generation | `opening-book.yml`, byte-identical |
+| `assets/opening-book/fixture-book-v2.txt` | fixture generation | `opening-book.yml` and `book-tool/tests/generate.rs`, byte-identical |
+| `assets/opening-book/fixture-metrics.tsv` | fixture generation | `opening-book.yml` and `book-tool/tests/generate.rs`, byte-identical |
 | `assets/opening-book/rusty-fish-book-v2.txt` | refresh workflow | refresh workflow only |
 | `assets/opening-book/metrics.tsv` | refresh workflow | refresh workflow only |
 
 The existing committed `rusty-fish-book-v2.txt` and `metrics.tsv` are fixture
-output and are renamed to `fixture-book-v2.txt` and `fixture-metrics.tsv`;
-`opening-book.yml` is repointed at those names. The production names hold no
-committed file until the first refresh PR lands. Nothing depends on a book
-existing: `BookPath` is opt-in and has no default, so the engine's behavior is
-unchanged until a book is configured.
+output and are renamed to `fixture-book-v2.txt` and `fixture-metrics.tsv`. The
+production names hold no committed file until the first refresh PR lands.
+Nothing depends on a book existing: `BookPath` is opt-in and has no default,
+so the engine's behavior is unchanged until a book is configured.
+
+Both files have exactly two consumers and both must be repointed at the
+fixture names in the same change:
+
+- `.github/workflows/opening-book.yml` diffs them against regenerated output.
+- `book-tool/tests/generate.rs` pulls both in with `include_str!`. This is a
+  compile-time dependency, so renaming without repointing it does not fail a
+  test, it fails to build the `book-tool` test target.
 
 Without this split, the refresh PR would overwrite the file the fixture check
 diffs against, and `opening-book.yml` would compare 3-position fixture output
@@ -59,12 +66,20 @@ unchanged, so no loader or format version work follows from this.
 Every move in the current fixture has exactly three observations, so the
 filter change alone leaves the fixture book byte-identical and would be
 proven by unit test only. To make the rule observable in the committed,
-CI-verified artifacts, the fixture gains one single-occurrence decisive game.
-Under today's code that game contributes a move at three points and it enters
-the book; under the corrected rule its moves have one observation and are
-excluded. The committed `fixture-book-v2.txt` therefore stays as it is today
-and that invariance is the regression evidence, while `fixture-metrics.tsv`
-records the higher source and accepted game counts.
+CI-verified artifacts, the fixture gains one single-occurrence decisive game
+on fresh openings (`1. c4 c5 1-0`). Under today's code each of its White moves
+scores three points and `c2c4:3` enters the startpos record, tie-breaking
+ahead of `d2d4:3` on ascending UCI; under the corrected rule those moves have
+one observation and are excluded. The committed `fixture-book-v2.txt`
+therefore stays exactly as it is today, and that invariance is the regression
+evidence.
+
+`fixture-metrics.tsv` is regenerated and three of its counters move:
+`source_games` and `accepted_games` rise to seven, and `positions` rises
+because it is `builder.counts.len()`, captured before the min-three filter, so
+the new game's fresh positions are counted even though their moves never reach
+the book. `entries` and `alternatives` are post-filter and stay at three and
+four. That diff is expected, not a defect.
 
 Note for readers of the earlier spec: `2026-07-13-licensed-opening-book-design.md`
 describes the weight as `frequency * (0.5 + score_fraction)`. The generator
@@ -79,12 +94,17 @@ The generator gains `--max-positions N`, which keeps the N most-observed
 positions and then re-sorts by FEN, so output stays deterministic and the
 byte-identical checks stay meaningful.
 
-A position's observation count is the sum of the observations of the
-alternatives it retains after the minimum-three filter, so the bound keeps the
+The flag bounds emitted book records, not the pre-filter `positions` counter:
+it applies after the minimum-three filter, to the positions that would
+otherwise be written. A position's observation count for ranking is the sum of
+the observations of the alternatives it retains, so the bound keeps the
 positions the engine most often reaches. Ties in that count are broken by
 ascending FEN, so the retained set is stable across runs. The default is
 unlimited, so the flag alone does not alter fixture output. The refresh uses
 `N = 5000`.
+
+`run` currently rejects any fourth argument, so its argument parsing accepts
+the flag alongside the three existing positional arguments.
 
 ## Streaming
 
