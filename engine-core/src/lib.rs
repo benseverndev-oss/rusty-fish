@@ -503,6 +503,23 @@ impl Board {
             .fold(0, |occupancy, pieces| occupancy | pieces)
     }
 
+    /// The pseudo-legal squares `piece` attacks from `square`, given the current
+    /// all-piece occupancy. Sliders stop at the first blocker (the blocker's
+    /// square is included). Defined for knight, bishop, rook, queen, and king;
+    /// pawns are never passed here (mobility does not use pawn attacks) and yield
+    /// an empty set.
+    pub fn attacks(&self, square: Square, piece: Piece) -> Bitboard {
+        let occupied = self.occupancy(Color::White) | self.occupancy(Color::Black);
+        match piece.kind {
+            PieceKind::Knight => knight_attacks(square),
+            PieceKind::Bishop => bishop_attacks(square, occupied),
+            PieceKind::Rook => rook_attacks(square, occupied),
+            PieceKind::Queen => queen_attacks(square, occupied),
+            PieceKind::King => king_attacks(square),
+            PieceKind::Pawn => 0,
+        }
+    }
+
     pub fn set_piece_at(&mut self, square: Square, piece: Option<Piece>) {
         if let Some(previous) = self.squares[square.0 as usize] {
             self.position_hash ^= piece_hash(previous, square);
