@@ -21,11 +21,11 @@ jobs:
           set -euo pipefail
           curl --location --fail --retry 5 --retry-delay 10 --retry-all-errors \
             --output export.pgn.zst \
-            https://database.lichess.org/standard/lichess_db_standard_rated_2014-12.pgn.zst
+            https://database.lichess.org/standard/lichess_db_standard_rated_2017-01.pgn.zst
       - name: Verify the pinned SHA-256
         run: |
           set -euo pipefail
-          echo "4589a1af622a893d196bc8eaede657652ce65dc79d2f289ff65fadd6a7076af4  export.pgn.zst" \
+          echo "d1236dcd954089aee162c7b0d82f51162f7c912882343d47b77ba5c0e05512f6  export.pgn.zst" \
             | sha256sum --check --strict
       - name: Build the generator
         run: cargo build --release -p book-tool
