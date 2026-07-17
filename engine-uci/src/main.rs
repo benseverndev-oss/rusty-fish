@@ -495,11 +495,17 @@ mod tests {
         );
         assert!(state.book.is_some());
 
-        // An empty value disables the book and restores ordinary search.
-        apply_option(&mut state, "setoption name BookPath value").unwrap();
-        assert!(state.book.is_none());
+        // A malformed book file errors and keeps the previously loaded book.
+        let bad = std::env::temp_dir().join(format!("rusty-fish-bad-book-{}.txt", std::process::id()));
+        std::fs::write(&bad, "not-a-rusty-fish-book\n").unwrap();
+        assert!(
+            apply_option(&mut state, &format!("setoption name BookPath value {}", bad.display()))
+                .is_err()
+        );
+        assert!(state.book.is_some());
 
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&bad);
     }
 
     #[test]
