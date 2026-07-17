@@ -587,6 +587,26 @@ pub fn play_parameter_game(
     })
 }
 
+/// Plays mobility-on (`mobility_scale = 100`) against mobility-off (`= 0`) over
+/// `openings` generated openings, color-swapped, at equal depth for both sides.
+/// Everything but the mobility scale is identical, so the SPRT isolates the term.
+pub fn run_mobility_gate(
+    openings: usize,
+    seed: u64,
+    config: MatchConfig,
+) -> Result<Vec<GameRecord>, String> {
+    let fens = random_opening_fens(openings, 8, seed);
+    let candidate = SearchParams { mobility_scale: 100, ..SearchParams::default() };
+    let baseline = SearchParams::default(); // mobility_scale == 0
+    let mut records = Vec::with_capacity(fens.len() * 2);
+    for fen in &fens {
+        for candidate_color in [Color::White, Color::Black] {
+            records.push(play_parameter_game(fen, candidate_color, candidate, baseline, config)?);
+        }
+    }
+    Ok(records)
+}
+
 fn play_external_game(
     fen: &str,
     candidate_color: Color,
