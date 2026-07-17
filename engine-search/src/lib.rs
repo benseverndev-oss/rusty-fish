@@ -2903,6 +2903,16 @@ mod tests {
     }
 
     #[test]
+    fn mobility_scale_rewards_the_more_active_side() {
+        // White knight on d4 (8 targets), black knight on a8 (2 targets).
+        let board = Board::from_fen("n6k/8/8/8/3N4/8/8/7K w - - 0 1").unwrap();
+        let off = evaluate_position(&board, 0);
+        let on = evaluate_position(&board, 100);
+        // White is to move, so a positive mobility difference raises the score.
+        assert!(on > off, "mobility should favor the side with the more active knight: on={on} off={off}");
+    }
+
+    #[test]
     fn king_safety_handles_a_king_on_the_board_edge() {
         let board = Board::from_fen("6K1/8/8/8/8/8/8/4k3 w - - 0 1").unwrap();
         let _ = evaluate_position(&board);
