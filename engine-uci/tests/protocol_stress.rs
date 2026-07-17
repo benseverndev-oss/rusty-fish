@@ -130,6 +130,43 @@ fn infinite_search_waits_for_stop_even_when_max_depth_is_one() {
 }
 
 #[test]
+fn a_configured_book_path_plays_a_book_move() {
+    let path = std::env::temp_dir().join(format!(
+        "rusty-fish-protocol-book-{}.txt",
+        std::process::id()
+    ));
+    // `a2a3` is a legal but weak move no ordinary search would return, so a
+    // bestmove of `a2a3` proves the configured book decided the move.
+    std::fs::write(
+        &path,
+        "rusty-fish-book v2\nrnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -\ta2a3:5\n",
+    )
+    .expect("write book fixture");
+
+    let mut uci = UciProcess::spawn();
+    uci.handshake();
+    uci.send(&format!("setoption name BookPath value {}", path.display()));
+    uci.send("position startpos");
+    uci.send("go depth 1");
+    uci.expect_line("bestmove a2a3", RESPONSE_TIMEOUT);
+
+    uci.wait_for_exit();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn an_invalid_book_path_reports_an_error_and_preserves_ordinary_search() {
+    let mut uci = UciProcess::spawn();
+    uci.handshake();
+    uci.send("setoption name BookPath value /nonexistent/rusty-fish-book.txt");
+    uci.expect_line_starting_with("info string setoption error: ", RESPONSE_TIMEOUT);
+
+    uci.send("position startpos");
+    uci.send("go depth 1");
+    uci.expect_line_starting_with("bestmove ", RESPONSE_TIMEOUT);
+}
+
+#[test]
 fn replacing_an_infinite_search_emits_only_the_replacement_bestmove() {
     let mut uci = UciProcess::spawn();
     uci.handshake();

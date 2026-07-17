@@ -1,0 +1,48 @@
+name: Opening Book
+
+on:
+  push:
+    paths:
+      - 'book-tool/**'
+      - 'assets/opening-book/**'
+      - '.github/workflows/opening-book.yml'
+  pull_request:
+    paths:
+      - 'book-tool/**'
+      - 'assets/opening-book/**'
+      - '.github/workflows/opening-book.yml'
+  workflow_dispatch:
+
+jobs:
+  book:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Regenerate the book from the committed fixture
+        run: |
+          cargo run --release -p book-tool -- generate \
+            assets/opening-book/lichess-cc0-fixture.pgn \
+            regenerated-book.txt \
+            regenerated-metrics.tsv
+      - name: Verify the committed book and metrics are byte-identical
+        run: |
+          diff --unified assets/opening-book/rusty-fish-book-v2.txt regenerated-book.txt
+          diff --unified assets/opening-book/metrics.tsv regenerated-metrics.tsv
+      - name: Report book metrics
+        run: |
+          {
+            echo '### Opening book metrics'
+            echo
+            echo '```'
+            cat regenerated-metrics.tsv
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload book and metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: opening-book
+          path: |
+            regenerated-book.txt
+            regenerated-metrics.tsv

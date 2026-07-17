@@ -71,6 +71,9 @@ pub struct SearchOptions {
     pub syzygy_probe_depth: u8,
     pub syzygy_probe_limit: u8,
     pub threads: usize,
+    /// 0 always plays the highest-weight book move; higher values widen
+    /// deterministic weighted selection among book alternatives.
+    pub book_variety: u8,
 }
 
 impl Default for SearchOptions {
@@ -82,6 +85,7 @@ impl Default for SearchOptions {
             syzygy_probe_depth: 1,
             syzygy_probe_limit: 7,
             threads: 1,
+            book_variety: 0,
         }
     }
 }
@@ -898,7 +902,7 @@ impl Searcher {
         if let Some(best_move) = self
             .opening_book
             .as_ref()
-            .and_then(|book| book.select(board))
+            .and_then(|book| book.select_with_variety(board, self.options.book_variety))
         {
             return SearchResult {
                 best_move: Some(best_move),
@@ -2651,6 +2655,44 @@ mod tests {
             Some("d2d4".to_string())
         );
         assert_eq!(result.depth, 0);
+    }
+
+    #[test]
+    fn search_honors_the_configured_book_variety() {
+        const BOOK: &str =
+            "rusty-fish-book v2\nrnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -\te2e4:9 d2d4:1\n";
+        let expected = OpeningBook::from_text(BOOK)
+            .unwrap()
+            .select_with_variety(&Board::startpos(), 100)
+            .map(|mv| mv.to_uci());
+
+        let mut searcher = Searcher::default();
+        searcher.set_options(SearchOptions {
+            book_variety: 100,
+            ..SearchOptions::default()
+        });
+        searcher.set_opening_book(Some(OpeningBook::from_text(BOOK).unwrap()));
+
+        let result = searcher.search(&Board::startpos(), SearchLimits::default());
+        assert_eq!(result.best_move.map(|mv| mv.to_uci()), expected);
+        assert_eq!(result.depth, 0);
+    }
+
+    #[test]
+    fn search_uses_the_highest_weight_book_move_at_zero_variety() {
+        let mut searcher = Searcher::default();
+        searcher.set_opening_book(Some(
+            OpeningBook::from_text(
+                "rusty-fish-book v2\nrnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -\te2e4:9 d2d4:1\n",
+            )
+            .unwrap(),
+        ));
+
+        let result = searcher.search(&Board::startpos(), SearchLimits::default());
+        assert_eq!(
+            result.best_move.map(|mv| mv.to_uci()),
+            Some("e2e4".to_string())
+        );
     }
 
     #[test]
