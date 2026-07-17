@@ -609,8 +609,10 @@ fn play_external_game(
                 )
                 .best_move
         } else {
-            let reply = opponent.best_move(&board, config.opponent_movetime)?;
-            Some(board.parse_uci_move(&reply)?)
+            match opponent.best_move(&board, config.opponent_movetime)? {
+                Some(reply) => Some(board.parse_uci_move(&reply)?),
+                None => None,
+            }
         };
         let Some(mv) = mv else {
             return Ok(GameRecord {
@@ -677,17 +679,16 @@ impl UciProcess {
         Ok(process)
     }
 
-    fn best_move(&mut self, board: &Board, movetime: Duration) -> Result<String, String> {
+    /// Returns the engine's chosen move, or `None` when the engine reports that
+    /// the side to move has no legal move (a terminal position).
+    fn best_move(&mut self, board: &Board, movetime: Duration) -> Result<Option<String>, String> {
         self.send(&format!("position fen {}", board.to_fen()))?;
         self.send(&format!("go movetime {}", movetime.as_millis()))?;
         loop {
             let line = self.next_line()?;
             if let Some(best_move) = line.strip_prefix("bestmove ") {
                 let best_move = best_move.split_whitespace().next().unwrap_or_default();
-                if best_move == "0000" || best_move.is_empty() {
-                    return Err("external UCI engine returned no legal move".to_string());
-                }
-                return Ok(best_move.to_string());
+                return Ok(classify_bestmove_token(best_move));
             }
         }
     }
@@ -720,6 +721,17 @@ impl Drop for UciProcess {
         let _ = self.send("quit");
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// Classifies the token following `bestmove `. Returns `None` when the engine
+/// reports no legal move (`0000` in the UCI spec, `(none)` as Stockfish spells
+/// it, or an empty token) — meaning the position is terminal and the game ends.
+fn classify_bestmove_token(token: &str) -> Option<String> {
+    if token == "0000" || token == "(none)" || token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
     }
 }
 
@@ -980,7 +992,8 @@ pub fn spsa_tsv_report(report: &SpsaReport) -> String {
 mod tests {
     use super::{
         DEFAULT_TACTICAL_SUITE, ExternalMatchConfig, MatchScore, SPSA_DIMENSIONS, SPSA_SPECS,
-        SpsaConfig, SpsaRng, external_match_game_count, external_tsv_report, measure_throughput,
+        SpsaConfig, SpsaRng, classify_bestmove_token, external_match_game_count,
+        external_tsv_report, measure_throughput,
         run_spsa_campaign, run_tactical_suite, search_params_to_vector, spsa_tsv_report,
         spsa_update, sprt, tactical_solve_rate, tactical_tsv_report, throughput_tsv_report,
         vector_to_search_params, MatchConfig, SprtConfig, SprtDecision, random_opening_fens,
@@ -988,6 +1001,18 @@ mod tests {
     };
     use engine_search::{Nnue, SearchParams};
     use std::{sync::Arc, time::Duration};
+
+    #[test]
+    fn classify_bestmove_token_treats_no_move_reports_as_game_over() {
+        // A real move parses through.
+        assert_eq!(classify_bestmove_token("e2e4"), Some("e2e4".to_string()));
+        // Stockfish emits `(none)` in a terminal position; the UCI spec uses
+        // `0000`. Both, and an empty token, mean the game is over, not a move to
+        // parse. Regression: `(none)` previously crashed the campaign.
+        assert_eq!(classify_bestmove_token("(none)"), None);
+        assert_eq!(classify_bestmove_token("0000"), None);
+        assert_eq!(classify_bestmove_token(""), None);
+    }
 
     #[test]
     fn random_openings_are_legal_and_varied() {
