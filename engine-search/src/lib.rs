@@ -2419,6 +2419,33 @@ mod tests {
         assert_eq!(SearchOptions::default().threads, 1);
     }
 
+    /// A spread of positions that exercise every eval term: startpos, an open
+    /// middlegame, a closed one, a pawn endgame, a bishop-pair position, and a
+    /// passed-pawn position. Used to freeze today's default-eval output so the
+    /// `EvalParams` threading stays byte-identical.
+    const EVAL_CORPUS: [&str; 6] = [
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 1",
+        "rnbqk2r/ppp1bppp/3p1n2/4p3/2PpP3/2NP1N2/PP3PPP/R1BQKB1R w KQkq - 0 1",
+        "8/5pk1/6p1/8/8/6P1/5PK1/8 w - - 0 1",
+        "2b1k3/8/8/8/8/8/8/2B1KB2 w - - 0 1",
+        "4k3/8/8/3P4/8/8/8/4K3 w - - 0 1",
+    ];
+
+    #[test]
+    fn default_eval_is_byte_identical() {
+        let scores: Vec<String> = EVAL_CORPUS
+            .iter()
+            .map(|fen| {
+                let board = Board::from_fen(fen).unwrap();
+                evaluate_position(&board, 0).to_string()
+            })
+            .collect();
+        // TEMP: cargo swallows stdout for passing tests, so panic to surface
+        // today's pre-change scores in the CI failure log, then bake them.
+        panic!("EVAL_SCORES {}", scores.join(","));
+    }
+
     #[test]
     fn shared_transposition_table_round_trips_across_shards() {
         let table = SharedTranspositionTable::new(4_096);
