@@ -6,7 +6,7 @@ use std::thread;
 use std::time::Duration;
 
 use engine_core::{Board, Color, GameStatus};
-use engine_search::{Nnue, SearchLimits, SearchParams, Searcher};
+use engine_search::{EvalParams, Nnue, SearchLimits, SearchParams, Searcher, TaperedScore};
 
 pub mod train;
 
@@ -536,26 +536,33 @@ fn play_game(fen: &str, candidate_color: Color, config: MatchConfig) -> Result<G
         fen,
         candidate_color,
         SearchParams::default(),
+        EvalParams::default(),
         SearchParams::default(),
+        EvalParams::default(),
         config,
     )
 }
 
 /// Plays one self-play game between two parameter sets. The candidate searches
-/// with `candidate_params`, the baseline with `baseline_params`; this is the
-/// objective the SPSA tuner optimises.
+/// with `candidate_params`/`candidate_eval`, the baseline with
+/// `baseline_params`/`baseline_eval`; this is the objective the SPSA tuner
+/// optimises. Per-side `EvalParams` let a match pit two eval configurations.
 pub fn play_parameter_game(
     fen: &str,
     candidate_color: Color,
     candidate_params: SearchParams,
+    candidate_eval: EvalParams,
     baseline_params: SearchParams,
+    baseline_eval: EvalParams,
     config: MatchConfig,
 ) -> Result<GameRecord, String> {
     let mut board = Board::from_fen(fen)?;
     let mut candidate = Searcher::default();
     candidate.set_search_params(candidate_params);
+    candidate.set_eval_params(candidate_eval);
     let mut baseline = Searcher::default();
     baseline.set_search_params(baseline_params);
+    baseline.set_eval_params(baseline_eval);
     for ply in 0..config.max_plies {
         let (depth, searcher) = if board.side_to_move == candidate_color {
             (config.candidate_depth, &mut candidate)
@@ -590,9 +597,10 @@ pub fn play_parameter_game(
 /// A gate searcher: the given params plus a trimmed move overhead so a small
 /// `movetime` budget is actually spent searching rather than swallowed by the
 /// default 25 ms overhead (there is no GUI latency to reserve for here).
-fn gate_searcher(params: SearchParams) -> Searcher {
+fn gate_searcher(params: SearchParams, eval: EvalParams) -> Searcher {
     let mut searcher = Searcher::default();
     searcher.set_search_params(params);
+    searcher.set_eval_params(eval);
     let mut options = searcher.options().clone();
     options.move_overhead = Duration::from_millis(3);
     searcher.set_options(options);
@@ -607,13 +615,15 @@ fn play_mobility_game(
     fen: &str,
     candidate_color: Color,
     candidate_params: SearchParams,
+    candidate_eval: EvalParams,
     baseline_params: SearchParams,
+    baseline_eval: EvalParams,
     move_time: Duration,
     max_plies: u32,
 ) -> Result<GameRecord, String> {
     let mut board = Board::from_fen(fen)?;
-    let mut candidate = gate_searcher(candidate_params);
-    let mut baseline = gate_searcher(baseline_params);
+    let mut candidate = gate_searcher(candidate_params, candidate_eval);
+    let mut baseline = gate_searcher(baseline_params, baseline_eval);
     for ply in 0..max_plies {
         let searcher = if board.side_to_move == candidate_color {
             &mut candidate
@@ -678,6 +688,42 @@ pub fn run_mobility_gate_fens<S: AsRef<str>>(
                 fen.as_ref(),
                 candidate_color,
                 candidate,
+                EvalParams::default(),
+                baseline,
+                EvalParams::default(),
+                move_time,
+                max_plies,
+            )?);
+        }
+    }
+    Ok(records)
+}
+
+/// The eval gate over an explicit set of opening FENs — the shardable core so a
+/// Modal fan-out can play a slice per container. Plays the `candidate`
+/// `EvalParams` (mobility on, `mobility_scale = 100`) against the `baseline`
+/// `EvalParams` (mobility off) over each FEN color-swapped, at the same
+/// `move_time` per move, capped at `max_plies`. Everything but the two
+/// `EvalParams` (and the mobility scale) is identical, so the SPRT isolates the
+/// eval change.
+pub fn run_eval_gate_fens<S: AsRef<str>>(
+    fens: &[S],
+    candidate: EvalParams,
+    baseline: EvalParams,
+    move_time: Duration,
+    max_plies: u32,
+) -> Result<Vec<GameRecord>, String> {
+    let candidate_params = SearchParams { mobility_scale: 100, ..SearchParams::default() };
+    let baseline_params = SearchParams::default(); // mobility_scale == 0
+    let mut records = Vec::with_capacity(fens.len() * 2);
+    for fen in fens {
+        for candidate_color in [Color::White, Color::Black] {
+            records.push(play_mobility_game(
+                fen.as_ref(),
+                candidate_color,
+                candidate_params,
+                candidate,
+                baseline_params,
                 baseline,
                 move_time,
                 max_plies,
@@ -918,6 +964,142 @@ fn to_array(v: &[f64]) -> [f64; SPSA_DIMENSIONS] {
     v.try_into().expect("len")
 }
 
+/// Number of tunable eval dimensions: 4 piece values x (mg, eg) = 8, 4 mobility
+/// weights x (mg, eg) = 8, plus `bishop_pair` and `passed_pawn_base`. Kept next
+/// to [`EVAL_SPSA_SPECS`] and the projection functions so the table and vector
+/// lengths cannot drift.
+pub const EVAL_DIMENSIONS: usize = 18;
+
+/// The fixed, documented order of the eval SPSA vector. **This order is the
+/// interchange contract** shared by [`eval_params_to_vector`],
+/// [`vector_to_eval_params`], and the `eval-gate-file` / `spsa-eval` TSV: any
+/// producer and consumer must agree on it. The 18 slots are, in order:
+///
+/// | Index | Weight |
+/// |-------|--------|
+/// | 0  | `knight.middlegame`          |
+/// | 1  | `knight.endgame`             |
+/// | 2  | `bishop.middlegame`          |
+/// | 3  | `bishop.endgame`             |
+/// | 4  | `rook.middlegame`            |
+/// | 5  | `rook.endgame`               |
+/// | 6  | `queen.middlegame`           |
+/// | 7  | `queen.endgame`              |
+/// | 8  | `knight_mobility.middlegame` |
+/// | 9  | `knight_mobility.endgame`    |
+/// | 10 | `bishop_mobility.middlegame` |
+/// | 11 | `bishop_mobility.endgame`    |
+/// | 12 | `rook_mobility.middlegame`   |
+/// | 13 | `rook_mobility.endgame`      |
+/// | 14 | `queen_mobility.middlegame`  |
+/// | 15 | `queen_mobility.endgame`     |
+/// | 16 | `bishop_pair`                |
+/// | 17 | `passed_pawn_base`           |
+pub const EVAL_SPSA_SPECS: [SpsaSpec; EVAL_DIMENSIONS] = [
+    // Piece values: default +/- 120, step 12 (mg and eg share the same window).
+    SpsaSpec { name: "knight_mg", min: 200.0, max: 440.0, step: 12.0 },
+    SpsaSpec { name: "knight_eg", min: 200.0, max: 440.0, step: 12.0 },
+    SpsaSpec { name: "bishop_mg", min: 210.0, max: 450.0, step: 12.0 },
+    SpsaSpec { name: "bishop_eg", min: 210.0, max: 450.0, step: 12.0 },
+    SpsaSpec { name: "rook_mg", min: 380.0, max: 620.0, step: 12.0 },
+    SpsaSpec { name: "rook_eg", min: 380.0, max: 620.0, step: 12.0 },
+    SpsaSpec { name: "queen_mg", min: 780.0, max: 1020.0, step: 12.0 },
+    SpsaSpec { name: "queen_eg", min: 780.0, max: 1020.0, step: 12.0 },
+    // Mobility weights: 0..12, step 1.
+    SpsaSpec { name: "knight_mobility_mg", min: 0.0, max: 12.0, step: 1.0 },
+    SpsaSpec { name: "knight_mobility_eg", min: 0.0, max: 12.0, step: 1.0 },
+    SpsaSpec { name: "bishop_mobility_mg", min: 0.0, max: 12.0, step: 1.0 },
+    SpsaSpec { name: "bishop_mobility_eg", min: 0.0, max: 12.0, step: 1.0 },
+    SpsaSpec { name: "rook_mobility_mg", min: 0.0, max: 12.0, step: 1.0 },
+    SpsaSpec { name: "rook_mobility_eg", min: 0.0, max: 12.0, step: 1.0 },
+    SpsaSpec { name: "queen_mobility_mg", min: 0.0, max: 12.0, step: 1.0 },
+    SpsaSpec { name: "queen_mobility_eg", min: 0.0, max: 12.0, step: 1.0 },
+    SpsaSpec { name: "bishop_pair", min: 0.0, max: 80.0, step: 6.0 },
+    SpsaSpec { name: "passed_pawn_base", min: 0.0, max: 60.0, step: 6.0 },
+];
+
+/// Projects an [`EvalParams`] onto the fixed 18-wide eval SPSA vector, in the
+/// order documented on [`EVAL_SPSA_SPECS`].
+pub fn eval_params_to_vector(params: &EvalParams) -> [f64; EVAL_DIMENSIONS] {
+    [
+        params.knight.middlegame as f64,
+        params.knight.endgame as f64,
+        params.bishop.middlegame as f64,
+        params.bishop.endgame as f64,
+        params.rook.middlegame as f64,
+        params.rook.endgame as f64,
+        params.queen.middlegame as f64,
+        params.queen.endgame as f64,
+        params.knight_mobility.middlegame as f64,
+        params.knight_mobility.endgame as f64,
+        params.bishop_mobility.middlegame as f64,
+        params.bishop_mobility.endgame as f64,
+        params.rook_mobility.middlegame as f64,
+        params.rook_mobility.endgame as f64,
+        params.queen_mobility.middlegame as f64,
+        params.queen_mobility.endgame as f64,
+        params.bishop_pair as f64,
+        params.passed_pawn_base as f64,
+    ]
+}
+
+/// Reconstructs an [`EvalParams`] from the 18-wide eval SPSA vector, clamping
+/// each slot to its [`EVAL_SPSA_SPECS`] bounds and rounding to `i32`.
+pub fn vector_to_eval_params(vector: &[f64; EVAL_DIMENSIONS]) -> EvalParams {
+    let clamped = clamp_vector(vector, &EVAL_SPSA_SPECS);
+    let at = |index: usize| clamped[index].round() as i32;
+    EvalParams {
+        knight: TaperedScore::new(at(0), at(1)),
+        bishop: TaperedScore::new(at(2), at(3)),
+        rook: TaperedScore::new(at(4), at(5)),
+        queen: TaperedScore::new(at(6), at(7)),
+        knight_mobility: TaperedScore::new(at(8), at(9)),
+        bishop_mobility: TaperedScore::new(at(10), at(11)),
+        rook_mobility: TaperedScore::new(at(12), at(13)),
+        queen_mobility: TaperedScore::new(at(14), at(15)),
+        bishop_pair: at(16),
+        passed_pawn_base: at(17),
+    }
+}
+
+/// Narrows a generalized SPSA vector back to the fixed-width eval array so it
+/// can feed [`vector_to_eval_params`].
+pub fn to_eval_array(v: &[f64]) -> [f64; EVAL_DIMENSIONS] {
+    v.try_into().expect("len")
+}
+
+/// Serializes an [`EvalParams`] to the one-line TSV the `eval-gate-file` /
+/// `spsa-eval` commands interchange: the 18 vector values, tab-separated, in the
+/// [`EVAL_SPSA_SPECS`] order.
+pub fn eval_params_to_tsv(params: &EvalParams) -> String {
+    eval_params_to_vector(params)
+        .iter()
+        .map(|value| format!("{value:.0}"))
+        .collect::<Vec<_>>()
+        .join("\t")
+}
+
+/// Parses the [`eval_params_to_tsv`] one-line TSV back into an [`EvalParams`].
+/// Accepts tab- or whitespace-separated values; requires exactly
+/// [`EVAL_DIMENSIONS`] of them.
+pub fn eval_params_from_tsv(contents: &str) -> Result<EvalParams, String> {
+    let values: Vec<f64> = contents
+        .split_whitespace()
+        .map(|token| {
+            token
+                .parse::<f64>()
+                .map_err(|error| format!("invalid eval TSV value `{token}`: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.len() != EVAL_DIMENSIONS {
+        return Err(format!(
+            "eval TSV must have {EVAL_DIMENSIONS} values, found {}",
+            values.len()
+        ));
+    }
+    Ok(vector_to_eval_params(&to_eval_array(&values)))
+}
+
 fn clamp_vector(vector: &[f64], specs: &[SpsaSpec]) -> Vec<f64> {
     vector
         .iter()
@@ -1051,8 +1233,15 @@ pub fn run_spsa_campaign(
         let mut score = MatchScore::default();
         for fen in positions {
             for candidate_color in [Color::White, Color::Black] {
-                let record =
-                    play_parameter_game(fen, candidate_color, plus, minus, config.match_config)?;
+                let record = play_parameter_game(
+                    fen,
+                    candidate_color,
+                    plus,
+                    EvalParams::default(),
+                    minus,
+                    EvalParams::default(),
+                    config.match_config,
+                )?;
                 match record.outcome {
                     GameOutcome::Win => score.wins += 1,
                     GameOutcome::Draw => score.draws += 1,
@@ -1107,16 +1296,17 @@ pub fn spsa_tsv_report(report: &SpsaReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TACTICAL_SUITE, ExternalMatchConfig, MatchScore, SPSA_DIMENSIONS, SPSA_SPECS,
-        SpsaConfig, SpsaRng, classify_bestmove_token, external_match_game_count,
+        DEFAULT_TACTICAL_SUITE, EVAL_DIMENSIONS, EVAL_SPSA_SPECS, ExternalMatchConfig, MatchScore,
+        SPSA_DIMENSIONS, SPSA_SPECS, SpsaConfig, SpsaRng, classify_bestmove_token,
+        eval_params_from_tsv, eval_params_to_tsv, eval_params_to_vector, external_match_game_count,
         external_tsv_report, measure_throughput,
         run_spsa_campaign, run_tactical_suite, search_params_to_vector, spsa_tsv_report,
         spsa_update, sprt, tactical_solve_rate, tactical_tsv_report, throughput_tsv_report,
-        vector_to_search_params, MatchConfig, SprtConfig, SprtDecision, random_opening_fens,
-        run_mobility_gate, run_nnue_gauntlet, run_nnue_gauntlet_with_move_time, sprt_tsv_report,
-        summarize,
+        vector_to_eval_params, vector_to_search_params, MatchConfig, SprtConfig, SprtDecision,
+        random_opening_fens, run_eval_gate_fens, run_mobility_gate, run_nnue_gauntlet,
+        run_nnue_gauntlet_with_move_time, sprt_tsv_report, summarize,
     };
-    use engine_search::{Nnue, SearchParams};
+    use engine_search::{EvalParams, Nnue, SearchParams, TaperedScore};
     use std::{sync::Arc, time::Duration};
 
     #[test]
@@ -1149,6 +1339,108 @@ mod tests {
         assert_eq!(records.len(), 4); // 2 openings x 2 colors
         let report = sprt_tsv_report(summarize(&records), SprtConfig::default());
         assert!(report.contains("decision"));
+    }
+
+    #[test]
+    fn eval_vector_round_trips_default_params() {
+        let params = EvalParams::default();
+        let restored = vector_to_eval_params(&eval_params_to_vector(&params));
+        assert_eq!(restored, params);
+        // The vector width is pinned to the spec table so they cannot drift.
+        assert_eq!(eval_params_to_vector(&params).len(), EVAL_DIMENSIONS);
+        assert_eq!(EVAL_SPSA_SPECS.len(), EVAL_DIMENSIONS);
+    }
+
+    #[test]
+    fn eval_vector_projection_uses_the_documented_order() {
+        // Distinct values in every slot pin the fixed order (queen mg/eg is
+        // slots 6/7, bishop_pair is 16, passed_pawn_base is 17).
+        let params = EvalParams {
+            knight: TaperedScore::new(300, 310),
+            bishop: TaperedScore::new(320, 330),
+            rook: TaperedScore::new(490, 500),
+            queen: TaperedScore::new(880, 900),
+            knight_mobility: TaperedScore::new(3, 4),
+            bishop_mobility: TaperedScore::new(2, 3),
+            rook_mobility: TaperedScore::new(1, 5),
+            queen_mobility: TaperedScore::new(0, 2),
+            bishop_pair: 40,
+            passed_pawn_base: 24,
+        };
+        let vector = eval_params_to_vector(&params);
+        let expected = [
+            300.0, 310.0, 320.0, 330.0, 490.0, 500.0, 880.0, 900.0, 3.0, 4.0, 2.0, 3.0, 1.0, 5.0,
+            0.0, 2.0, 40.0, 24.0,
+        ];
+        assert_eq!(vector, expected);
+        assert_eq!(vector_to_eval_params(&vector), params);
+    }
+
+    #[test]
+    fn vector_to_eval_params_clamps_out_of_range() {
+        // Wildly out-of-range in both directions; every slot must land on its
+        // spec bound.
+        let mut low = [0.0_f64; EVAL_DIMENSIONS];
+        let mut high = [0.0_f64; EVAL_DIMENSIONS];
+        for index in 0..EVAL_DIMENSIONS {
+            low[index] = EVAL_SPSA_SPECS[index].min - 1000.0;
+            high[index] = EVAL_SPSA_SPECS[index].max + 1000.0;
+        }
+        let low_params = eval_params_to_vector(&vector_to_eval_params(&low));
+        let high_params = eval_params_to_vector(&vector_to_eval_params(&high));
+        for index in 0..EVAL_DIMENSIONS {
+            assert_eq!(low_params[index], EVAL_SPSA_SPECS[index].min);
+            assert_eq!(high_params[index], EVAL_SPSA_SPECS[index].max);
+        }
+    }
+
+    #[test]
+    fn eval_tsv_round_trips_and_rejects_wrong_arity() {
+        let params = EvalParams::default();
+        let tsv = eval_params_to_tsv(&params);
+        assert_eq!(tsv.split('\t').count(), EVAL_DIMENSIONS);
+        assert_eq!(eval_params_from_tsv(&tsv).unwrap(), params);
+        assert!(eval_params_from_tsv("1\t2\t3").is_err());
+    }
+
+    #[test]
+    fn eval_gate_default_vs_default_is_well_formed() {
+        let fens = random_opening_fens(2, 8, 0xE7A1);
+        let records = run_eval_gate_fens(
+            &fens,
+            EvalParams::default(),
+            EvalParams::default(),
+            Duration::from_millis(5),
+            10,
+        )
+        .expect("eval gate runs");
+        assert_eq!(records.len(), 4); // 2 openings x 2 colors
+        let report = sprt_tsv_report(summarize(&records), SprtConfig::default());
+        assert!(report.contains("decision"));
+    }
+
+    #[test]
+    fn eval_gate_penalizes_a_lopsidedly_bad_candidate() {
+        // A candidate that values its queen at 200 (vs the real ~900) will hang
+        // or trade its queen for scraps and lose against the default eval.
+        let crippled = EvalParams {
+            queen: TaperedScore::equal(200),
+            ..EvalParams::default()
+        };
+        let fens = random_opening_fens(6, 8, 0x10517);
+        let records = run_eval_gate_fens(
+            &fens,
+            crippled,
+            EvalParams::default(),
+            Duration::from_millis(20),
+            60,
+        )
+        .expect("eval gate runs");
+        let score = summarize(&records);
+        assert!(
+            score.losses > score.wins,
+            "crippled queen-value candidate should lose the gate: {score:?}"
+        );
     }
 
     #[test]
