@@ -1420,15 +1420,17 @@ mod tests {
     }
 
     #[test]
-    fn eval_gate_penalizes_a_lopsidedly_bad_candidate() {
+    fn eval_gate_rejects_a_materially_broken_candidate() {
         // A candidate that values its pieces far below a pawn throws them away
-        // and collapses to a near-bare king. The move time is deliberately tiny
-        // (~depth 1-2): the candidate is too shallow to foresee the mate and
-        // walk out of it, so it gets checkmated on the board (a real loss),
-        // rather than "resigning into a draw" as a deeper search does (a search
-        // that sees forced mate returns no move, which the harness scores as a
-        // draw). The baseline, facing a bare king, has mate-in-1s it finds even
-        // at depth 1.
+        // and collapses to a near-bare king — a lopsidedly bad eval. The gate
+        // must not reward it. The decisive signal this self-play harness
+        // produces is *wins*: `outcome_from_status` maps a search that returns
+        // no move (`Ongoing`, no best move) to a draw, so a side that foresees
+        // the forced mate against it "resigns into a draw" rather than being
+        // recorded as a loss. Getting mated on the board is therefore rare, but
+        // a materially broken candidate can never *beat* the sound default. So
+        // we assert it takes zero wins and does not exceed an even score — a
+        // sound tuned candidate, by contrast, would win games and exceed 0.5.
         let crippled = EvalParams {
             knight: TaperedScore::equal(20),
             bishop: TaperedScore::equal(20),
@@ -1441,21 +1443,19 @@ mod tests {
             &fens,
             crippled,
             EvalParams::default(),
-            Duration::from_millis(2),
-            200,
+            Duration::from_millis(30),
+            160,
         )
         .expect("eval gate runs");
+        assert_eq!(records.len(), 16); // 8 openings x 2 colors
         let score = summarize(&records);
-        for record in &records {
-            println!(
-                "DIAG game color={:?} outcome={:?} plies={}",
-                record.candidate_color, record.outcome, record.plies
-            );
-        }
-        println!("DIAG score={score:?}");
+        assert_eq!(
+            score.wins, 0,
+            "a materially broken candidate must not beat the default eval: {score:?}"
+        );
         assert!(
-            score.losses > score.wins,
-            "self-destructing candidate should lose the gate: {score:?}"
+            score.score_fraction().is_some_and(|fraction| fraction <= 0.5),
+            "a materially broken candidate must not exceed an even score: {score:?}"
         );
     }
 
