@@ -1427,13 +1427,15 @@ mod tests {
             queen: TaperedScore::equal(200),
             ..EvalParams::default()
         };
-        let fens = random_opening_fens(6, 8, 0x10517);
+        let fens = random_opening_fens(4, 8, 0x10517);
+        // Enough movetime and plies for the queen-down side to actually be
+        // converted into a lost game before the ply cap (a capped game draws).
         let records = run_eval_gate_fens(
             &fens,
             crippled,
             EvalParams::default(),
-            Duration::from_millis(20),
-            60,
+            Duration::from_millis(30),
+            200,
         )
         .expect("eval gate runs");
         let score = summarize(&records);
