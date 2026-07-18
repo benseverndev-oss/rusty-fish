@@ -14,14 +14,27 @@ weights, and the hypothesis is that calibration, not the idea, was the problem.
 
 ## Making eval weights tunable: `EvalParams`
 
-The weights to tune move out of hardcoded constants in `engine-search` into an
-`EvalParams` struct, threaded into `evaluate_position` the same way
-`mobility_scale` already is (the searcher owns it and passes it in; the public
-`hand_crafted_evaluation` uses the default). `EvalParams::default()` reproduces
+An `EvalParams` struct already exists in `engine-search` (a private const holding
+only the five piece values). This design **extends it** — adds the tunable
+mobility weights, bishop pair, and passed-pawn base, tapers the piece values into
+middlegame/endgame pairs — and makes it a searcher-held, settable value threaded
+into `evaluate_position` (which today takes `(board, mobility_scale)`). The
+searcher owns an `EvalParams`, passes it into `evaluate_position`; the public
+`hand_crafted_evaluation` uses the default. `EvalParams::default()` reproduces
 today's exact values, so a default build's evaluation is **byte-identical** and
 nothing ships until a gate proves a change. A regression test pins that
 `evaluate_position` with default `EvalParams` equals today's output on a corpus
 of positions.
+
+Threading is more invasive than `mobility_scale` (a single scalar). The values
+being made tunable are read today by several free functions and inline literals
+that must be rewired to take `&EvalParams`: `tapered_piece_value` /
+`EVAL_PARAMS` (piece values), the hardcoded match arms in `mobility_score`, the
+inline `TaperedScore::equal(35)` bishop-pair adds, and the passed-pawn base `20`
+inside `pawn_structure_bonus`. That passed-pawn `20` is entangled with an
+`advancement * 10` term and shares the function with unrelated `20` literals
+(isolated-pawn, open-file) that must **not** be swept into the tunable weight —
+only the passed-pawn base becomes a parameter.
 
 The first tunable set is deliberately small (~18 weights); larger sets tune
 noisier under SPSA. Each weight has a lower/upper bound and an SPSA step:
@@ -44,52 +57,59 @@ today's shipped default.
 
 ## Extending SPSA to an eval vector
 
-The tuner already optimizes a fixed-size `[f64; N]` vector with a per-dimension
-`SpsaSpec` (name, min, max, step), projecting to and from `SearchParams`. This
-design adds an analogous eval vector: `eval_params_to_vector` /
-`vector_to_eval_params` over `EvalParams`, and an `EVAL_SPSA_SPECS` table with
-one spec per tunable weight. The existing `spsa_update`, `SpsaRng` (deterministic
-Rademacher directions), and clamping are reused unchanged — they operate on a
-vector and a specs table, so they generalize.
+The tuner today optimizes a fixed-size `[f64; SPSA_DIMENSIONS]` (=8) vector, but
+its primitives — `spsa_update`, `clamp_vector`, `perturb`, and
+`SpsaRng::direction` — are **hardcoded to that size and read the global
+`SPSA_SPECS` const directly**. They cannot take an ~18-weight eval vector as-is.
+The core Rust refactor of this effort is therefore to **generalize those
+primitives** to be size-agnostic (a slice, or const-generic `[f64; N]`) and to
+take a `&[SpsaSpec]` argument instead of reading the global. Once generalized,
+the same primitives serve both the existing 8-dim search vector (passing
+`&SPSA_SPECS`) and the new eval vector (passing a new `EVAL_SPSA_SPECS`). This is
+a mechanical but real refactor and a regression test pins that the search-param
+campaign is unchanged by it.
+
+The design then adds the eval projection: `eval_params_to_vector` /
+`vector_to_eval_params` over `EvalParams`, and an `EVAL_SPSA_SPECS` table with one
+spec (name, min, max, step) per tunable weight.
 
 This run tunes **eval only**. Search-parameter tuning is a separate, existing
-concern and stays off here so the eval signal is not confounded by search-param
-perturbation. The two tuners share the same `spsa_update`/RNG code but run over
-different vectors and specs.
+concern and stays off here so the eval signal is not confounded. The two tuners
+share the generalized primitives but run over different vectors and specs.
 
-The per-side plumbing mirrors mobility: `play_parameter_game` already sets
-`SearchParams` per side; the tuning campaign additionally sets `EvalParams` per
-side (the searcher gains a settable `EvalParams`, defaulting to today's values,
-passed into `evaluate_position`).
+The per-side plumbing mirrors mobility: `play_parameter_game` and the gate's
+`play_mobility_game` currently take only `SearchParams` per side; they gain a
+per-side `EvalParams` (via a `Searcher::set_eval_params`), so a match can pit two
+eval configurations. During tuning, both perturbed sides also run with mobility
+enabled (`mobility_scale = 100`) so the mobility weights are exercised.
 
 ## Running the campaign on Modal
 
-SPSA is sequential across iterations — each gradient step needs the previous
-iteration's match result — but each iteration's `theta+` vs `theta-` match is
-embarrassingly parallel, exactly like the gate. A single sequential container is
-too slow: the game volume SPSA needs (dozens of iterations, hundreds of games
-each) would run for hours, the same single-machine wall the gate hit. So the
-campaign fans each iteration's match across containers.
+To keep all the SPSA math in one place (Rust) and avoid a second, drift-prone
+Python implementation of the RNG/perturb/step, the **entire SPSA loop stays in
+Rust** — the generalized `run_spsa_campaign`, extended to tune `EvalParams`.
+Modal's role is simply to run that Rust campaign in a container with a generous
+timeout, exactly as the NNUE `train_net` function runs the trainer in one
+container. This escapes GitHub Actions' 60-minute wall (Modal timeouts are hours)
+without splitting the loop across languages.
 
-Concretely, mirroring the existing Modal gate:
+The tradeoff, stated plainly: within that one container the per-iteration matches
+are **sequential**, not fanned across containers, so campaign size is bounded by
+the container's wall time. The first campaign is sized to fit (for example ~40
+iterations of a modest per-iteration match, a couple of hours), which is enough
+to propose candidate weights. This is acceptable because the campaign only
+*proposes* — the definitive verdict comes from the powered, parallel gate below.
+Fanning each iteration's match across containers for a larger campaign is a real
+future optimization (it would require moving the loop into a Python driver that
+calls thin Rust step commands, or an RPC), and is deliberately **out of scope for
+this first slice**.
 
-- A `spsa-match-file` engine-bench command plays one shard of a `theta+` vs
-  `theta-` match: it reads a shard of openings and both parameter vectors (as
-  values or a small file), plays them color-swapped, and emits `W\tD\tL`. This
-  is the SPSA analog of `mobility-gate-file`.
-- A Modal `spsa_tune` entrypoint runs the sequential SPSA loop *locally in the
-  driver* (cheap: RNG, perturb, gradient, step), but for each iteration fans the
-  perturbed match across `spsa_match_shard` containers, sums the score, and steps
-  `theta`. It prints the tuned `EvalParams` and the per-iteration trace.
-
-Iterations are sequential and each waits on its parallel match, so wall time is
-`iterations * (one parallel match)`. With a parallel match at gate-like speed
-(~1 minute) and ~30 iterations, a campaign is ~30 minutes — feasible, and far
-beyond what one runner could do.
-
-The campaign is launched the same way as the gate: `infisical run --env dev --
-uv run --with modal -- modal run modal/app.py::spsa_tune` (Infisical supplies the
-Modal token; `PYTHONUTF8=1` on Windows).
+A Modal `spsa_tune` entrypoint (in `modal/app.py`) invokes a new
+`engine-bench spsa-eval` command inside the container — it runs the campaign over
+a generated opening set and prints the tuned `EvalParams` plus the per-iteration
+trace. Launched the same way as the gate: `infisical run --env dev -- uv run
+--with modal -- modal run modal/app.py::spsa_tune` (Infisical supplies the Modal
+token; `PYTHONUTF8=1` on Windows).
 
 ## Gating and shipping
 
@@ -111,12 +131,16 @@ Nothing about the shipped engine changes until that explicit, gated flip.
 
 - A regression test pins that default `EvalParams` reproduces today's evaluation
   byte-for-byte on a position corpus (the guarantee that tuning is inert until a
-  flip).
+  flip), plus a unit test that `EvalParams::default()` matches the current
+  hand-set eval constants (the analog of `default_search_params_match...`).
 - Unit tests for `eval_params_to_vector` / `vector_to_eval_params` round-tripping
   the default, and that out-of-range weights clamp to bounds.
-- A unit test that `EvalParams::default()` matches the current hand-set eval
-  constants (the analog of the existing `default_search_params_match...` test).
-- A small self-play smoke test that `spsa-match-file` runs and emits `W\tD\tL`.
+- A regression test that the generalized SPSA primitives leave the existing
+  search-param campaign unchanged (same tuned output for a fixed seed as before
+  the refactor).
+- A short in-process `spsa-eval` smoke test (a couple of iterations over a few
+  positions) that returns in-bounds `EvalParams`, and an `eval-gate-file` smoke
+  test that emits `W\tD\tL`.
 - The Modal SPSA campaign and the eval gate are validated by running them
   end-to-end on Modal (a short campaign first, then the real one), the same way
   the mobility gate was.
