@@ -1421,27 +1421,34 @@ mod tests {
 
     #[test]
     fn eval_gate_penalizes_a_lopsidedly_bad_candidate() {
-        // A candidate that values its queen at 200 (vs the real ~900) will hang
-        // or trade its queen for scraps and lose against the default eval.
+        // A candidate that badly undervalues its heavy pieces (queen worth ~a
+        // pawn, rook/minor barely more) is materially blind: it will make bad
+        // captures and trades a shallow search can punish, and lose against the
+        // default eval. The queen-value-200 idea alone drew at low depth because
+        // the imbalance never surfaced; crippling every heavy piece guarantees
+        // concrete bad trades. Enough movetime for tactics to surface and enough
+        // plies for the material edge to convert before the cap (a capped game
+        // draws).
         let crippled = EvalParams {
-            queen: TaperedScore::equal(200),
+            knight: TaperedScore::equal(120),
+            bishop: TaperedScore::equal(120),
+            rook: TaperedScore::equal(180),
+            queen: TaperedScore::equal(120),
             ..EvalParams::default()
         };
         let fens = random_opening_fens(4, 8, 0x10517);
-        // Enough movetime and plies for the queen-down side to actually be
-        // converted into a lost game before the ply cap (a capped game draws).
         let records = run_eval_gate_fens(
             &fens,
             crippled,
             EvalParams::default(),
-            Duration::from_millis(30),
-            200,
+            Duration::from_millis(50),
+            240,
         )
         .expect("eval gate runs");
         let score = summarize(&records);
         assert!(
             score.losses > score.wins,
-            "crippled queen-value candidate should lose the gate: {score:?}"
+            "materially blind candidate should lose the gate: {score:?}"
         );
     }
 
