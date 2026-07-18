@@ -1297,10 +1297,11 @@ pub fn spsa_tsv_report(report: &SpsaReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TACTICAL_SUITE, EVAL_DIMENSIONS, EVAL_SPSA_SPECS, ExternalMatchConfig, MatchScore,
+        DEFAULT_TACTICAL_SUITE, EVAL_DIMENSIONS, EVAL_SPSA_SPECS, EvalSpsaConfig,
+        ExternalMatchConfig, MatchScore,
         SPSA_DIMENSIONS, SPSA_SPECS, SpsaConfig, SpsaRng, classify_bestmove_token,
         eval_params_from_tsv, eval_params_to_tsv, eval_params_to_vector, external_match_game_count,
-        external_tsv_report, measure_throughput,
+        external_tsv_report, measure_throughput, run_eval_spsa_campaign,
         run_spsa_campaign, run_tactical_suite, search_params_to_vector, spsa_tsv_report,
         spsa_update, sprt, tactical_solve_rate, tactical_tsv_report, throughput_tsv_report,
         vector_to_eval_params, vector_to_search_params, MatchConfig, SprtConfig, SprtDecision,
@@ -1610,6 +1611,32 @@ mod tests {
         let tsv = spsa_tsv_report(&report);
         assert!(tsv.starts_with("engine_version\titeration"));
         assert!(tsv.contains("aspiration_window"));
+    }
+
+    #[test]
+    fn eval_spsa_smoke_campaign_returns_in_bounds_parameters() {
+        // Two iterations over one position at a tiny movetime/ply budget: enough
+        // to exercise perturb -> per-side-eval match -> spsa_update and prove the
+        // tuned EvalParams land inside every EVAL_SPSA_SPECS window.
+        let config = EvalSpsaConfig {
+            iterations: 2,
+            learning_rate: 1.0,
+            seed: 7,
+            move_time: Duration::from_millis(5),
+            max_plies: 16,
+        };
+        let report = run_eval_spsa_campaign(
+            &["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"],
+            EvalParams::default(),
+            config,
+        )
+        .expect("eval smoke campaign runs");
+        assert_eq!(report.iterations.len(), 2);
+        let tuned = eval_params_to_vector(&report.tuned);
+        for index in 0..EVAL_DIMENSIONS {
+            assert!(tuned[index] >= EVAL_SPSA_SPECS[index].min, "slot {index} below its min");
+            assert!(tuned[index] <= EVAL_SPSA_SPECS[index].max, "slot {index} above its max");
+        }
     }
 
     #[test]
