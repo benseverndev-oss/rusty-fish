@@ -86,7 +86,10 @@ def make_openings(count: int, plies: int, seed: int) -> str:
     return result.stdout
 
 
-@app.function(image=rust_image)
+# 30-minute timeout: a movetime gate shard plays gate_shard_size*2 games at
+# move_time_ms per move; with a hidden-512 net that can exceed Modal's 300s
+# default (which timed out the first hidden-512 gate).
+@app.function(image=rust_image, timeout=60 * 30)
 def gate_shard(net_bytes: bytes, depth: int, openings_text: str, move_time_ms: int = 0) -> tuple[int, int, int]:
     """Play the NNUE candidate vs the hand-crafted baseline over one opening shard.
 
@@ -473,6 +476,38 @@ def train_wdl(
     net_bytes = train_wdl_run.remote(shard_names, hidden, epochs)
     print(f"trained network: {len(net_bytes)} bytes")
 
+    print(nnue_gate_run.remote(net_bytes, gate_depth, gate_openings, gate_plies,
+                               gate_shard_size, move_time_ms))
+
+
+@app.function(image=rust_image, volumes={"/vol": wdl_volume})
+def read_net() -> bytes:
+    """Read the last-trained /vol/net.rfnn back off the volume."""
+    wdl_volume.reload()
+    with open("/vol/net.rfnn", "rb") as handle:
+        return handle.read()
+
+
+@app.local_entrypoint()
+def gate_net(
+    gate_openings: int = 2048,
+    gate_plies: int = 8,
+    gate_depth: int = 64,
+    gate_shard_size: int = 16,
+    move_time_ms: int = 50,
+):
+    """Gate the LAST-trained net (/vol/net.rfnn) vs the hand-crafted baseline.
+
+    Re-gates an already-trained net without re-labeling or re-training — use
+    after a `train_wdl` run whose gate timed out or to re-measure a saved net.
+    Smaller default gate_shard_size (16) keeps each movetime shard well under the
+    per-container timeout for a slower hidden-512 net.
+
+        modal run modal/app.py::gate_net
+        modal run modal/app.py::gate_net --gate-openings 2048 --move-time-ms 50
+    """
+    net_bytes = read_net.remote()
+    print(f"loaded net: {len(net_bytes)} bytes")
     print(nnue_gate_run.remote(net_bytes, gate_depth, gate_openings, gate_plies,
                                gate_shard_size, move_time_ms))
 
