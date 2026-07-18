@@ -587,6 +587,26 @@ pub fn play_parameter_game(
     })
 }
 
+/// Plays mobility-on (`mobility_scale = 100`) against mobility-off (`= 0`) over
+/// `openings` generated openings, color-swapped, at equal depth for both sides.
+/// Everything but the mobility scale is identical, so the SPRT isolates the term.
+pub fn run_mobility_gate(
+    openings: usize,
+    seed: u64,
+    config: MatchConfig,
+) -> Result<Vec<GameRecord>, String> {
+    let fens = random_opening_fens(openings, 8, seed);
+    let candidate = SearchParams { mobility_scale: 100, ..SearchParams::default() };
+    let baseline = SearchParams::default(); // mobility_scale == 0
+    let mut records = Vec::with_capacity(fens.len() * 2);
+    for fen in &fens {
+        for candidate_color in [Color::White, Color::Black] {
+            records.push(play_parameter_game(fen, candidate_color, candidate, baseline, config)?);
+        }
+    }
+    Ok(records)
+}
+
 fn play_external_game(
     fen: &str,
     candidate_color: Color,
@@ -808,6 +828,7 @@ pub fn vector_to_search_params(vector: &[f64; SPSA_DIMENSIONS]) -> SearchParams 
         late_move_pruning_base: clamped[5].round() as usize,
         late_move_pruning_scale: clamped[6].round() as usize,
         null_move_reduction: clamped[7].round() as u8,
+        mobility_scale: 0,
     }
 }
 
@@ -1005,7 +1026,8 @@ mod tests {
         run_spsa_campaign, run_tactical_suite, search_params_to_vector, spsa_tsv_report,
         spsa_update, sprt, tactical_solve_rate, tactical_tsv_report, throughput_tsv_report,
         vector_to_search_params, MatchConfig, SprtConfig, SprtDecision, random_opening_fens,
-        run_nnue_gauntlet, run_nnue_gauntlet_with_move_time, summarize,
+        run_mobility_gate, run_nnue_gauntlet, run_nnue_gauntlet_with_move_time, sprt_tsv_report,
+        summarize,
     };
     use engine_search::{Nnue, SearchParams};
     use std::{sync::Arc, time::Duration};
@@ -1032,6 +1054,15 @@ mod tests {
         // The walks diverge, so not every opening is identical.
         let unique: std::collections::HashSet<&String> = fens.iter().collect();
         assert!(unique.len() > 1, "openings should vary");
+    }
+
+    #[test]
+    fn mobility_gate_plays_games_and_reports() {
+        let config = MatchConfig { candidate_depth: 2, baseline_depth: 2, max_plies: 20 };
+        let records = run_mobility_gate(2, 0xC0FFEE, config).expect("gate runs");
+        assert_eq!(records.len(), 4); // 2 openings x 2 colors
+        let report = sprt_tsv_report(summarize(&records), SprtConfig::default());
+        assert!(report.contains("decision"));
     }
 
     #[test]

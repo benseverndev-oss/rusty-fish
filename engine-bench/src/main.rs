@@ -3,9 +3,10 @@ use std::{sync::Arc, time::Duration};
 use engine_bench::{
     DEFAULT_TACTICAL_SUITE, ExternalMatchConfig, MatchConfig, MatchScore, SpsaConfig, SprtConfig,
     external_tsv_report, measure_throughput, random_opening_fens, run_external_opponent_match,
-    run_fixed_opponent_match, run_nnue_gauntlet, run_nnue_gauntlet_with_move_time,
+    run_fixed_opponent_match, run_mobility_gate, run_nnue_gauntlet, run_nnue_gauntlet_with_move_time,
     run_spsa_campaign, run_tactical_suite,
     spsa_tsv_report, sprt, sprt_tsv_report, summarize, tactical_tsv_report, throughput_tsv_report,
+    tsv_report,
 };
 use engine_bench::train::{generate_training_samples, train_nnue, TrainConfig};
 use engine_search::{Nnue, SearchParams};
@@ -200,6 +201,15 @@ fn main() -> Result<(), String> {
         )?;
         let score = summarize(&records);
         println!("{}\t{}\t{}", score.wins, score.draws, score.losses);
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("mobility-gate") {
+        let openings = std::env::args().nth(2).and_then(|a| a.parse().ok()).unwrap_or(200);
+        let depth = std::env::args().nth(3).and_then(|a| a.parse().ok()).unwrap_or(6);
+        let config = MatchConfig { candidate_depth: depth, baseline_depth: depth, max_plies: 160 };
+        let records = run_mobility_gate(openings, 0xC0FFEE, config)?;
+        eprint!("{}", tsv_report(&records, config));
+        print!("{}", sprt_tsv_report(summarize(&records), SprtConfig::default()));
         return Ok(());
     }
     if std::env::args().nth(1).as_deref() == Some("sprt") {

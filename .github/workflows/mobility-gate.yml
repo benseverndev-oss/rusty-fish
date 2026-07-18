@@ -1,0 +1,46 @@
+name: Mobility Gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      openings:
+        description: Number of generated openings (games = openings x 2)
+        required: false
+        default: '200'
+      depth:
+        description: Fixed search depth for both sides
+        required: false
+        default: '6'
+
+jobs:
+  mobility-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run the mobility self-play SPRT
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cargo run --release -p engine-bench -- mobility-gate \
+            "${{ inputs.openings }}" "${{ inputs.depth }}" \
+            > artifacts/mobility-sprt.tsv \
+            2> artifacts/mobility-games.tsv
+          echo '=== mobility-sprt.tsv ==='
+          cat artifacts/mobility-sprt.tsv
+          {
+            echo '### Mobility self-play SPRT'
+            echo
+            echo '```'
+            cat artifacts/mobility-sprt.tsv
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobility-gate-tsv
+          path: |
+            artifacts/mobility-sprt.tsv
+            artifacts/mobility-games.tsv

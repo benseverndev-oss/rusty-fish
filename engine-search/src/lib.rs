@@ -103,6 +103,9 @@ pub struct SearchParams {
     pub late_move_pruning_base: usize,
     pub late_move_pruning_scale: usize,
     pub null_move_reduction: u8,
+    /// Scales the mobility evaluation term, 0–100. 0 disables it (and skips its
+    /// cost). Excluded from the SPSA vector; tuned in a later sub-project.
+    pub mobility_scale: i32,
 }
 
 impl Default for SearchParams {
@@ -116,6 +119,7 @@ impl Default for SearchParams {
             late_move_pruning_base: 3,
             late_move_pruning_scale: 2,
             null_move_reduction: 3,
+            mobility_scale: 0,
         }
     }
 }
@@ -1433,7 +1437,7 @@ impl Searcher {
                 // search): fall back to a full refresh.
                 None => nnue.evaluate(board, board.side_to_move),
             },
-            None => evaluate_position(board),
+            None => evaluate_position(board, self.params.mobility_scale),
         }
     }
 
@@ -1982,10 +1986,25 @@ fn nnue_changed_squares(board: &Board, mv: ChessMove) -> ([Square; 4], usize) {
 /// The hand-crafted evaluation of `board` from the side-to-move's perspective,
 /// in centipawns. Exposed as the teacher signal for NNUE training.
 pub fn hand_crafted_evaluation(board: &Board) -> i32 {
-    evaluate_position(board)
+    evaluate_position(board, 0)
 }
 
-fn evaluate_position(board: &Board) -> i32 {
+fn mobility_score(kind: PieceKind, mobility: i32) -> TaperedScore {
+    // Centered by a per-piece offset so an average-mobility piece scores near
+    // zero (material already accounts for having the piece). Hand-set starting
+    // weights; tuned later via SPSA.
+    let (mg, eg, offset) = match kind {
+        PieceKind::Knight => (4, 4, 4),
+        PieceKind::Bishop => (3, 3, 6),
+        PieceKind::Rook => (2, 4, 7),
+        PieceKind::Queen => (1, 2, 13),
+        _ => (0, 0, 0),
+    };
+    let centered = mobility - offset;
+    TaperedScore::new(mg * centered, eg * centered)
+}
+
+fn evaluate_position(board: &Board, mobility_scale: i32) -> i32 {
     let mut features = EvalFeatures::default();
     let mut white_pawn_files = [0u8; 8];
     let mut black_pawn_files = [0u8; 8];
@@ -2003,6 +2022,22 @@ fn evaluate_position(board: &Board) -> i32 {
             tapered_piece_value(piece).add(piece_square_bonus(piece, idx)),
             endgame_phase,
         );
+
+        if mobility_scale != 0
+            && matches!(
+                piece.kind,
+                PieceKind::Knight | PieceKind::Bishop | PieceKind::Rook | PieceKind::Queen
+            )
+        {
+            let mobility =
+                (board.attacks(square, piece) & !board.occupancy(piece.color)).count_ones() as i32;
+            let raw = mobility_score(piece.kind, mobility);
+            let scaled = TaperedScore::new(
+                raw.middlegame * mobility_scale / 100,
+                raw.endgame * mobility_scale / 100,
+            );
+            features.add(piece.color, scaled, endgame_phase);
+        }
 
         if piece.kind == PieceKind::Pawn {
             match piece.color {
@@ -2773,6 +2808,7 @@ mod tests {
         assert_eq!(reverse_futility_margin(&params, 1), 190);
         assert_eq!(late_move_pruning_limit(&params, 3), 9);
         assert_eq!(params.null_move_reduction, 3);
+        assert_eq!(params.mobility_scale, 0);
     }
 
     #[test]
@@ -2864,8 +2900,8 @@ mod tests {
     fn evaluation_prefers_passed_pawn_and_bishop_pair() {
         let white_edge = Board::from_fen("4k3/8/8/3P4/8/8/4BB2/4K3 w - - 0 1").unwrap();
         let black_edge = Board::from_fen("4k3/4bb2/8/8/3p4/8/8/4K3 b - - 0 1").unwrap();
-        assert!(evaluate_position(&white_edge) > 0);
-        assert!(evaluate_position(&black_edge) > 0);
+        assert!(evaluate_position(&white_edge, 0) > 0);
+        assert!(evaluate_position(&black_edge, 0) > 0);
     }
 
     #[test]
@@ -2899,13 +2935,23 @@ mod tests {
     fn endgame_evaluation_rewards_an_active_king() {
         let active = Board::from_fen("4k3/8/8/8/4K3/8/4P3/8 w - - 0 1").unwrap();
         let passive = Board::from_fen("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1").unwrap();
-        assert!(evaluate_position(&active) > evaluate_position(&passive));
+        assert!(evaluate_position(&active, 0) > evaluate_position(&passive, 0));
+    }
+
+    #[test]
+    fn mobility_scale_rewards_the_more_active_side() {
+        // White knight on d4 (8 targets), black knight on a8 (2 targets).
+        let board = Board::from_fen("n6k/8/8/8/3N4/8/8/7K w - - 0 1").unwrap();
+        let off = evaluate_position(&board, 0);
+        let on = evaluate_position(&board, 100);
+        // White is to move, so a positive mobility difference raises the score.
+        assert!(on > off, "mobility should favor the side with the more active knight: on={on} off={off}");
     }
 
     #[test]
     fn king_safety_handles_a_king_on_the_board_edge() {
         let board = Board::from_fen("6K1/8/8/8/8/8/8/4k3 w - - 0 1").unwrap();
-        let _ = evaluate_position(&board);
+        let _ = evaluate_position(&board, 0);
     }
 
     #[test]
@@ -2939,8 +2985,8 @@ mod tests {
     fn mirrored_position_keeps_side_to_move_perspective() {
         let white = Board::from_fen("4k3/8/8/8/8/8/4Q3/4K3 w - - 0 1").unwrap();
         let black = Board::from_fen("4k3/4q3/8/8/8/8/8/4K3 b - - 0 1").unwrap();
-        assert!(evaluate_position(&white) > 0);
-        assert!(evaluate_position(&black) > 0);
+        assert!(evaluate_position(&white, 0) > 0);
+        assert!(evaluate_position(&black, 0) > 0);
         assert_eq!(white.side_to_move, Color::White);
     }
 

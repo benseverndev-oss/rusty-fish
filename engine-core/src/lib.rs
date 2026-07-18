@@ -503,6 +503,23 @@ impl Board {
             .fold(0, |occupancy, pieces| occupancy | pieces)
     }
 
+    /// The pseudo-legal squares `piece` attacks from `square`, given the current
+    /// all-piece occupancy. Sliders stop at the first blocker (the blocker's
+    /// square is included). Defined for knight, bishop, rook, queen, and king;
+    /// pawns are never passed here (mobility does not use pawn attacks) and yield
+    /// an empty set.
+    pub fn attacks(&self, square: Square, piece: Piece) -> Bitboard {
+        let occupied = self.occupancy(Color::White) | self.occupancy(Color::Black);
+        match piece.kind {
+            PieceKind::Knight => knight_attacks(square),
+            PieceKind::Bishop => bishop_attacks(square, occupied),
+            PieceKind::Rook => rook_attacks(square, occupied),
+            PieceKind::Queen => queen_attacks(square, occupied),
+            PieceKind::King => king_attacks(square),
+            PieceKind::Pawn => 0,
+        }
+    }
+
     pub fn set_piece_at(&mut self, square: Square, piece: Option<Piece>) {
         if let Some(previous) = self.squares[square.0 as usize] {
             self.position_hash ^= piece_hash(previous, square);
@@ -1429,6 +1446,24 @@ mod tests {
     fn parse_and_format_move() {
         let mv = ChessMove::from_uci("e7e8q").unwrap();
         assert_eq!(mv.to_uci(), "e7e8q");
+    }
+
+    #[test]
+    fn attacks_reports_pseudo_legal_targets() {
+        use crate::{Color, Piece, PieceKind, Square};
+        let knight = Piece { color: Color::White, kind: PieceKind::Knight };
+        // Central knight on d4 reaches 8 squares; a cornered knight on a1 reaches 2.
+        let central = Board::from_fen("8/8/8/8/3N4/8/8/8 w - - 0 1").unwrap();
+        assert_eq!(central.attacks(Square(27), knight).count_ones(), 8);
+        let corner = Board::from_fen("8/8/8/8/8/8/8/N7 w - - 0 1").unwrap();
+        assert_eq!(corner.attacks(Square(0), knight).count_ones(), 2);
+        // A rook's slide stops at the first blocker (own pawn on d6 blocks past it).
+        let rook = Piece { color: Color::White, kind: PieceKind::Rook };
+        let blocked = Board::from_fen("8/8/3P4/8/8/8/8/3R4 w - - 0 1").unwrap();
+        let up_file = blocked.attacks(Square(3), rook); // rook on d1
+        assert!(up_file & (1 << 19) != 0, "attacks d3");   // d3 reachable
+        assert!(up_file & (1 << 43) != 0, "attacks d6");   // d6 (the blocker) reachable
+        assert!(up_file & (1 << 51) == 0, "stops at d6");  // d7 not reachable
     }
 
     #[test]
