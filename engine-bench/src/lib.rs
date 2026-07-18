@@ -657,13 +657,25 @@ pub fn run_mobility_gate(
     max_plies: u32,
 ) -> Result<Vec<GameRecord>, String> {
     let fens = random_opening_fens(openings, 8, seed);
+    run_mobility_gate_fens(&fens, move_time, max_plies)
+}
+
+/// The mobility gate over an explicit set of opening FENs — the shardable core
+/// so a Modal fan-out can play a slice per container. Plays each FEN
+/// color-swapped, mobility-on (`mobility_scale = 100`) against mobility-off, at
+/// the same `move_time` per move, capped at `max_plies`.
+pub fn run_mobility_gate_fens<S: AsRef<str>>(
+    fens: &[S],
+    move_time: Duration,
+    max_plies: u32,
+) -> Result<Vec<GameRecord>, String> {
     let candidate = SearchParams { mobility_scale: 100, ..SearchParams::default() };
     let baseline = SearchParams::default(); // mobility_scale == 0
     let mut records = Vec::with_capacity(fens.len() * 2);
-    for fen in &fens {
+    for fen in fens {
         for candidate_color in [Color::White, Color::Black] {
             records.push(play_mobility_game(
-                fen,
+                fen.as_ref(),
                 candidate_color,
                 candidate,
                 baseline,
