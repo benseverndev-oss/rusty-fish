@@ -147,6 +147,19 @@ def train(
         pred_wp = torch.sigmoid(pred_cp / WDL_SCALE)
         return ((pred_wp - target_wp[idx]) ** 2).mean()
 
+    def mean_loss_batched(idx):
+        # Evaluate a mean loss over `idx` in minibatches. Forwarding a large index
+        # set at once materializes a [len(idx), MAX_FEATURES, hidden] activation
+        # (~12 GB for a ~180k validation set at hidden 512), which OOMs the GPU;
+        # batching keeps the peak at one minibatch.
+        if not idx.numel():
+            return float("nan")
+        total = 0.0
+        for start in range(0, idx.numel(), batch_size):
+            chunk = idx[start:start + batch_size]
+            total += loss_on(chunk).item() * chunk.numel()
+        return total / idx.numel()
+
     for epoch in range(epochs):
         model.train()
         perm = train_idx[torch.randperm(train_idx.numel(), device=device)]
@@ -161,7 +174,7 @@ def train(
         scheduler.step()
         model.eval()
         with torch.no_grad():
-            val = loss_on(val_idx).item() if val_idx.numel() else float("nan")
+            val = mean_loss_batched(val_idx)
         train_mean = total / train_idx.numel() if train_idx.numel() else float("nan")
         print(
             f"epoch {epoch + 1}/{epochs}: train_wdl_loss {train_mean:.6f} "
