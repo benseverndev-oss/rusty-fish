@@ -1271,10 +1271,22 @@ mod tests {
         };
         let pos = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"];
         let report = run_spsa_campaign(&pos, SearchParams::default(), cfg).unwrap();
-        // TEMP: surface the pre-refactor tuned params in the CI failures section,
-        // then bake them into the assert below and remove this panic.
-        panic!("FROZEN_TUNED = {:?}", report.tuned);
-        // assert_eq!(report.tuned, SearchParams { ...frozen from CI... });
+        // Pre-refactor snapshot captured from CI. The generalization of the SPSA
+        // primitives (slices + specs argument) must reproduce these exactly.
+        assert_eq!(
+            report.tuned,
+            SearchParams {
+                aspiration_window: 50,
+                razor_margin_base: 120,
+                razor_margin_scale: 80,
+                reverse_futility_base: 100,
+                reverse_futility_scale: 90,
+                late_move_pruning_base: 3,
+                late_move_pruning_scale: 2,
+                null_move_reduction: 3,
+                mobility_scale: 0,
+            }
+        );
     }
 
     #[test]
