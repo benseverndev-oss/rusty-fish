@@ -1309,8 +1309,13 @@ pub struct EvalSpsaReport {
     pub iterations: Vec<EvalSpsaIterationRecord>,
 }
 
-/// Runs a deterministic eval SPSA campaign over the supplied positions, starting
-/// from `initial`. Mirrors [`run_spsa_campaign`] but tunes the eval vector
+/// Runs an eval SPSA campaign over the supplied positions, starting
+/// from `initial`. The perturbation schedule is deterministic (fixed-seed
+/// [`SpsaRng`] and deterministic openings), but the **match outcomes are not**:
+/// each move is movetime-bounded, so per-move search depth — and thus the tuned
+/// result — varies with CPU speed and load. Do not freeze the tuned output in a
+/// test the way the search campaign's `search_param_spsa_matches_the_frozen_...`
+/// test does; assert only that it stays in-bounds. Mirrors [`run_spsa_campaign`] but tunes the eval vector
 /// (`EVAL_SPSA_SPECS`, [`EVAL_DIMENSIONS`] wide): each iteration perturbs the eval
 /// vector, plays a `theta+` vs `theta-` self-play match across all positions and
 /// both colours, and steps the eval params. **Both sides run mobility-on**
