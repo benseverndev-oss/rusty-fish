@@ -67,21 +67,6 @@ def _load_samples(path: str):
     return owns, opps, targets
 
 
-def _ragged_to_bag(rows):
-    """Flattens ragged index lists into (values, offsets) for nn.EmbeddingBag."""
-    import torch
-
-    offsets = [0]
-    flat = []
-    for row in rows:
-        flat.extend(row)
-        offsets.append(len(flat))
-    return (
-        torch.tensor(flat, dtype=torch.long),
-        torch.tensor(offsets[:-1], dtype=torch.long),
-    )
-
-
 def _pad_rows(rows):
     """Ragged index lists -> a [N, MAX_FEATURES] int32 tensor padded with PAD_INDEX.
 
@@ -177,8 +162,9 @@ def train(
         model.eval()
         with torch.no_grad():
             val = loss_on(val_idx).item() if val_idx.numel() else float("nan")
+        train_mean = total / train_idx.numel() if train_idx.numel() else float("nan")
         print(
-            f"epoch {epoch + 1}/{epochs}: train_wdl_loss {total / train_idx.numel():.6f} "
+            f"epoch {epoch + 1}/{epochs}: train_wdl_loss {train_mean:.6f} "
             f"val_wdl_loss {val:.6f} lr {scheduler.get_last_lr()[0]:.2e}",
             file=sys.stderr,
         )
