@@ -129,7 +129,11 @@ def spsa_tune_run(iterations: int, openings: int, movetime_ms: int) -> str:
         [BIN, "spsa-eval", str(iterations), str(openings), str(movetime_ms)],
         capture_output=True, text=True, check=True,
     )
-    return result.stdout.strip()
+    tuned = result.stdout.strip()
+    # Emit to the (remote) function log so a detached run stays retrievable via
+    # `modal app logs` even if the launching client disconnects.
+    print(f"TUNED_TSV_BEGIN\n{tuned}\nTUNED_TSV_END", flush=True)
+    return tuned
 
 
 @app.function(image=rust_image)
@@ -251,6 +255,16 @@ def eval_gate(
 
         modal run modal/app.py::eval_gate --tuned "$(cat tuned.tsv)"
     """
+    print(eval_gate_run.remote(tuned, gate_openings, gate_plies, movetime_ms, gate_shard_size))
+
+
+@app.function(image=rust_image, timeout=60 * 30)
+def eval_gate_run(
+    tuned: str, gate_openings: int, gate_plies: int, movetime_ms: int, gate_shard_size: int
+) -> str:
+    """Runs the whole eval gate (fan shards, sum, SPRT) inside one remote function
+    and prints the verdict to its log, so a detached run stays retrievable via
+    `modal app logs` even if the launching client disconnects."""
     openings = [line for line in make_openings.remote(gate_openings, gate_plies, 1).splitlines() if line]
     shard_texts = list(_chunks(openings, gate_shard_size))
     results = eval_gate_shard.starmap([(movetime_ms, tuned, text) for text in shard_texts])
@@ -259,5 +273,8 @@ def eval_gate(
         wins += w
         draws += d
         losses += l
-    print(f"eval gate over {len(openings) * 2} games: {wins}W {draws}D {losses}L")
-    print(sprt_verdict.remote(wins, draws, losses))
+    summary = f"eval gate over {len(openings) * 2} games: {wins}W {draws}D {losses}L"
+    verdict = sprt_verdict.remote(wins, draws, losses)
+    out = f"EVAL_GATE_RESULT_BEGIN\n{summary}\n{verdict}\nEVAL_GATE_RESULT_END"
+    print(out, flush=True)
+    return out
