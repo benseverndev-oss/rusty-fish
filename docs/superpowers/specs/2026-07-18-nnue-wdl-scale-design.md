@@ -71,11 +71,18 @@ batching cheap.
 
 **Approach — fixed-width padded index tensors, tokenised once:**
 
-- A chess position has at most 32 pieces, so `active_features` returns at most 32
-  indices per perspective. Pre-tokenise the **entire dataset once** into two
+- Each perspective's active-feature list is a subset of that side's on-board
+  pieces (at most 16 per side), so `active_features` returns **at most 16, always
+  fewer than 32,** indices per perspective. Width 32 is therefore a safe
+  over-provision that no position can overflow — a stated invariant the padded
+  layout's correctness rests on. Pre-tokenise the **entire dataset once** into two
   `[N, 32]` integer tensors (own, opp), padding each row to width 32 with a
-  dedicated **padding index 768** (real feature indices are `0..=767`). Move these
-  tensors, plus the `[N]` target tensor, to the GPU a single time.
+  dedicated **padding index 768** (real feature indices are `0..=767`). Use
+  **int32** for the index tensors (feature indices and N both fit comfortably);
+  int64 would double the footprint for no benefit. At N ~= 9M the two index
+  tensors are ~2.3 GB combined, plus the `[N]` float32 targets (~36 MB), all moved
+  to the GPU once — comfortably within the A10G's 24 GB alongside the embedding
+  weights, activations, and Adam state.
 - The model's transformer becomes an `nn.Embedding(769, hidden)` whose row `768`
   (padding) is **fixed to zero and frozen** (`padding_idx=768`), so padded slots
   contribute nothing to the summed accumulator. The forward for a minibatch of row
@@ -133,12 +140,19 @@ faster trainer:
   hidden 512, and returns the RFNN bytes. Its timeout is raised to accommodate the
   larger dataset (the batched trainer makes this feasible).
 - **Gate:** switch to a **movetime-bounded** gate (as the eval gate uses), not the
-  depth-5 fixed-depth gate the first run used. Fixed-depth self-play produced long
-  games and a ~25-minute gate; movetime bounds each game and brings the 4096-game
-  gate back to ~5 minutes, and is a fairer time-equal comparison. This requires the
-  NNUE gate path (`gate-file` / the gate shard) to accept a movetime budget rather
-  than a fixed depth. `nnue_gate_run` keeps the remote-aggregation +
-  `NNUE_GATE_RESULT` marker pattern for detached retrieval.
+  effectively depth-bound gate the first run used. The first run's `gate_shard`
+  called `gate-file <net> <depth> <openings>` without forwarding a movetime, so it
+  silently fell back to the binary's default and fixed-depth-ish self-play produced
+  long games and a ~25-minute gate; a bound movetime brings the 4096-game gate back
+  to ~5 minutes and is a fairer time-equal comparison. **This is a Modal /
+  orchestration change only, not a Rust change:** `gate-file` already accepts an
+  optional movetime budget as its 5th argument (`gate-file <net> <depth>
+  <openings_file> [move_time_ms]`) and already threads it into the search's limits.
+  The change is to `gate_shard` / `nnue_gate_run` / `train_wdl` — forward an
+  explicit `move_time_ms` and set `depth` high enough that the movetime cap binds
+  first, exactly as the `eval_gate_shard` / `mobility_gate_shard` paths do.
+  `nnue_gate_run` keeps the remote-aggregation + `NNUE_GATE_RESULT` marker pattern
+  for detached retrieval.
 
 ## Adoption
 
@@ -159,11 +173,11 @@ Either way the tracker is updated with the verdict and the reasoning.
 
 ## Verification
 
-- **Rust:** no engine change is required for training, but the movetime gate path
-  needs a Rust change if the gate binary does not already accept a movetime budget
-  for the NNUE-vs-baseline match; that change is covered by a unit test and runs in
-  the `Rusty Fish Tests` GHA workflow (`cargo test --workspace`). Cargo is never
-  run locally.
+- **Rust:** this slice needs **no Rust change**. Training is Python; the labeller
+  is unchanged; and the movetime gate is orchestration-only because `gate-file`
+  already accepts a movetime budget (5th argument). There is therefore no new
+  `cargo test` surface here — the existing `Rusty Fish Tests` workflow still guards
+  the unchanged engine. Cargo is never run locally regardless.
 - **Trainer parity (torch, not CI):** a check that the padded-tensor forward
   produces the same accumulator as the original ragged bag-sum on a few fixed
   samples (padding rows contribute zero), and that a tiny end-to-end train +
