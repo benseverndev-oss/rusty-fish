@@ -32,9 +32,9 @@ that must be rewired to take `&EvalParams`: `tapered_piece_value` /
 `EVAL_PARAMS` (piece values), the hardcoded match arms in `mobility_score`, the
 inline `TaperedScore::equal(35)` bishop-pair adds, and the passed-pawn base `20`
 inside `pawn_structure_bonus`. That passed-pawn `20` is entangled with an
-`advancement * 10` term and shares the function with unrelated `20` literals
-(isolated-pawn, open-file) that must **not** be swept into the tunable weight —
-only the passed-pawn base becomes a parameter.
+`advancement * 10` term (`score += 20 + advancement * 10`), and a separate,
+unrelated `20` literal lives in `rook_file_bonus` (open-file rook bonus). Only
+the passed-pawn base becomes a parameter — do not blanket-replace `20`.
 
 The first tunable set is deliberately small (~18 weights); larger sets tune
 noisier under SPSA. Each weight has a lower/upper bound and an SPSA step:
