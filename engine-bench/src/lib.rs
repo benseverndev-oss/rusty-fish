@@ -1609,15 +1609,27 @@ fn evenly_spaced<T: Clone>(items: &[T], n: usize) -> Vec<T> {
 /// Parses a PGN (whole games) and returns the labelled middlegame WDL samples.
 /// `&[u8]` implements `io::Read`, so the `&str` bytes feed the reader directly.
 pub fn gen_wdl_data_samples(pgn: &str, config: WdlSampleConfig) -> Vec<WdlSample> {
+    gen_wdl_data_samples_from_reader(pgn.as_bytes(), config)
+        .expect("reading an in-memory PGN cannot fail")
+}
+
+/// Streams a PGN from any `io::Read` (a file, or `zstdcat | -` on stdin) and
+/// returns the labelled middlegame WDL samples. This is the entry the CLI uses
+/// so the multi-GB Lichess export is never materialized as one `String`; the
+/// returned `Vec` is bounded by `per_game * games`. Propagates any read error.
+pub fn gen_wdl_data_samples_from_reader<R: std::io::Read>(
+    reader: R,
+    config: WdlSampleConfig,
+) -> Result<Vec<WdlSample>, String> {
     let mut builder = WdlBuilder {
         config,
         stream_index: 0,
         out: Vec::new(),
     };
-    Reader::new(pgn.as_bytes())
+    Reader::new(reader)
         .visit_all_games(&mut builder)
-        .expect("reading an in-memory PGN cannot fail");
-    builder.out
+        .map_err(|error| format!("failed to read PGN: {error}"))?;
+    Ok(builder.out)
 }
 
 #[cfg(test)]
@@ -1633,7 +1645,7 @@ mod tests {
         vector_to_eval_params, vector_to_search_params, MatchConfig, SprtConfig, SprtDecision,
         random_opening_fens, run_eval_gate_fens, run_mobility_gate, run_nnue_gauntlet,
         run_nnue_gauntlet_with_move_time, sprt_tsv_report, summarize,
-        gen_wdl_data_samples, WdlSample, WdlSampleConfig,
+        gen_wdl_data_samples, gen_wdl_data_samples_from_reader, WdlSample, WdlSampleConfig,
     };
     use engine_search::{EvalParams, Nnue, SearchParams, TaperedScore};
     use std::{sync::Arc, time::Duration};
@@ -2211,6 +2223,32 @@ mod tests {
             assert!(!s.own.is_empty() && !s.opp.is_empty());
             assert!(s.own.iter().all(|&i| i < 768) && s.opp.iter().all(|&i| i < 768));
         }
+    }
+
+    #[test]
+    fn gen_wdl_data_reader_matches_str_path() {
+        // The CLI streams the PGN through `gen_wdl_data_samples_from_reader`
+        // (over stdin / a file) to avoid buffering the multi-GB export as one
+        // `String`. That reader path must yield exactly the same samples as the
+        // in-memory `&str` path the tests use.
+        let config = WdlSampleConfig {
+            min_ply: 8,
+            end_trim: 5,
+            per_game: 6,
+            shard: (0, 1),
+        };
+        let via_str: Vec<String> = gen_wdl_data_samples(WDL_MULTI_GAME_FIXTURE, config)
+            .iter()
+            .map(wdl_line)
+            .collect();
+        let via_reader: Vec<String> =
+            gen_wdl_data_samples_from_reader(WDL_MULTI_GAME_FIXTURE.as_bytes(), config)
+                .expect("reader path succeeds")
+                .iter()
+                .map(wdl_line)
+                .collect();
+        assert!(!via_str.is_empty());
+        assert_eq!(via_str, via_reader);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use engine_bench::{
     run_nnue_gauntlet_with_move_time,
     run_spsa_campaign, run_tactical_suite,
     spsa_tsv_report, sprt, sprt_tsv_report, summarize, tactical_tsv_report, throughput_tsv_report,
-    gen_wdl_data_samples, WdlSampleConfig,
+    gen_wdl_data_samples_from_reader, WdlSampleConfig,
 };
 use engine_bench::train::{generate_training_samples, train_nnue, TrainConfig};
 use engine_search::{EvalParams, Nnue, SearchParams};
@@ -346,6 +346,9 @@ fn main() -> Result<(), String> {
                     per_game = value
                         .parse::<usize>()
                         .map_err(|_| format!("invalid --per-game value: {value}"))?;
+                    if per_game == 0 {
+                        return Err("invalid --per-game 0: need N >= 1".to_string());
+                    }
                 }
                 _ => {
                     if source.is_some() {
@@ -357,22 +360,24 @@ fn main() -> Result<(), String> {
         }
         let source = source
             .ok_or_else(|| "usage: gen-wdl-data <pgn_or_-> [--shard i/n] [--per-game N]".to_string())?;
-        let pgn = if source == "-" {
-            let mut buffer = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut buffer)
-                .map_err(|error| format!("failed to read PGN from stdin: {error}"))?;
-            buffer
-        } else {
-            std::fs::read_to_string(&source)
-                .map_err(|error| format!("failed to read PGN {source}: {error}"))?
-        };
         let config = WdlSampleConfig {
             min_ply: 8,
             end_trim: 5,
             per_game,
             shard,
         };
-        for sample in gen_wdl_data_samples(&pgn, config) {
+        // Stream the PGN rather than buffering it: the real Lichess export is
+        // ~16 GB decompressed and is piped via `zstdcat ... | gen-wdl-data -`,
+        // so `read_to_string` would OOM the container. `Reader` is generic over
+        // `io::Read`, and both `StdinLock` and `BufReader<File>` implement it.
+        let samples = if source == "-" {
+            gen_wdl_data_samples_from_reader(std::io::stdin().lock(), config)?
+        } else {
+            let file = std::fs::File::open(&source)
+                .map_err(|error| format!("failed to open PGN {source}: {error}"))?;
+            gen_wdl_data_samples_from_reader(std::io::BufReader::new(file), config)?
+        };
+        for sample in samples {
             println!(
                 "{}\t{}\t{}",
                 sample.target,
