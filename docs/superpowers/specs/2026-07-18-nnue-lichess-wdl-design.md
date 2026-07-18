@@ -27,20 +27,41 @@ infinite). The trainer therefore gains a `--wdl-target` mode: `target_wp =
 clamp(target, 0, 1)` used directly, skipping the centipawn sigmoid. The loss
 (squared error on win-probabilities), the perspective architecture, and the RFNN
 quantisation are otherwise unchanged, so the exported net loads in the Rust
-engine exactly as today.
+engine exactly as today. The flag is threaded as a `train(..., wdl_target=True)`
+**function parameter**, not only an argparse flag, because Modal's `train_net`
+calls the Python `train()` function directly rather than the CLI. It must be
+passed on WDL data: if it were omitted, `sigmoid(1.0/400) ≈ 0.5006` would collapse
+every win/draw/loss target to ~0.5 and train the net on noise silently — so the
+data producer's outcome targets and the trainer's `wdl_target` mode are one
+coupled decision.
 
 ## Data pipeline: `gen-wdl-data`
 
 A new `engine-bench gen-wdl-data` command produces outcome-labelled training
 samples from PGN, emitting the **same TSV format** the trainer already reads
 (`target<TAB>own_feature_csv<TAB>opp_feature_csv`), with `target` set to the
-game outcome and the feature CSVs from `engine_search::nnue::active_features`.
+game outcome and the feature CSVs from `engine_search::nnue::active_features`
+(which is `pub` and already used by `engine-bench`).
 
-It reuses `book-tool`'s existing Lichess PGN machinery (the `pgn-reader` visitor,
-the rated/standard/rating filter, `engine_core::Board`) — this is a new consumer
-of the same parsing, not new parsing. It reads a PGN from a path or `-` (stdin),
-so the pinned Lichess export can be streamed on Modal exactly as the book refresh
-does (`zstdcat export.zst | gen-wdl-data -`).
+This is a **new PGN visitor in engine-bench**, not a reuse of `book-tool`.
+`book-tool` is a binary-only crate: its `pgn-reader` visitor and rated/standard/
+≥2200 filter are private items in `book-tool/src/main.rs`, `engine-bench` does not
+depend on `pgn-reader`, and — decisively — `book-tool`'s visitor only advances the
+`engine_core::Board` for the first sixteen plies, whereas the WDL sampler needs
+the real board state deep into the middlegame. So the plan adds `pgn-reader` as an
+`engine-bench` dependency and writes a purpose-built visitor that (a) applies the
+same tag filter (standard, rated, both ≥ 2200) as book-tool but re-implemented
+here, and (b) keeps the `engine_core::Board` current for the **whole game** so
+positions past ply sixteen can be sampled. It reads a PGN from a path or `-`
+(stdin), so the pinned export streams on Modal as the book refresh does
+(`zstdcat export.zst | gen-wdl-data -`).
+
+For Modal fan-out over the single monolithic export, `gen-wdl-data` takes a
+`--shard i/n` option: container `i` of `n` emits samples only for games whose
+zero-based index satisfies `index % n == i`. Each shard still decompresses and
+scans the whole stream (cheap relative to the search-free feature extraction) but
+labels a disjoint set of games, so the shards concatenate to the full dataset
+with no overlap.
 
 Selection and sampling, chosen to give the net diverse, decisive-signal
 positions rather than correlated or trivial ones:
@@ -82,10 +103,14 @@ Mirrors the existing NNUE train→gate loop in `modal/app.py`, swapping only the
 labeller:
 
 - **Label** from Lichess instead of self-play: download and SHA-verify the pinned
-  export (as the book refresh does), then fan `gen-wdl-data` over shards of it
-  (by game range / seed) across containers, concatenating the sample TSV.
-- **Train** one GPU container (`train_net` with `--wdl-target`, hidden 256),
-  exporting the RFNN bytes.
+  export (as the book refresh does), then fan `gen-wdl-data --shard i/n` across
+  `n` containers. Because the concatenated dataset (~1–2M samples ≈ several
+  hundred MB) is too large to pass as a Python function argument the way the
+  small self-play dataset is, the shards write into a **Modal Volume** (a shared
+  file) that the trainer reads, rather than being `"".join`-ed in the launching
+  client's memory.
+- **Train** one GPU container (`train()` with `wdl_target=True`, hidden 256),
+  reading the dataset from the Volume and exporting the RFNN bytes.
 - **Gate** the net with the existing powered self-play gate: NNUE candidate vs the
   tuned hand-crafted baseline over thousands of parallel games, summed to an SPRT
   verdict — the same rig that gated the eval tune. Launched and retrieved the same
@@ -111,6 +136,9 @@ labels) or HalfKA, not more of the same.
   Black-to-move).
 - A unit test that the sampler is deterministic from its seed and respects the
   opening/endgame skips and the per-game cap.
+- A unit test that `--shard i/n` partitions games disjointly: the union of all `n`
+  shards over a fixture PGN equals the unsharded output, with no game sampled
+  twice.
 - A trainer check (the standalone `python train_nnue.py` path) that `--wdl-target`
   uses the target as the win-probability directly — a couple of samples with
   targets `0.0`/`1.0` drive the prediction toward those, and the exported RFNN
