@@ -134,6 +134,8 @@ fn parse_uci_score_reads_last_cp_and_clamps_mate() {
     // mate -> clamped +/- MATE_CP
     assert_eq!(parse_uci_score_cp("info depth 30 score mate 3 pv"), Some(MATE_CP));
     assert_eq!(parse_uci_score_cp("info depth 30 score mate -2 pv"), Some(-MATE_CP));
+    // bound qualifier follows the value -> value kept, qualifier ignored
+    assert_eq!(parse_uci_score_cp("info depth 20 score cp 37 lowerbound nodes 1"), Some(37));
     // non-score info line -> None (caller keeps the previous score)
     assert_eq!(parse_uci_score_cp("info depth 1 nodes 20"), None);
 }

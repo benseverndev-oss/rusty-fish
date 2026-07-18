@@ -114,12 +114,14 @@ legal positions) are skipped with a count to stderr rather than aborting the sha
 
 Mirrors `train_wdl`, swapping the labeller and the trainer's teacher flag:
 
-- **Stockfish in the image:** a pinned Stockfish binary is baked into `rust_image`
-  as a **build-time layer** (`.run_commands("curl -L -o … && echo '<sha>  …' |
-  sha256sum -c && chmod +x …")`) — not downloaded to the Volume at runtime like the
-  corpus, since it is a build dependency. The pinned release must be an **AVX2**
-  build (the safe floor for Modal's CPUs; a BMI2/AVX-512 build risks `SIGILL`). The
-  binary path is passed to `label-sf`.
+- **Stockfish in the image:** Stockfish is added to `rust_image` via
+  `apt_install("stockfish")` — a build-time image layer at `/usr/games/stockfish`.
+  Debian ships a **baseline x86-64** build, so there is no AVX/BMI2 `SIGILL` risk on
+  Modal's CPUs and no per-microarch tar to extract, which is why apt is the
+  pragmatic choice for this first attempt. The apt version (pinned-ish by the base
+  image digest) is a strong-enough teacher at 100k nodes; a specific
+  SHA-pinned release build is a documented later refinement (out of scope) if exact
+  version reproducibility is needed. The binary path is passed to `label-sf`.
 - **`label_sf_shard(name, i, n, per_game, nodes)`** runs the one-container pipe
   under `bash -c 'set -euo pipefail'`:
   `zstdcat /vol/export-<name>.pgn.zst | engine-bench gen-eval-positions - --shard i/n --per-game <p> | engine-bench label-sf - <nodes> > /vol/sf/samples-<name>-<i>.tsv`,
