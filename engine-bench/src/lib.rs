@@ -1447,6 +1447,13 @@ mod tests {
         )
         .expect("eval gate runs");
         let score = summarize(&records);
+        for record in &records {
+            println!(
+                "DIAG game color={:?} outcome={:?} plies={}",
+                record.candidate_color, record.outcome, record.plies
+            );
+        }
+        println!("DIAG score={score:?}");
         assert!(
             score.losses > score.wins,
             "self-destructing candidate should lose the gate: {score:?}"
