@@ -1271,7 +1271,9 @@ mod tests {
         };
         let pos = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"];
         let report = run_spsa_campaign(&pos, SearchParams::default(), cfg).unwrap();
-        eprintln!("FROZEN_TUNED = {:?}", report.tuned); // TEMP: read from CI, then bake below
+        // TEMP: surface the pre-refactor tuned params in the CI failures section,
+        // then bake them into the assert below and remove this panic.
+        panic!("FROZEN_TUNED = {:?}", report.tuned);
         // assert_eq!(report.tuned, SearchParams { ...frozen from CI... });
     }
 
