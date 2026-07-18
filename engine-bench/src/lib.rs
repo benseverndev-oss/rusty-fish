@@ -1665,7 +1665,10 @@ mod tests {
     fn spsa_vector_round_trips_default_params() {
         let params = SearchParams::default();
         let restored = vector_to_search_params(&search_params_to_vector(&params));
-        assert_eq!(restored, params);
+        // `mobility_scale` is intentionally excluded from the SPSA vector, so it
+        // is not preserved by the round-trip: `vector_to_search_params` always
+        // resets it to 0. Every other (tunable) field must round-trip exactly.
+        assert_eq!(restored, SearchParams { mobility_scale: 0, ..params });
     }
 
     #[test]
