@@ -11,6 +11,11 @@ containers and the training on a GPU:
                   `engine-bench gate-file` per shard in parallel, sum the
                   win/draw/loss counts, and take the SPRT verdict.
 
+There is also a WDL path (`train_wdl`): pull a multi-month Lichess corpus
+(`assets/nnue/wdl-corpus.toml`), use `sha_probe` to pin each month's SHA, then
+`train_wdl` labels the game outcomes into the shared Volume, GPU-trains with the
+WDL loss, and runs a movetime-gated SPRT vs the hand-crafted baseline.
+
 This is scaffolding: it needs your own Modal account/token and cannot be run
 from the agent sandbox. See modal/README.md.
 
@@ -22,18 +27,19 @@ import glob
 import pathlib
 import subprocess
 import tempfile
+import tomllib
 
 import modal
 
 REPO_ROOT = str(pathlib.Path(__file__).resolve().parent.parent)
 BIN = "/repo/target/release/engine-bench"
 
-# Pinned Lichess standard-rated export (matches assets/opening-book/manifest.toml).
-# The WDL pipeline labels game outcomes from this file.
-WDL_EXPORT_URL = (
-    "https://database.lichess.org/standard/lichess_db_standard_rated_2017-01.pgn.zst"
-)
-WDL_EXPORT_SHA256 = "d1236dcd954089aee162c7b0d82f51162f7c912882343d47b77ba5c0e05512f6"
+
+def _load_wdl_corpus() -> list[dict]:
+    """Read the committed WDL corpus manifest (name/url/sha256 per month)."""
+    manifest = pathlib.Path(REPO_ROOT) / "assets" / "nnue" / "wdl-corpus.toml"
+    with open(manifest, "rb") as handle:
+        return tomllib.load(handle)["month"]
 
 # Image A: builds the engine-bench release binary from the repo source.
 rust_image = (
@@ -81,8 +87,13 @@ def make_openings(count: int, plies: int, seed: int) -> str:
 
 
 @app.function(image=rust_image)
-def gate_shard(net_bytes: bytes, depth: int, openings_text: str) -> tuple[int, int, int]:
-    """Play the NNUE candidate vs the hand-crafted baseline over one opening shard."""
+def gate_shard(net_bytes: bytes, depth: int, openings_text: str, move_time_ms: int = 0) -> tuple[int, int, int]:
+    """Play the NNUE candidate vs the hand-crafted baseline over one opening shard.
+
+    `move_time_ms` is forwarded as the optional 5th `gate-file` arg only when
+    truthy, so `move_time_ms=0` preserves the depth-only behavior the `run()`
+    entrypoint relies on.
+    """
     with tempfile.TemporaryDirectory() as directory:
         net_path = f"{directory}/net.rfnn"
         openings_path = f"{directory}/openings.txt"
@@ -90,10 +101,10 @@ def gate_shard(net_bytes: bytes, depth: int, openings_text: str) -> tuple[int, i
             handle.write(net_bytes)
         with open(openings_path, "w", encoding="utf-8") as handle:
             handle.write(openings_text)
-        result = subprocess.run(
-            [BIN, "gate-file", net_path, str(depth), openings_path],
-            capture_output=True, text=True, check=True,
-        )
+        cmd = [BIN, "gate-file", net_path, str(depth), openings_path]
+        if move_time_ms:
+            cmd.append(str(move_time_ms))
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     wins, draws, losses = (int(x) for x in result.stdout.strip().split("\t"))
     return wins, draws, losses
 
@@ -173,51 +184,79 @@ def train_net(data_text: str, hidden: int, epochs: int) -> bytes:
 
 
 @app.function(image=rust_image, volumes={"/vol": wdl_volume}, timeout=60 * 60)
-def prepare_export() -> None:
-    """Download + verify the pinned Lichess export into the shared volume, once.
+def prepare_export(name: str, url: str, sha256: str) -> None:
+    """Download + verify one pinned Lichess month into the shared volume, once.
 
-    Idempotent: if the file is already present (a prior run committed it) this
-    returns early and skips the multi-GB re-download. The SHA-256 check fails the
-    function on any mismatch, so a corrupt/partial download never reaches labeling.
+    Idempotent per month: if `/vol/export-{name}.pgn.zst` is already present this
+    returns early and skips the multi-GB re-download. That early return is safe
+    because a file at the FINAL path is always a fully-downloaded, SHA-verified
+    one: we download to a `.tmp` sibling, verify it, and only then atomically
+    rename it into place — so a truncated leftover from a crashed download can
+    never occupy the final path and be used unverified.
     """
-    export_path = "/vol/export.pgn.zst"
+    export_path = f"/vol/export-{name}.pgn.zst"
     if pathlib.Path(export_path).exists():
-        print(f"export already present at {export_path}, skipping download", flush=True)
+        print(f"{export_path} present, skipping download", flush=True)
         return
-    subprocess.run(["curl", "-L", "-o", export_path, WDL_EXPORT_URL], check=True)
+    tmp_path = f"{export_path}.tmp"
+    subprocess.run(["curl", "-L", "-o", tmp_path, url], check=True)
     # sha256sum --check reads "<hash>  <path>" and exits non-zero on mismatch,
     # which check=True turns into a raised CalledProcessError (function fails).
-    checkfile = f"{WDL_EXPORT_SHA256}  {export_path}\n"
-    subprocess.run(["sha256sum", "--check"], input=checkfile, text=True, check=True)
+    # Verify the TEMP file, then atomically rename — the final path only ever
+    # holds a verified export.
+    subprocess.run(["sha256sum", "--check"], input=f"{sha256}  {tmp_path}\n", text=True, check=True)
+    pathlib.Path(tmp_path).replace(export_path)
     wdl_volume.commit()
     print(f"downloaded + verified {export_path}", flush=True)
 
 
 @app.function(image=rust_image, volumes={"/vol": wdl_volume}, timeout=60 * 60)
-def label_wdl_shard(i: int, n: int, per_game: int) -> int:
-    """One WDL labeling shard: stream the export through gen-wdl-data.
+def label_wdl_shard(name: str, i: int, n: int, per_game: int) -> int:
+    """One WDL labeling shard: stream a month's export through gen-wdl-data.
 
     Runs the pipe under bash with pipefail so a zstdcat failure (e.g. truncated
     export) fails the shard instead of silently yielding an empty TSV.
     """
+    out = f"/vol/samples-{name}-{i}.tsv"
     cmd = (
-        f"set -euo pipefail; zstdcat /vol/export.pgn.zst | "
-        f"{BIN} gen-wdl-data - --shard {i}/{n} --per-game {per_game} > /vol/samples-{i}.tsv"
+        f"set -euo pipefail; zstdcat /vol/export-{name}.pgn.zst | "
+        f"{BIN} gen-wdl-data - --shard {i}/{n} --per-game {per_game} > {out}"
     )
     subprocess.run(["bash", "-c", cmd], check=True)
     wdl_volume.commit()
-    with open(f"/vol/samples-{i}.tsv", "r", encoding="utf-8") as handle:
-        count = sum(1 for line in handle if line.strip())
-    return count
+    with open(out, "r", encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())
 
 
-@app.function(image=torch_image, gpu="A10G", timeout=60 * 60 * 2, volumes={"/vol": wdl_volume})
-def train_wdl_run(hidden: int, epochs: int) -> bytes:
-    """GPU train on the WDL outcome labels (all shards) -> quantised RFNN bytes."""
+@app.function(
+    image=torch_image, gpu="A10G", timeout=60 * 60 * 3, memory=32768, volumes={"/vol": wdl_volume}
+)
+def train_wdl_run(shard_names: list[str], hidden: int, epochs: int) -> bytes:
+    """GPU train on EXACTLY this run's WDL shards -> quantised RFNN bytes.
+
+    `shard_names` is the explicit set of basenames the current run's labelers
+    produced (e.g. "samples-2017-01-0.tsv"). We train on those and only those.
+    """
     import train_nnue
 
     wdl_volume.reload()
-    shard_paths = sorted(glob.glob("/vol/samples-*.tsv"))
+    # The persistent Volume can hold shards from prior runs with a DIFFERENT
+    # month set or shard count, plus v1's one-token shards (samples-0.tsv..) and
+    # a stale /vol/data.tsv. Any of those would silently contaminate training, so
+    # delete every /vol/samples-*.tsv that is NOT one of this run's expected
+    # shards (this removes both v1 one-token names and stale two-token shards).
+    expected = {f"/vol/{n}" for n in shard_names}
+    for stale in glob.glob("/vol/samples-*.tsv"):
+        if stale not in expected:
+            pathlib.Path(stale).unlink(missing_ok=True)
+    stale_data = pathlib.Path("/vol/data.tsv")
+    if stale_data.exists():
+        stale_data.unlink()
+    # Train on exactly the expected shards; a missing one means a labeler didn't
+    # produce it, so fail loudly rather than train on a partial corpus.
+    shard_paths = sorted(expected)
+    for shard_path in shard_paths:
+        assert pathlib.Path(shard_path).exists(), f"expected shard missing: {shard_path}"
     data_path = "/vol/data.tsv"
     with open(data_path, "w", encoding="utf-8") as out:
         for shard_path in shard_paths:
@@ -360,13 +399,17 @@ def nnue_gate_run(
     gate_openings: int,
     gate_plies: int,
     gate_shard_size: int,
+    move_time_ms: int = 0,
 ) -> str:
     """Runs the whole NNUE gate (fan shards, sum, SPRT) inside one remote function
     and prints the verdict to its log, so a detached run stays retrievable via
-    `modal app logs` even if the launching client disconnects."""
+    `modal app logs` even if the launching client disconnects.
+
+    A truthy `move_time_ms` makes the gate movetime-bounded (callers pass a high
+    `gate_depth` so the movetime budget binds first)."""
     openings = [line for line in make_openings.remote(gate_openings, gate_plies, 1).splitlines() if line]
     shard_texts = list(_chunks(openings, gate_shard_size))
-    results = gate_shard.starmap([(net_bytes, gate_depth, text) for text in shard_texts])
+    results = gate_shard.starmap([(net_bytes, gate_depth, text, move_time_ms) for text in shard_texts])
     wins = draws = losses = 0
     for w, d, l in results:
         wins += w
@@ -381,31 +424,76 @@ def nnue_gate_run(
 
 @app.local_entrypoint()
 def train_wdl(
-    label_shards: int = 16,
+    shards_per_month: int = 8,
     per_game: int = 12,
-    hidden: int = 256,
-    epochs: int = 40,
+    hidden: int = 512,
+    epochs: int = 60,
     gate_openings: int = 2048,
     gate_plies: int = 8,
-    gate_depth: int = 5,
+    gate_depth: int = 64,        # high; movetime binds first
     gate_shard_size: int = 32,
+    move_time_ms: int = 50,
+    months: str = "",            # comma-sep subset (e.g. "2017-01,2017-02") for short runs; empty = all
 ):
-    """Train an NNUE on real Lichess game outcomes (WDL), then gate it via SPRT.
+    """Train an NNUE on real Lichess game outcomes (WDL) across many months, then
+    gate it movetime-bounded via SPRT.
 
-    Downloads the pinned Lichess export once into a shared volume, fans out
-    `engine-bench gen-wdl-data` shards to label game outcomes, trains on a GPU
-    with the WDL loss, and runs the parallel SPRT gate vs the hand-crafted
-    baseline.
+    Downloads + verifies each pinned month from `assets/nnue/wdl-corpus.toml` into
+    a shared volume once, fans out `engine-bench gen-wdl-data` labeling over every
+    (month, shard) pair, trains on a GPU with the WDL loss (hidden 512 by default),
+    and runs the parallel movetime SPRT gate vs the hand-crafted baseline.
 
-        modal run modal/app.py::train_wdl --label-shards 2 --per-game 2 --epochs 2 --gate-openings 64
-        modal run modal/app.py::train_wdl --label-shards 16 --per-game 12 --hidden 256 --epochs 40 --gate-openings 2048
+        # short validation (2 months, tiny config — plumbing only):
+        modal run modal/app.py::train_wdl --months 2017-01,2017-02 --shards-per-month 2 --per-game 2 --hidden 64 --epochs 2 --gate-openings 64 --gate-shard-size 16 --move-time-ms 50
+
+        # real run (all six months, hidden 512, powered gate):
+        modal run modal/app.py::train_wdl --shards-per-month 8 --per-game 12 --hidden 512 --epochs 60 --gate-openings 2048 --gate-shard-size 32 --move-time-ms 50
     """
-    prepare_export.remote()
-    counts = label_wdl_shard.starmap([(i, label_shards, per_game) for i in range(label_shards)])
-    total = sum(counts)
-    print(f"labeled {total} WDL samples across {label_shards} shards")
+    corpus = _load_wdl_corpus()
+    if months:
+        wanted = set(months.split(","))
+        corpus = [m for m in corpus if m["name"] in wanted]
+        missing = wanted - {m["name"] for m in corpus}
+        assert not missing, f"unknown months: {sorted(missing)}"
+        assert corpus, "no months selected"
+    for m in corpus:
+        assert m.get("sha256"), f"month {m['name']} has no pinned sha256 — run sha_probe first"
 
-    net_bytes = train_wdl_run.remote(hidden, epochs)
+    # .starmap is lazy; wrap in list() so every export is downloaded + verified
+    # before any labeler runs.
+    list(prepare_export.starmap([(m["name"], m["url"], m["sha256"]) for m in corpus]))
+    label_args = [(m["name"], i, shards_per_month, per_game)
+                  for m in corpus for i in range(shards_per_month)]
+    shard_names = [f"samples-{m['name']}-{i}.tsv"
+                   for m in corpus for i in range(shards_per_month)]
+    counts = label_wdl_shard.starmap(label_args)
+    print(f"labeled {sum(counts)} WDL samples across {len(label_args)} shards "
+          f"({len(corpus)} months x {shards_per_month})")
+
+    net_bytes = train_wdl_run.remote(shard_names, hidden, epochs)
     print(f"trained network: {len(net_bytes)} bytes")
 
-    print(nnue_gate_run.remote(net_bytes, gate_depth, gate_openings, gate_plies, gate_shard_size))
+    print(nnue_gate_run.remote(net_bytes, gate_depth, gate_openings, gate_plies,
+                               gate_shard_size, move_time_ms))
+
+
+@app.function(image=rust_image, timeout=60 * 60)
+def sha_probe_one(name: str, url: str) -> str:
+    """Download one corpus month and print its sha256 (for pinning wdl-corpus.toml)."""
+    path = f"/tmp/{name}.zst"
+    subprocess.run(["curl", "-L", "-o", path, url], check=True)
+    out = subprocess.run(["sha256sum", path], capture_output=True, text=True, check=True)
+    digest = out.stdout.split()[0]
+    print(f"SHA_PROBE {name} {digest}", flush=True)
+    return f"{name} {digest}"
+
+
+@app.local_entrypoint()
+def sha_probe():
+    """Print sha256 for EVERY corpus month so 2017-01 cross-checks its pinned SHA.
+
+        modal run modal/app.py::sha_probe
+    """
+    months = _load_wdl_corpus()
+    for line in sha_probe_one.starmap([(m["name"], m["url"]) for m in months]):
+        print(line)

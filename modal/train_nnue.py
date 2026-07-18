@@ -32,6 +32,9 @@ ACTIVATION_CLIP = 127.0  # clipped-ReLU upper bound
 OUTPUT_SCALE = 64.0      # inference divides the integer output by this
 EVAL_CLAMP = 20000       # inference clamps the centipawn score to +/- this
 WDL_SCALE = 400.0        # centipawns -> win-probability steepness
+MAX_FEATURES = 32        # >= max active features per perspective (<=16 pieces/side)
+PAD_INDEX = INPUT_DIMENSION  # 768: a dedicated padding row, frozen to zero
+VAL_EVERY = 50           # 1-in-50 samples (~2%) held out for validation
 
 
 def target_win_prob(target: float, wdl_target: bool) -> float:
@@ -64,19 +67,21 @@ def _load_samples(path: str):
     return owns, opps, targets
 
 
-def _ragged_to_bag(rows):
-    """Flattens ragged index lists into (values, offsets) for nn.EmbeddingBag."""
+def _pad_rows(rows):
+    """Ragged index lists -> a [N, MAX_FEATURES] int32 tensor padded with PAD_INDEX.
+
+    Rows never exceed MAX_FEATURES (a perspective has <=16 pieces). Built once for
+    the whole dataset via a single flatten + masked scatter (no per-row Python)."""
     import torch
 
-    offsets = [0]
-    flat = []
-    for row in rows:
-        flat.extend(row)
-        offsets.append(len(flat))
-    return (
-        torch.tensor(flat, dtype=torch.long),
-        torch.tensor(offsets[:-1], dtype=torch.long),
-    )
+    lengths = torch.tensor([len(r) for r in rows], dtype=torch.long)
+    if (lengths > MAX_FEATURES).any():
+        raise SystemExit("a sample exceeded MAX_FEATURES active features")
+    flat = torch.tensor([x for r in rows for x in r], dtype=torch.int32)
+    padded = torch.full((len(rows), MAX_FEATURES), PAD_INDEX, dtype=torch.int32)
+    mask = torch.arange(MAX_FEATURES)[None, :] < lengths[:, None]
+    padded[mask] = flat
+    return padded
 
 
 def train(
@@ -95,63 +100,74 @@ def train(
     if not owns:
         raise SystemExit(f"no training samples in {data_path}")
 
-    own_values, own_offsets = _ragged_to_bag(owns)
-    opp_values, opp_offsets = _ragged_to_bag(opps)
-    target = torch.tensor(targets, dtype=torch.float32)
+    own_t = _pad_rows(owns).to(device)             # [N, 32] int32
+    opp_t = _pad_rows(opps).to(device)
+    target = torch.tensor(targets, dtype=torch.float32, device=device)
+    # In WDL mode the target already IS a win-probability (0.0/0.5/1.0 game
+    # outcome) and is used directly; in centipawn mode it is squashed through the
+    # WDL sigmoid. See target_win_prob for why the two paths cannot be merged.
+    target_wp = torch.clamp(target, 0.0, 1.0) if wdl_target else torch.sigmoid(target / WDL_SCALE)
 
     class Nnue(nn.Module):
         def __init__(self, hidden: int):
             super().__init__()
-            # weight[feature] is the hidden-vector added to the accumulator, which
-            # is exactly the RFNN feature_weights row-major (feature*hidden + i)
-            # layout. mode="sum" reproduces the accumulator's summed columns.
-            self.transformer = nn.EmbeddingBag(INPUT_DIMENSION, hidden, mode="sum")
+            # 769 rows: 0..767 are real features, 768 is a frozen zero pad row.
+            # weight[feature] is the hidden-vector added to the accumulator, exactly
+            # the RFNN feature_weights row-major (feature*hidden + i) layout. The
+            # padding row is dropped on export, so the block stays byte-identical.
+            self.transformer = nn.Embedding(INPUT_DIMENSION + 1, hidden, padding_idx=PAD_INDEX)
             self.feature_bias = nn.Parameter(torch.zeros(hidden))
             self.output = nn.Linear(2 * hidden, 1)
-            nn.init.uniform_(self.transformer.weight, -0.1, 0.1)
+            nn.init.uniform_(self.transformer.weight[:INPUT_DIMENSION], -0.1, 0.1)
             nn.init.uniform_(self.output.weight, -0.1, 0.1)
             nn.init.zeros_(self.output.bias)
 
-        def forward(self, own_v, own_o, opp_v, opp_o):
-            acc_own = self.transformer(own_v, own_o) + self.feature_bias
-            acc_opp = self.transformer(opp_v, opp_o) + self.feature_bias
+        def forward(self, own_rows, opp_rows):
+            # own_rows/opp_rows: [B, MAX_FEATURES] int; embed -> [B, F, hidden] -> sum F.
+            acc_own = self.transformer(own_rows).sum(dim=1) + self.feature_bias
+            acc_opp = self.transformer(opp_rows).sum(dim=1) + self.feature_bias
             a_own = torch.clamp(acc_own, 0.0, ACTIVATION_CLIP)
             a_opp = torch.clamp(acc_opp, 0.0, ACTIVATION_CLIP)
             features = torch.cat([a_own, a_opp], dim=1)
             # pred is centipawns (inference divides the integer output by 64).
             return self.output(features).squeeze(1) / OUTPUT_SCALE
 
+    count = len(owns)
+    all_idx = torch.arange(count, device=device)
+    is_val = (all_idx % VAL_EVERY) == 0
+    train_idx = all_idx[~is_val]
+    val_idx = all_idx[is_val]
+
     model = Nnue(hidden).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    own_values, own_offsets = own_values.to(device), own_offsets.to(device)
-    opp_values, opp_offsets = opp_values.to(device), opp_offsets.to(device)
-    target = target.to(device)
-    # In WDL mode the target already IS a win-probability (0.0/0.5/1.0 game
-    # outcome) and is used directly; in centipawn mode it is squashed through the
-    # WDL sigmoid. See target_win_prob for why the two paths cannot be merged.
-    if wdl_target:
-        target_wp = torch.clamp(target, 0.0, 1.0)
-    else:
-        target_wp = torch.sigmoid(target / WDL_SCALE)
+    def loss_on(idx):
+        pred_cp = model(own_t[idx], opp_t[idx])
+        pred_wp = torch.sigmoid(pred_cp / WDL_SCALE)
+        return ((pred_wp - target_wp[idx]) ** 2).mean()
 
-    count = len(owns)
     for epoch in range(epochs):
-        permutation = torch.randperm(count, device=device)
+        model.train()
+        perm = train_idx[torch.randperm(train_idx.numel(), device=device)]
         total = 0.0
-        for start in range(0, count, batch_size):
-            idx = permutation[start:start + batch_size]
-            # Rebuild ragged bags for the minibatch on CPU indices.
-            ov, oo = _ragged_to_bag([owns[i] for i in idx.tolist()])
-            pv, po = _ragged_to_bag([opps[i] for i in idx.tolist()])
-            pred_cp = model(ov.to(device), oo.to(device), pv.to(device), po.to(device))
-            pred_wp = torch.sigmoid(pred_cp / WDL_SCALE)
-            loss = ((pred_wp - target_wp[idx]) ** 2).mean()
+        for start in range(0, perm.numel(), batch_size):
+            idx = perm[start:start + batch_size]
+            loss = loss_on(idx)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            total += loss.item() * len(idx)
-        print(f"epoch {epoch + 1}/{epochs}: wdl_loss {total / count:.6f}", file=sys.stderr)
+            total += loss.item() * idx.numel()
+        scheduler.step()
+        model.eval()
+        with torch.no_grad():
+            val = loss_on(val_idx).item() if val_idx.numel() else float("nan")
+        train_mean = total / train_idx.numel() if train_idx.numel() else float("nan")
+        print(
+            f"epoch {epoch + 1}/{epochs}: train_wdl_loss {train_mean:.6f} "
+            f"val_wdl_loss {val:.6f} lr {scheduler.get_last_lr()[0]:.2e}",
+            file=sys.stderr,
+        )
 
     return model
 
@@ -160,7 +176,7 @@ def quantize_and_write(model, hidden: int, out_path: str):
     import torch
 
     with torch.no_grad():
-        w1 = model.transformer.weight.detach().cpu()          # [INPUT, hidden]
+        w1 = model.transformer.weight.detach().cpu()[:INPUT_DIMENSION]   # [768, hidden]
         b1 = model.feature_bias.detach().cpu()                # [hidden]
         w2 = model.output.weight.detach().cpu().squeeze(0)    # [2*hidden]
         b2 = float(model.output.bias.detach().cpu().item())
