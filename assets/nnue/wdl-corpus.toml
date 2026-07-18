@@ -1,0 +1,36 @@
+# Lichess standard-rated monthly exports used as NNUE WDL training input.
+# SEPARATE from assets/opening-book/manifest.toml: that pins a shipped book asset;
+# this is training data. SHAs verified in the Modal pipeline before use.
+source_name = "Lichess Open Database standard rated games"
+license = "CC0-1.0"
+license_url = "https://database.lichess.org/"
+
+[[month]]
+name = "2017-01"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2017-01.pgn.zst"
+sha256 = "d1236dcd954089aee162c7b0d82f51162f7c912882343d47b77ba5c0e05512f6"
+
+[[month]]
+name = "2017-02"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2017-02.pgn.zst"
+sha256 = "0d85d1c1ca6782fa3fae4aa2016835c0b60d51162aa84e6bfff8e4cb4af6285b"
+
+[[month]]
+name = "2017-03"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2017-03.pgn.zst"
+sha256 = "b319297e9270285635d615cbcd19a9b0d44747be3ff91d5b3eac41175b794320"
+
+[[month]]
+name = "2017-04"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2017-04.pgn.zst"
+sha256 = "559222b0e933bc02281643724fbd9bd46690074b10d784c4f264e0bff6c5992c"
+
+[[month]]
+name = "2017-05"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2017-05.pgn.zst"
+sha256 = "c4b2e39a382fb8a9dc5e766bbae0201d123c5c0ccc27f6e852d9a69e6661ab2f"
+
+[[month]]
+name = "2017-06"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2017-06.pgn.zst"
+sha256 = "f11fef4ff2b605c041f88b12846f11d7fc609988ff2185222c083c09cf13a29b"
