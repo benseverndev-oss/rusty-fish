@@ -680,7 +680,9 @@ pub fn run_mobility_gate_fens<S: AsRef<str>>(
     max_plies: u32,
 ) -> Result<Vec<GameRecord>, String> {
     let candidate = SearchParams { mobility_scale: 100, ..SearchParams::default() };
-    let baseline = SearchParams::default(); // mobility_scale == 0
+    // Pin the baseline OFF explicitly: the shipped default is now mobility-on, so
+    // relying on `SearchParams::default()` here would make this 100-vs-100.
+    let baseline = SearchParams { mobility_scale: 0, ..SearchParams::default() };
     let mut records = Vec::with_capacity(fens.len() * 2);
     for fen in fens {
         for candidate_color in [Color::White, Color::Black] {
@@ -715,7 +717,9 @@ pub fn run_eval_gate_fens<S: AsRef<str>>(
     max_plies: u32,
 ) -> Result<Vec<GameRecord>, String> {
     let candidate_params = SearchParams { mobility_scale: 100, ..SearchParams::default() };
-    let baseline_params = SearchParams::default(); // mobility_scale == 0
+    // Pin the baseline OFF explicitly: the shipped default is now mobility-on, so
+    // relying on `SearchParams::default()` here would leave mobility on for both.
+    let baseline_params = SearchParams { mobility_scale: 0, ..SearchParams::default() };
     let mut records = Vec::with_capacity(fens.len() * 2);
     for fen in fens {
         for candidate_color in [Color::White, Color::Black] {
