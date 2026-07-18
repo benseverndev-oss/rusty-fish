@@ -703,9 +703,10 @@ pub fn run_mobility_gate_fens<S: AsRef<str>>(
 /// Modal fan-out can play a slice per container. Plays the `candidate`
 /// `EvalParams` (mobility on, `mobility_scale = 100`) against the `baseline`
 /// `EvalParams` (mobility off) over each FEN color-swapped, at the same
-/// `move_time` per move, capped at `max_plies`. Everything but the two
-/// `EvalParams` (and the mobility scale) is identical, so the SPRT isolates the
-/// eval change.
+/// `move_time` per move, capped at `max_plies`. Because the candidate also turns
+/// mobility on while the baseline leaves it off, the SPRT measures the *combined*
+/// tuned-eval-plus-mobility-on change versus the current default — not a pure
+/// eval-only A/B (that would require both sides to share one mobility setting).
 pub fn run_eval_gate_fens<S: AsRef<str>>(
     fens: &[S],
     candidate: EvalParams,
@@ -1391,6 +1392,44 @@ mod tests {
         for index in 0..EVAL_DIMENSIONS {
             assert_eq!(low_params[index], EVAL_SPSA_SPECS[index].min);
             assert_eq!(high_params[index], EVAL_SPSA_SPECS[index].max);
+        }
+    }
+
+    #[test]
+    fn each_eval_spec_governs_its_own_vector_slot() {
+        // Perturb exactly ONE slot far past its own spec bound, starting from the
+        // default (which sits inside every window). The perturbed slot must clamp
+        // to THAT spec's min/max, and — critically — every OTHER slot must stay at
+        // its default. That isolation proves spec index i governs vector slot i and
+        // that the field at slot i is the one clamped: a specs/vector misordering
+        // (e.g. queen bounds landing on a mobility slot, or `vector_to_eval_params`
+        // reading slot i into the wrong field) would either bleed into a neighbour
+        // slot or miss the bound here. The default round-trip test cannot catch
+        // this because the defaults never touch a bound.
+        let default_vector = eval_params_to_vector(&EvalParams::default());
+        for slot in 0..EVAL_DIMENSIONS {
+            let spec = EVAL_SPSA_SPECS[slot];
+            for (perturbed, expected) in
+                [(spec.max + 1000.0, spec.max), (spec.min - 1000.0, spec.min)]
+            {
+                let mut vector = default_vector;
+                vector[slot] = perturbed;
+                let result = eval_params_to_vector(&vector_to_eval_params(&vector));
+                assert_eq!(
+                    result[slot], expected,
+                    "slot {slot} ({}) must clamp to its own spec bound",
+                    spec.name
+                );
+                for other in 0..EVAL_DIMENSIONS {
+                    if other != slot {
+                        assert_eq!(
+                            result[other], default_vector[other],
+                            "perturbing slot {slot} ({}) must not disturb slot {other} ({})",
+                            spec.name, EVAL_SPSA_SPECS[other].name
+                        );
+                    }
+                }
+            }
         }
     }
 
