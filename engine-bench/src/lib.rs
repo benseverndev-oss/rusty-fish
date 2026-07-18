@@ -1430,13 +1430,13 @@ mod tests {
         // plies for the material edge to convert before the cap (a capped game
         // draws).
         let crippled = EvalParams {
-            knight: TaperedScore::equal(120),
-            bishop: TaperedScore::equal(120),
-            rook: TaperedScore::equal(180),
-            queen: TaperedScore::equal(120),
+            knight: TaperedScore::equal(1),
+            bishop: TaperedScore::equal(1),
+            rook: TaperedScore::equal(1),
+            queen: TaperedScore::equal(1),
             ..EvalParams::default()
         };
-        let fens = random_opening_fens(4, 8, 0x10517);
+        let fens = random_opening_fens(6, 8, 0x10517);
         let records = run_eval_gate_fens(
             &fens,
             crippled,
