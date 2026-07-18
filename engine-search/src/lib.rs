@@ -803,6 +803,7 @@ impl Searcher {
         tt: Arc<SharedTranspositionTable>,
         options: SearchOptions,
         params: SearchParams,
+        eval_params: EvalParams,
         nnue: Option<Arc<Nnue>>,
     ) -> Self {
         Self {
@@ -817,6 +818,7 @@ impl Searcher {
             counter_moves: vec![None; HISTORY_SIZE],
             options,
             params,
+            eval_params,
             nnue,
             nnue_accumulator: None,
             nnue_stack: Vec::new(),
@@ -968,11 +970,12 @@ impl Searcher {
                 let tt = Arc::clone(&self.tt);
                 let options = self.options.clone();
                 let params = self.params;
+                let eval_params = self.eval_params;
                 let nnue = self.nnue.clone();
                 let helper_board = board.clone();
                 let stop = Arc::clone(&shared_stop);
                 helper_handles.push(thread::spawn(move || {
-                    Searcher::helper(tt, options, params, nnue).run_lazy_smp_helper(
+                    Searcher::helper(tt, options, params, eval_params, nnue).run_lazy_smp_helper(
                         &helper_board,
                         max_depth,
                         deadline,
