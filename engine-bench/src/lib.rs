@@ -1268,6 +1268,109 @@ pub fn run_spsa_campaign(
     })
 }
 
+/// Configuration for an eval SPSA campaign ([`run_eval_spsa_campaign`]). Unlike
+/// [`SpsaConfig`], the per-iteration match is bounded by a per-move `move_time`
+/// (not a search depth) and a `max_plies` cap, so the whole campaign's cost is
+/// `iterations * positions * 2 * max_plies * move_time` — mirroring the movetime
+/// discipline of the eval gate ([`run_eval_gate_fens`]).
+#[derive(Clone, Copy, Debug)]
+pub struct EvalSpsaConfig {
+    pub iterations: usize,
+    pub learning_rate: f64,
+    pub seed: u64,
+    pub move_time: Duration,
+    pub max_plies: u32,
+}
+
+impl Default for EvalSpsaConfig {
+    fn default() -> Self {
+        Self {
+            iterations: 32,
+            learning_rate: 1.0,
+            seed: 0x0DDB_1A5E_5BAD_5EED,
+            move_time: Duration::from_millis(50),
+            max_plies: 120,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EvalSpsaIterationRecord {
+    pub iteration: usize,
+    pub score: MatchScore,
+    pub candidate_score_fraction: f64,
+    pub params: EvalParams,
+}
+
+#[derive(Clone, Debug)]
+pub struct EvalSpsaReport {
+    pub initial: EvalParams,
+    pub tuned: EvalParams,
+    pub iterations: Vec<EvalSpsaIterationRecord>,
+}
+
+/// Runs a deterministic eval SPSA campaign over the supplied positions, starting
+/// from `initial`. Mirrors [`run_spsa_campaign`] but tunes the eval vector
+/// (`EVAL_SPSA_SPECS`, [`EVAL_DIMENSIONS`] wide): each iteration perturbs the eval
+/// vector, plays a `theta+` vs `theta-` self-play match across all positions and
+/// both colours, and steps the eval params. **Both sides run mobility-on**
+/// (`mobility_scale = 100`) so the tuned mobility weights are actually exercised;
+/// the only difference between the two players is their [`EvalParams`]. Each move
+/// is bounded by `config.move_time` (not depth), games capped at
+/// `config.max_plies`. Returns the per-iteration record and the final tuned
+/// `EvalParams`.
+pub fn run_eval_spsa_campaign(
+    positions: &[&str],
+    initial: EvalParams,
+    config: EvalSpsaConfig,
+) -> Result<EvalSpsaReport, String> {
+    let mobility_on = SearchParams { mobility_scale: 100, ..SearchParams::default() };
+    let mut theta = eval_params_to_vector(&initial).to_vec();
+    let mut rng = SpsaRng::new(config.seed);
+    let mut iterations = Vec::with_capacity(config.iterations);
+
+    for iteration in 0..config.iterations {
+        let direction = rng.direction(EVAL_DIMENSIONS);
+        let plus_vector = perturb(&theta, &direction, 1.0, &EVAL_SPSA_SPECS);
+        let minus_vector = perturb(&theta, &direction, -1.0, &EVAL_SPSA_SPECS);
+        let plus = vector_to_eval_params(&to_eval_array(&plus_vector));
+        let minus = vector_to_eval_params(&to_eval_array(&minus_vector));
+
+        // theta+ (candidate) vs theta- (baseline), both mobility-on, color-swapped
+        // over every position — the eval analog of run_eval_gate_fens's match.
+        let mut records = Vec::with_capacity(positions.len() * 2);
+        for fen in positions {
+            for candidate_color in [Color::White, Color::Black] {
+                records.push(play_mobility_game(
+                    fen,
+                    candidate_color,
+                    mobility_on,
+                    plus,
+                    mobility_on,
+                    minus,
+                    config.move_time,
+                    config.max_plies,
+                )?);
+            }
+        }
+        let score = summarize(&records);
+        let fraction = score.score_fraction().unwrap_or(0.5);
+        theta = spsa_update(&theta, &direction, fraction, config.learning_rate, &EVAL_SPSA_SPECS);
+        iterations.push(EvalSpsaIterationRecord {
+            iteration,
+            score,
+            candidate_score_fraction: fraction,
+            params: vector_to_eval_params(&to_eval_array(&theta)),
+        });
+    }
+
+    Ok(EvalSpsaReport {
+        initial,
+        tuned: vector_to_eval_params(&to_eval_array(&theta)),
+        iterations,
+    })
+}
+
 pub fn spsa_tsv_report(report: &SpsaReport) -> String {
     let mut out = String::from("engine_version\titeration\twins\tdraws\tlosses\tcandidate_score");
     for spec in SPSA_SPECS.iter() {

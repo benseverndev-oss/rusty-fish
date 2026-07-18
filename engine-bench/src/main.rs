@@ -1,9 +1,10 @@
 use std::{sync::Arc, time::Duration};
 
 use engine_bench::{
-    DEFAULT_TACTICAL_SUITE, ExternalMatchConfig, MatchConfig, MatchScore, SpsaConfig, SprtConfig,
-    eval_params_from_tsv, external_tsv_report, measure_throughput, random_opening_fens,
-    run_eval_gate_fens, run_external_opponent_match,
+    DEFAULT_TACTICAL_SUITE, EvalSpsaConfig, ExternalMatchConfig, MatchConfig, MatchScore,
+    SpsaConfig, SprtConfig,
+    eval_params_from_tsv, eval_params_to_tsv, external_tsv_report, measure_throughput,
+    random_opening_fens, run_eval_gate_fens, run_eval_spsa_campaign, run_external_opponent_match,
     run_fixed_opponent_match, run_mobility_gate, run_mobility_gate_fens, run_nnue_gauntlet,
     run_nnue_gauntlet_with_move_time,
     run_spsa_campaign, run_tactical_suite,
@@ -72,6 +73,37 @@ fn main() -> Result<(), String> {
         }
         let report = run_spsa_campaign(EXTERNAL_SPRT_POSITIONS, SearchParams::default(), config)?;
         print!("{}", spsa_tsv_report(&report));
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("spsa-eval") {
+        // spsa-eval [iterations] [openings] [movetime_ms]: SPSA-tune the eval
+        // weights via self-play (theta+ vs theta-, both mobility-on), then print
+        // the tuned EvalParams to STDOUT as the 18-value vector TSV that
+        // `eval-gate-file` parses, so the campaign output feeds the gate directly.
+        // A per-iteration trace goes to stderr.
+        let mut config = EvalSpsaConfig::default();
+        if let Some(iterations) = arg_u32(2) {
+            config.iterations = iterations as usize;
+        }
+        let openings = arg_u32(3).unwrap_or(64) as usize;
+        if let Some(movetime_ms) = arg_u64(4) {
+            config.move_time = Duration::from_millis(movetime_ms);
+        }
+        let fens = random_opening_fens(openings, 8, 0x5EED);
+        let fen_refs: Vec<&str> = fens.iter().map(String::as_str).collect();
+        let report = run_eval_spsa_campaign(&fen_refs, EvalParams::default(), config)?;
+        for record in &report.iterations {
+            eprintln!(
+                "iter {:>3}: {}W {}D {}L score {:.3} | {}",
+                record.iteration,
+                record.score.wins,
+                record.score.draws,
+                record.score.losses,
+                record.candidate_score_fraction,
+                eval_params_to_tsv(&record.params),
+            );
+        }
+        println!("{}", eval_params_to_tsv(&report.tuned));
         return Ok(());
     }
     if std::env::args().nth(1).as_deref() == Some("train") {
