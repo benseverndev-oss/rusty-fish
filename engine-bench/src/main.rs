@@ -3,7 +3,8 @@ use std::{sync::Arc, time::Duration};
 use engine_bench::{
     DEFAULT_TACTICAL_SUITE, ExternalMatchConfig, MatchConfig, MatchScore, SpsaConfig, SprtConfig,
     external_tsv_report, measure_throughput, random_opening_fens, run_external_opponent_match,
-    run_fixed_opponent_match, run_mobility_gate, run_nnue_gauntlet, run_nnue_gauntlet_with_move_time,
+    run_fixed_opponent_match, run_mobility_gate, run_mobility_gate_fens, run_nnue_gauntlet,
+    run_nnue_gauntlet_with_move_time,
     run_spsa_campaign, run_tactical_suite,
     spsa_tsv_report, sprt, sprt_tsv_report, summarize, tactical_tsv_report, throughput_tsv_report,
 };
@@ -198,6 +199,26 @@ fn main() -> Result<(), String> {
             config,
             move_time,
         )?;
+        let score = summarize(&records);
+        println!("{}\t{}\t{}", score.wins, score.draws, score.losses);
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("mobility-gate-file") {
+        // mobility-gate-file <openings_file> [movetime_ms]: play mobility-on vs
+        // off over the file's openings, color-swapped; emit "W\tD\tL". The
+        // shardable form so a Modal fan-out can play a slice per container.
+        let openings_path = std::env::args()
+            .nth(2)
+            .ok_or_else(|| "usage: mobility-gate-file <openings_file> [movetime_ms]".to_string())?;
+        let move_time = Duration::from_millis(arg_u64(3).unwrap_or(15));
+        let contents = std::fs::read_to_string(&openings_path)
+            .map_err(|error| format!("failed to read openings {openings_path}: {error}"))?;
+        let fens: Vec<&str> = contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        let records = run_mobility_gate_fens(&fens, move_time, 80)?;
         let score = summarize(&records);
         println!("{}\t{}\t{}", score.wins, score.draws, score.losses);
         return Ok(());

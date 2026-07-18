@@ -87,6 +87,21 @@ def gate_shard(net_bytes: bytes, depth: int, openings_text: str) -> tuple[int, i
 
 
 @app.function(image=rust_image)
+def mobility_gate_shard(movetime_ms: int, openings_text: str) -> tuple[int, int, int]:
+    """Play mobility-on (scale 100) vs mobility-off over one opening shard."""
+    with tempfile.TemporaryDirectory() as directory:
+        openings_path = f"{directory}/openings.txt"
+        with open(openings_path, "w", encoding="utf-8") as handle:
+            handle.write(openings_text)
+        result = subprocess.run(
+            [BIN, "mobility-gate-file", openings_path, str(movetime_ms)],
+            capture_output=True, text=True, check=True,
+        )
+    wins, draws, losses = (int(x) for x in result.stdout.strip().split("\t"))
+    return wins, draws, losses
+
+
+@app.function(image=rust_image)
 def sprt_verdict(wins: int, draws: int, losses: int) -> str:
     result = subprocess.run(
         [BIN, "sprt", str(wins), str(draws), str(losses)],
@@ -146,4 +161,31 @@ def run(
         draws += d
         losses += l
     print(f"gate over {len(openings) * 2} games: {wins}W {draws}D {losses}L")
+    print(sprt_verdict.remote(wins, draws, losses))
+
+
+@app.local_entrypoint()
+def mobility_gate(
+    gate_openings: int = 2048,
+    gate_plies: int = 8,
+    movetime_ms: int = 50,
+    gate_shard_size: int = 32,
+):
+    """Self-play SPRT for the mobility eval term, fanned out across containers.
+
+    Plays mobility-on (mobility_scale=100) against mobility-off over many
+    openings, color-swapped. Candidate wins => the term helps.
+
+        modal run modal/app.py::mobility_gate
+        modal run modal/app.py::mobility_gate --gate-openings 4096 --movetime-ms 50
+    """
+    openings = [line for line in make_openings.remote(gate_openings, gate_plies, 1).splitlines() if line]
+    shard_texts = list(_chunks(openings, gate_shard_size))
+    results = mobility_gate_shard.starmap([(movetime_ms, text) for text in shard_texts])
+    wins = draws = losses = 0
+    for w, d, l in results:
+        wins += w
+        draws += d
+        losses += l
+    print(f"mobility gate over {len(openings) * 2} games: {wins}W {draws}D {losses}L")
     print(sprt_verdict.remote(wins, draws, losses))
