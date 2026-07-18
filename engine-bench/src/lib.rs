@@ -1421,34 +1421,35 @@ mod tests {
 
     #[test]
     fn eval_gate_penalizes_a_lopsidedly_bad_candidate() {
-        // A candidate that badly undervalues its heavy pieces (queen worth ~a
-        // pawn, rook/minor barely more) is materially blind: it will make bad
-        // captures and trades a shallow search can punish, and lose against the
-        // default eval. The queen-value-200 idea alone drew at low depth because
-        // the imbalance never surfaced; crippling every heavy piece guarantees
-        // concrete bad trades. Enough movetime for tactics to surface and enough
-        // plies for the material edge to convert before the cap (a capped game
-        // draws).
+        // A candidate with negative piece values actively self-destructs: it
+        // values its own pieces as liabilities (sheds them for free) and the
+        // opponent's as assets (refuses to capture them). Against the default
+        // eval it collapses to a bare-ish king and gets checkmated, so games
+        // resolve to losses rather than drawing at the ply cap. Merely
+        // undervaluing pieces (even to ~1) drew, because a shallow search could
+        // not convert a material edge into mate before the cap; negative values
+        // make the candidate walk into mate itself. A generous ply cap gives the
+        // rout time to finish.
         let crippled = EvalParams {
-            knight: TaperedScore::equal(1),
-            bishop: TaperedScore::equal(1),
-            rook: TaperedScore::equal(1),
-            queen: TaperedScore::equal(1),
+            knight: TaperedScore::equal(-1000),
+            bishop: TaperedScore::equal(-1000),
+            rook: TaperedScore::equal(-1000),
+            queen: TaperedScore::equal(-1000),
             ..EvalParams::default()
         };
-        let fens = random_opening_fens(6, 8, 0x10517);
+        let fens = random_opening_fens(8, 8, 0x10517);
         let records = run_eval_gate_fens(
             &fens,
             crippled,
             EvalParams::default(),
-            Duration::from_millis(50),
-            240,
+            Duration::from_millis(40),
+            300,
         )
         .expect("eval gate runs");
         let score = summarize(&records);
         assert!(
             score.losses > score.wins,
-            "materially blind candidate should lose the gate: {score:?}"
+            "self-destructing candidate should lose the gate: {score:?}"
         );
     }
 
