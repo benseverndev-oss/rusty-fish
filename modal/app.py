@@ -18,6 +18,7 @@ from the agent sandbox. See modal/README.md.
     modal run modal/app.py --hidden 256 --epochs 60 --gate-openings 2048
 """
 
+import glob
 import pathlib
 import subprocess
 import tempfile
@@ -27,10 +28,17 @@ import modal
 REPO_ROOT = str(pathlib.Path(__file__).resolve().parent.parent)
 BIN = "/repo/target/release/engine-bench"
 
+# Pinned Lichess standard-rated export (matches assets/opening-book/manifest.toml).
+# The WDL pipeline labels game outcomes from this file.
+WDL_EXPORT_URL = (
+    "https://database.lichess.org/standard/lichess_db_standard_rated_2017-01.pgn.zst"
+)
+WDL_EXPORT_SHA256 = "d1236dcd954089aee162c7b0d82f51162f7c912882343d47b77ba5c0e05512f6"
+
 # Image A: builds the engine-bench release binary from the repo source.
 rust_image = (
     modal.Image.debian_slim()
-    .apt_install("curl", "build-essential", "pkg-config")
+    .apt_install("curl", "build-essential", "pkg-config", "zstd")
     .run_commands(
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs "
         "| sh -s -- -y --default-toolchain stable"
@@ -47,6 +55,10 @@ torch_image = (
 )
 
 app = modal.App("rusty-fish-nnue")
+
+# Persistent volume holding the (large) Lichess export and the labelled shards, so
+# the download happens once and the GPU trainer can read every shard by path.
+wdl_volume = modal.Volume.from_name("rusty-fish-wdl", create_if_missing=True)
 
 
 @app.function(image=rust_image)
@@ -158,6 +170,67 @@ def train_net(data_text: str, hidden: int, epochs: int) -> bytes:
         train_nnue.quantize_and_write(model, hidden, out_path)
         with open(out_path, "rb") as handle:
             return handle.read()
+
+
+@app.function(image=rust_image, volumes={"/vol": wdl_volume}, timeout=60 * 60)
+def prepare_export() -> None:
+    """Download + verify the pinned Lichess export into the shared volume, once.
+
+    Idempotent: if the file is already present (a prior run committed it) this
+    returns early and skips the multi-GB re-download. The SHA-256 check fails the
+    function on any mismatch, so a corrupt/partial download never reaches labeling.
+    """
+    export_path = "/vol/export.pgn.zst"
+    if pathlib.Path(export_path).exists():
+        print(f"export already present at {export_path}, skipping download", flush=True)
+        return
+    subprocess.run(["curl", "-L", "-o", export_path, WDL_EXPORT_URL], check=True)
+    # sha256sum --check reads "<hash>  <path>" and exits non-zero on mismatch,
+    # which check=True turns into a raised CalledProcessError (function fails).
+    checkfile = f"{WDL_EXPORT_SHA256}  {export_path}\n"
+    subprocess.run(["sha256sum", "--check"], input=checkfile, text=True, check=True)
+    wdl_volume.commit()
+    print(f"downloaded + verified {export_path}", flush=True)
+
+
+@app.function(image=rust_image, volumes={"/vol": wdl_volume}, timeout=60 * 60)
+def label_wdl_shard(i: int, n: int, per_game: int) -> int:
+    """One WDL labeling shard: stream the export through gen-wdl-data.
+
+    Runs the pipe under bash with pipefail so a zstdcat failure (e.g. truncated
+    export) fails the shard instead of silently yielding an empty TSV.
+    """
+    cmd = (
+        f"set -euo pipefail; zstdcat /vol/export.pgn.zst | "
+        f"{BIN} gen-wdl-data - --shard {i}/{n} --per-game {per_game} > /vol/samples-{i}.tsv"
+    )
+    subprocess.run(["bash", "-c", cmd], check=True)
+    wdl_volume.commit()
+    with open(f"/vol/samples-{i}.tsv", "r", encoding="utf-8") as handle:
+        count = sum(1 for line in handle if line.strip())
+    return count
+
+
+@app.function(image=torch_image, gpu="A10G", timeout=60 * 60 * 2, volumes={"/vol": wdl_volume})
+def train_wdl_run(hidden: int, epochs: int) -> bytes:
+    """GPU train on the WDL outcome labels (all shards) -> quantised RFNN bytes."""
+    import train_nnue
+
+    wdl_volume.reload()
+    shard_paths = sorted(glob.glob("/vol/samples-*.tsv"))
+    data_path = "/vol/data.tsv"
+    with open(data_path, "w", encoding="utf-8") as out:
+        for shard_path in shard_paths:
+            with open(shard_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    out.write(line)
+    out_path = "/vol/net.rfnn"
+    model = train_nnue.train(
+        data_path, hidden, epochs, batch_size=1024, lr=1e-3, device="cuda", wdl_target=True
+    )
+    train_nnue.quantize_and_write(model, hidden, out_path)
+    with open(out_path, "rb") as handle:
+        return handle.read()
 
 
 def _chunks(lines, size):
@@ -278,3 +351,61 @@ def eval_gate_run(
     out = f"EVAL_GATE_RESULT_BEGIN\n{summary}\n{verdict}\nEVAL_GATE_RESULT_END"
     print(out, flush=True)
     return out
+
+
+@app.function(image=rust_image, timeout=60 * 30)
+def nnue_gate_run(
+    net_bytes: bytes,
+    gate_depth: int,
+    gate_openings: int,
+    gate_plies: int,
+    gate_shard_size: int,
+) -> str:
+    """Runs the whole NNUE gate (fan shards, sum, SPRT) inside one remote function
+    and prints the verdict to its log, so a detached run stays retrievable via
+    `modal app logs` even if the launching client disconnects."""
+    openings = [line for line in make_openings.remote(gate_openings, gate_plies, 1).splitlines() if line]
+    shard_texts = list(_chunks(openings, gate_shard_size))
+    results = gate_shard.starmap([(net_bytes, gate_depth, text) for text in shard_texts])
+    wins = draws = losses = 0
+    for w, d, l in results:
+        wins += w
+        draws += d
+        losses += l
+    summary = f"nnue gate over {len(openings) * 2} games: {wins}W {draws}D {losses}L"
+    verdict = sprt_verdict.remote(wins, draws, losses)
+    out = f"NNUE_GATE_RESULT_BEGIN\n{summary}\n{verdict}\nNNUE_GATE_RESULT_END"
+    print(out, flush=True)
+    return out
+
+
+@app.local_entrypoint()
+def train_wdl(
+    label_shards: int = 16,
+    per_game: int = 12,
+    hidden: int = 256,
+    epochs: int = 40,
+    gate_openings: int = 2048,
+    gate_plies: int = 8,
+    gate_depth: int = 5,
+    gate_shard_size: int = 32,
+):
+    """Train an NNUE on real Lichess game outcomes (WDL), then gate it via SPRT.
+
+    Downloads the pinned Lichess export once into a shared volume, fans out
+    `engine-bench gen-wdl-data` shards to label game outcomes, trains on a GPU
+    with the WDL loss, and runs the parallel SPRT gate vs the hand-crafted
+    baseline.
+
+        modal run modal/app.py::train_wdl --label-shards 2 --per-game 2 --epochs 2 --gate-openings 64
+        modal run modal/app.py::train_wdl --label-shards 16 --per-game 12 --hidden 256 --epochs 40 --gate-openings 2048
+    """
+    prepare_export.remote()
+    counts = label_wdl_shard.starmap([(i, label_shards, per_game) for i in range(label_shards)])
+    total = sum(counts)
+    print(f"labeled {total} WDL samples across {label_shards} shards")
+
+    net_bytes = train_wdl_run.remote(hidden, epochs)
+    print(f"trained network: {len(net_bytes)} bytes")
+
+    print(nnue_gate_run.remote(net_bytes, gate_depth, gate_openings, gate_plies, gate_shard_size))
