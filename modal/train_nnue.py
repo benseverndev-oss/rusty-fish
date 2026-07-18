@@ -34,6 +34,21 @@ EVAL_CLAMP = 20000       # inference clamps the centipawn score to +/- this
 WDL_SCALE = 400.0        # centipawns -> win-probability steepness
 
 
+def target_win_prob(target: float, wdl_target: bool) -> float:
+    """The training target as a win-probability in [0, 1].
+
+    In WDL mode the target already IS a win-probability (a game outcome
+    0.0/0.5/1.0), so it is used directly. In centipawn mode it is squashed
+    through the WDL sigmoid. Encoding a 0/1 outcome as centipawns would be
+    degenerate (logit(1) is infinite), which is why WDL data needs this mode.
+    """
+    if wdl_target:
+        return min(1.0, max(0.0, target))
+    import math
+
+    return 1.0 / (1.0 + math.exp(-target / WDL_SCALE))
+
+
 def _load_samples(path: str):
     """Yields (own_indices, opp_indices, target_cp) parsed from a gen-data TSV."""
     owns, opps, targets = [], [], []
@@ -64,7 +79,15 @@ def _ragged_to_bag(rows):
     )
 
 
-def train(data_path: str, hidden: int, epochs: int, batch_size: int, lr: float, device: str):
+def train(
+    data_path: str,
+    hidden: int,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    device: str,
+    wdl_target: bool = False,
+):
     import torch
     from torch import nn
 
@@ -104,7 +127,13 @@ def train(data_path: str, hidden: int, epochs: int, batch_size: int, lr: float, 
     own_values, own_offsets = own_values.to(device), own_offsets.to(device)
     opp_values, opp_offsets = opp_values.to(device), opp_offsets.to(device)
     target = target.to(device)
-    target_wp = torch.sigmoid(target / WDL_SCALE)
+    # In WDL mode the target already IS a win-probability (0.0/0.5/1.0 game
+    # outcome) and is used directly; in centipawn mode it is squashed through the
+    # WDL sigmoid. See target_win_prob for why the two paths cannot be merged.
+    if wdl_target:
+        target_wp = torch.clamp(target, 0.0, 1.0)
+    else:
+        target_wp = torch.sigmoid(target / WDL_SCALE)
 
     count = len(owns)
     for epoch in range(epochs):
@@ -166,12 +195,21 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--wdl-target",
+        action="store_true",
+        help="targets are game-outcome win-probabilities (0/0.5/1), used directly "
+        "instead of squashed through the centipawn sigmoid",
+    )
     args = parser.parse_args()
 
     import torch
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model = train(args.data, args.hidden, args.epochs, args.batch_size, args.lr, device)
+    model = train(
+        args.data, args.hidden, args.epochs, args.batch_size, args.lr, device,
+        wdl_target=args.wdl_target,
+    )
     quantize_and_write(model, args.hidden, args.out)
 
 
