@@ -58,7 +58,10 @@ positions past ply sixteen can be sampled. It reads a PGN from a path or `-`
 
 For Modal fan-out over the single monolithic export, `gen-wdl-data` takes a
 `--shard i/n` option: container `i` of `n` emits samples only for games whose
-zero-based index satisfies `index % n == i`. Each shard still decompresses and
+zero-based index satisfies `index % n == i`, where the index counts games in
+**stream order before the rating filter** (so shard assignment is
+filter-independent and the partition is trivially disjoint; each shard then
+applies the filter to its assigned games). Each shard still decompresses and
 scans the whole stream (cheap relative to the search-free feature extraction) but
 labels a disjoint set of games, so the shards concatenate to the full dataset
 with no overlap.
