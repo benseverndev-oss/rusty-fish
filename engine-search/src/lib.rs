@@ -2432,18 +2432,17 @@ mod tests {
         "4k3/8/8/3P4/8/8/8/4K3 w - - 0 1",
     ];
 
+    /// Today's exact default-eval scores for `EVAL_CORPUS`, baked from the
+    /// pre-change two-arg `evaluate_position`. Threading `EvalParams` must keep
+    /// these byte-identical.
+    const FROZEN_EVAL_SCORES: [i32; 6] = [168, 155, 129, 42, 396, 172];
+
     #[test]
     fn default_eval_is_byte_identical() {
-        let scores: Vec<String> = EVAL_CORPUS
-            .iter()
-            .map(|fen| {
-                let board = Board::from_fen(fen).unwrap();
-                evaluate_position(&board, 0).to_string()
-            })
-            .collect();
-        // TEMP: cargo swallows stdout for passing tests, so panic to surface
-        // today's pre-change scores in the CI failure log, then bake them.
-        panic!("EVAL_SCORES {}", scores.join(","));
+        for (fen, expected) in EVAL_CORPUS.iter().zip(FROZEN_EVAL_SCORES) {
+            let board = Board::from_fen(fen).unwrap();
+            assert_eq!(evaluate_position(&board, 0), expected, "score drift for {fen}");
+        }
     }
 
     #[test]
