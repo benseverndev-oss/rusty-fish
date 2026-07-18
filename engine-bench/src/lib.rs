@@ -587,13 +587,74 @@ pub fn play_parameter_game(
     })
 }
 
+/// A gate searcher: the given params plus a trimmed move overhead so a small
+/// `movetime` budget is actually spent searching rather than swallowed by the
+/// default 25 ms overhead (there is no GUI latency to reserve for here).
+fn gate_searcher(params: SearchParams) -> Searcher {
+    let mut searcher = Searcher::default();
+    searcher.set_search_params(params);
+    let mut options = searcher.options().clone();
+    options.move_overhead = Duration::from_millis(3);
+    searcher.set_options(options);
+    searcher
+}
+
+/// Plays one gate game where both sides think for a fixed `move_time` per move.
+/// Movetime (not depth) bounds each move, so the whole game's cost is bounded by
+/// `max_plies * move_time` regardless of how sharp the position is — which is
+/// what makes the gate's total runtime predictable.
+fn play_mobility_game(
+    fen: &str,
+    candidate_color: Color,
+    candidate_params: SearchParams,
+    baseline_params: SearchParams,
+    move_time: Duration,
+    max_plies: u32,
+) -> Result<GameRecord, String> {
+    let mut board = Board::from_fen(fen)?;
+    let mut candidate = gate_searcher(candidate_params);
+    let mut baseline = gate_searcher(baseline_params);
+    for ply in 0..max_plies {
+        let searcher = if board.side_to_move == candidate_color {
+            &mut candidate
+        } else {
+            &mut baseline
+        };
+        let result = searcher.search(
+            &board,
+            SearchLimits {
+                movetime: Some(move_time),
+                ..SearchLimits::default()
+            },
+        );
+        let Some(mv) = result.best_move else {
+            return Ok(GameRecord {
+                fen: fen.to_string(),
+                candidate_color,
+                outcome: outcome_from_status(board.game_status(), candidate_color),
+                plies: ply,
+            });
+        };
+        board.make_move(mv)?;
+    }
+    Ok(GameRecord {
+        fen: fen.to_string(),
+        candidate_color,
+        outcome: GameOutcome::Draw,
+        plies: max_plies,
+    })
+}
+
 /// Plays mobility-on (`mobility_scale = 100`) against mobility-off (`= 0`) over
-/// `openings` generated openings, color-swapped, at equal depth for both sides.
-/// Everything but the mobility scale is identical, so the SPRT isolates the term.
+/// `openings` generated openings, color-swapped. Both sides think for the same
+/// `move_time` per move (fair) and games are capped at `max_plies`, so the total
+/// cost is bounded by `openings * 2 * max_plies * move_time`. Everything but the
+/// mobility scale is identical, so the SPRT isolates the term.
 pub fn run_mobility_gate(
     openings: usize,
     seed: u64,
-    config: MatchConfig,
+    move_time: Duration,
+    max_plies: u32,
 ) -> Result<Vec<GameRecord>, String> {
     let fens = random_opening_fens(openings, 8, seed);
     let candidate = SearchParams { mobility_scale: 100, ..SearchParams::default() };
@@ -601,7 +662,14 @@ pub fn run_mobility_gate(
     let mut records = Vec::with_capacity(fens.len() * 2);
     for fen in &fens {
         for candidate_color in [Color::White, Color::Black] {
-            records.push(play_parameter_game(fen, candidate_color, candidate, baseline, config)?);
+            records.push(play_mobility_game(
+                fen,
+                candidate_color,
+                candidate,
+                baseline,
+                move_time,
+                max_plies,
+            )?);
         }
     }
     Ok(records)
@@ -1058,8 +1126,7 @@ mod tests {
 
     #[test]
     fn mobility_gate_plays_games_and_reports() {
-        let config = MatchConfig { candidate_depth: 2, baseline_depth: 2, max_plies: 20 };
-        let records = run_mobility_gate(2, 0xC0FFEE, config).expect("gate runs");
+        let records = run_mobility_gate(2, 0xC0FFEE, Duration::from_millis(5), 10).expect("gate runs");
         assert_eq!(records.len(), 4); // 2 openings x 2 colors
         let report = sprt_tsv_report(summarize(&records), SprtConfig::default());
         assert!(report.contains("decision"));

@@ -6,11 +6,11 @@ on:
       openings:
         description: Number of generated openings (games = openings x 2)
         required: false
-        default: '200'
-      depth:
-        description: Fixed search depth for both sides
+        default: '600'
+      movetime_ms:
+        description: Fixed think time per move, milliseconds (both sides)
         required: false
-        default: '6'
+        default: '15'
 
 jobs:
   mobility-gate:
@@ -24,7 +24,7 @@ jobs:
           set -euo pipefail
           mkdir -p artifacts
           cargo run --release -p engine-bench -- mobility-gate \
-            "${{ inputs.openings }}" "${{ inputs.depth }}" \
+            "${{ inputs.openings }}" "${{ inputs.movetime_ms }}" \
             > artifacts/mobility-sprt.tsv \
             2> artifacts/mobility-games.tsv
           echo '=== mobility-sprt.tsv ==='

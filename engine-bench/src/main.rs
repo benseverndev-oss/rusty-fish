@@ -6,7 +6,6 @@ use engine_bench::{
     run_fixed_opponent_match, run_mobility_gate, run_nnue_gauntlet, run_nnue_gauntlet_with_move_time,
     run_spsa_campaign, run_tactical_suite,
     spsa_tsv_report, sprt, sprt_tsv_report, summarize, tactical_tsv_report, throughput_tsv_report,
-    tsv_report,
 };
 use engine_bench::train::{generate_training_samples, train_nnue, TrainConfig};
 use engine_search::{Nnue, SearchParams};
@@ -204,11 +203,12 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
     if std::env::args().nth(1).as_deref() == Some("mobility-gate") {
-        let openings = std::env::args().nth(2).and_then(|a| a.parse().ok()).unwrap_or(200);
-        let depth = std::env::args().nth(3).and_then(|a| a.parse().ok()).unwrap_or(6);
-        let config = MatchConfig { candidate_depth: depth, baseline_depth: depth, max_plies: 160 };
-        let records = run_mobility_gate(openings, 0xC0FFEE, config)?;
-        eprint!("{}", tsv_report(&records, config));
+        // mobility-gate [openings] [movetime_ms]: self-play SPRT, mobility on vs
+        // off. Movetime bounds each move, so runtime <= openings*2*80*movetime.
+        let openings = std::env::args().nth(2).and_then(|a| a.parse().ok()).unwrap_or(600);
+        let move_ms: u64 = std::env::args().nth(3).and_then(|a| a.parse().ok()).unwrap_or(15);
+        let records =
+            run_mobility_gate(openings, 0xC0FFEE, Duration::from_millis(move_ms), 80)?;
         print!("{}", sprt_tsv_report(summarize(&records), SprtConfig::default()));
         return Ok(());
     }
