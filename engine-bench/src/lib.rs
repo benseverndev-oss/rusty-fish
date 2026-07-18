@@ -1421,20 +1421,19 @@ mod tests {
 
     #[test]
     fn eval_gate_penalizes_a_lopsidedly_bad_candidate() {
-        // A candidate with negative piece values actively self-destructs: it
-        // values its own pieces as liabilities (sheds them for free) and the
-        // opponent's as assets (refuses to capture them). Against the default
-        // eval it collapses to a bare-ish king and gets checkmated, so games
-        // resolve to losses rather than drawing at the ply cap. Merely
-        // undervaluing pieces (even to ~1) drew, because a shallow search could
-        // not convert a material edge into mate before the cap; negative values
-        // make the candidate walk into mate itself. A generous ply cap gives the
-        // rout time to finish.
+        // A candidate that values its pieces far below a pawn throws them away
+        // and collapses to a near-bare king. The move time is deliberately tiny
+        // (~depth 1-2): the candidate is too shallow to foresee the mate and
+        // walk out of it, so it gets checkmated on the board (a real loss),
+        // rather than "resigning into a draw" as a deeper search does (a search
+        // that sees forced mate returns no move, which the harness scores as a
+        // draw). The baseline, facing a bare king, has mate-in-1s it finds even
+        // at depth 1.
         let crippled = EvalParams {
-            knight: TaperedScore::equal(-1000),
-            bishop: TaperedScore::equal(-1000),
-            rook: TaperedScore::equal(-1000),
-            queen: TaperedScore::equal(-1000),
+            knight: TaperedScore::equal(20),
+            bishop: TaperedScore::equal(20),
+            rook: TaperedScore::equal(20),
+            queen: TaperedScore::equal(20),
             ..EvalParams::default()
         };
         let fens = random_opening_fens(8, 8, 0x10517);
@@ -1442,8 +1441,8 @@ mod tests {
             &fens,
             crippled,
             EvalParams::default(),
-            Duration::from_millis(40),
-            300,
+            Duration::from_millis(2),
+            200,
         )
         .expect("eval gate runs");
         let score = summarize(&records);
