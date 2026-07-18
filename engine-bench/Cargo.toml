@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 engine-core = { path = "../engine-core" }
 engine-search = { path = "../engine-search" }
+pgn-reader = "0.29"
