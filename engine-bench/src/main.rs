@@ -9,6 +9,7 @@ use engine_bench::{
     run_nnue_gauntlet_with_move_time,
     run_spsa_campaign, run_tactical_suite,
     spsa_tsv_report, sprt, sprt_tsv_report, summarize, tactical_tsv_report, throughput_tsv_report,
+    gen_wdl_data_samples, WdlSampleConfig,
 };
 use engine_bench::train::{generate_training_samples, train_nnue, TrainConfig};
 use engine_search::{EvalParams, Nnue, SearchParams};
@@ -306,6 +307,79 @@ fn main() -> Result<(), String> {
             "sprt: {wins}W {draws}D {losses}L; elo {}; decision = {decision:?}",
             score.elo_difference().map_or_else(|| "n/a".to_string(), |elo| format!("{elo:.1}")),
         );
+        return Ok(());
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("gen-wdl-data") {
+        // gen-wdl-data <pgn_or_-> [--shard i/n] [--per-game N]: sample middlegame
+        // positions from a Lichess PGN (path or `-` for stdin) and label each with
+        // the side-to-move-relative game outcome. Emits one sample per line as
+        // "target\town_csv\topp_csv" — the format train_nnue.py reads.
+        let mut source: Option<String> = None;
+        let mut shard = (0usize, 1usize);
+        let mut per_game = 12usize;
+        let mut args = std::env::args().skip(2);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--shard" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "usage: gen-wdl-data <pgn_or_-> [--shard i/n] [--per-game N]".to_string())?;
+                    let (i, n) = value
+                        .split_once('/')
+                        .ok_or_else(|| format!("invalid --shard value (want i/n): {value}"))?;
+                    let i = i
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid --shard index: {i}"))?;
+                    let n = n
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid --shard count: {n}"))?;
+                    if n == 0 || i >= n {
+                        return Err(format!("invalid --shard {i}/{n}: need 0 <= i < n"));
+                    }
+                    shard = (i, n);
+                }
+                "--per-game" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "usage: gen-wdl-data <pgn_or_-> [--shard i/n] [--per-game N]".to_string())?;
+                    per_game = value
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid --per-game value: {value}"))?;
+                }
+                _ => {
+                    if source.is_some() {
+                        return Err(format!("unexpected argument: {arg}"));
+                    }
+                    source = Some(arg);
+                }
+            }
+        }
+        let source = source
+            .ok_or_else(|| "usage: gen-wdl-data <pgn_or_-> [--shard i/n] [--per-game N]".to_string())?;
+        let pgn = if source == "-" {
+            let mut buffer = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut buffer)
+                .map_err(|error| format!("failed to read PGN from stdin: {error}"))?;
+            buffer
+        } else {
+            std::fs::read_to_string(&source)
+                .map_err(|error| format!("failed to read PGN {source}: {error}"))?
+        };
+        let config = WdlSampleConfig {
+            min_ply: 8,
+            end_trim: 5,
+            per_game,
+            shard,
+        };
+        for sample in gen_wdl_data_samples(&pgn, config) {
+            println!(
+                "{}\t{}\t{}",
+                sample.target,
+                join_usize(&sample.own),
+                join_usize(&sample.opp)
+            );
+        }
         return Ok(());
     }
 

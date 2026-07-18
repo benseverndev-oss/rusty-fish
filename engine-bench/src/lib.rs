@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader, Write};
+use std::ops::ControlFlow;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
@@ -6,7 +7,11 @@ use std::thread;
 use std::time::Duration;
 
 use engine_core::{Board, Color, GameStatus};
-use engine_search::{EvalParams, Nnue, SearchLimits, SearchParams, Searcher, TaperedScore};
+use engine_search::{
+    EvalParams, Nnue, SearchLimits, SearchParams, Searcher, TaperedScore, active_features,
+};
+use pgn_reader::shakmaty::{Chess, Position, uci::UciMove};
+use pgn_reader::{RawTag, Reader, SanPlus, Visitor};
 
 pub mod train;
 
@@ -1406,6 +1411,215 @@ pub fn spsa_tsv_report(report: &SpsaReport) -> String {
     out
 }
 
+// --- WDL sample generation from Lichess games -------------------------------
+
+/// The other colour. `engine_core::Color` has no `Not` impl, so mirror
+/// `train.rs`'s free helper rather than writing `!stm`.
+fn opposite(color: Color) -> Color {
+    match color {
+        Color::White => Color::Black,
+        Color::Black => Color::White,
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct WdlSampleConfig {
+    /// Skip the opening: only positions at or past this ply are eligible.
+    pub min_ply: u32,
+    /// Skip the last N plies (the decided endgame) from each game.
+    pub end_trim: u32,
+    /// Maximum sampled positions per game.
+    pub per_game: usize,
+    /// `(i, n)`: keep games where `stream_index % n == i`, counted over every
+    /// game in stream order *before* the rating filter so shards partition
+    /// disjointly regardless of which games the filter drops.
+    pub shard: (usize, usize),
+}
+
+/// One labelled WDL position. `target` is a win-probability in `{0.0, 0.5, 1.0}`
+/// (side-to-move-relative game outcome). It is deliberately not `Eq`/`Hash`
+/// (f32) — the disjoint-partition test compares the printed TSV lines instead.
+#[derive(Clone)]
+pub struct WdlSample {
+    pub target: f32,
+    pub own: Vec<usize>,
+    pub opp: Vec<usize>,
+    pub ply: u32,
+}
+
+#[derive(Default)]
+struct WdlTags {
+    event: String,
+    variant: String,
+    white_elo: u32,
+    black_elo: u32,
+    result: String,
+}
+
+struct WdlGame {
+    chess: Chess,
+    board: Board,
+    /// `(features_own, features_opp, side_to_move, ply)` for every eligible ply.
+    positions: Vec<(Vec<usize>, Vec<usize>, Color, u32)>,
+    ply: u32,
+    valid: bool,
+    result: String,
+}
+
+struct WdlBuilder {
+    config: WdlSampleConfig,
+    stream_index: usize,
+    out: Vec<WdlSample>,
+}
+
+impl WdlBuilder {
+    /// The same rating/standard filter book-tool applies (min rating 2200).
+    fn accepts_tags(tags: &WdlTags) -> bool {
+        tags.white_elo >= 2200
+            && tags.black_elo >= 2200
+            && tags.event.to_ascii_lowercase().contains("rated")
+            && (tags.variant.is_empty() || tags.variant.eq_ignore_ascii_case("standard"))
+    }
+}
+
+impl Visitor for WdlBuilder {
+    type Tags = WdlTags;
+    type Movetext = WdlGame;
+    type Output = ();
+
+    fn begin_tags(&mut self) -> ControlFlow<Self::Output, Self::Tags> {
+        ControlFlow::Continue(WdlTags::default())
+    }
+
+    fn tag(
+        &mut self,
+        tags: &mut WdlTags,
+        name: &[u8],
+        value: RawTag<'_>,
+    ) -> ControlFlow<Self::Output> {
+        let value = std::str::from_utf8(value.as_bytes()).unwrap_or_default();
+        match name {
+            b"Event" => tags.event = value.to_string(),
+            b"Variant" => tags.variant = value.to_string(),
+            b"WhiteElo" => tags.white_elo = value.parse().unwrap_or(0),
+            b"BlackElo" => tags.black_elo = value.parse().unwrap_or(0),
+            b"Result" => tags.result = value.to_string(),
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn begin_movetext(&mut self, tags: WdlTags) -> ControlFlow<Self::Output, Self::Movetext> {
+        let (i, n) = self.config.shard;
+        // Count every game in stream order and gate on the index *before* the
+        // rating filter, so `0/n, 1/n, ...` partition the games disjointly.
+        let in_shard = n == 0 || self.stream_index % n == i;
+        self.stream_index += 1;
+        let valid = in_shard && Self::accepts_tags(&tags);
+        ControlFlow::Continue(WdlGame {
+            chess: Chess::default(),
+            board: Board::startpos(),
+            positions: Vec::new(),
+            ply: 0,
+            valid,
+            result: tags.result,
+        })
+    }
+
+    fn san(&mut self, game: &mut WdlGame, san: SanPlus) -> ControlFlow<Self::Output> {
+        if !game.valid {
+            return ControlFlow::Continue(());
+        }
+        let Ok(mv) = san.san.to_move(&game.chess) else {
+            game.valid = false;
+            return ControlFlow::Continue(());
+        };
+        let stm = game.board.side_to_move;
+        // Capture the pre-move features for the eligible plies; only commit them
+        // once the move has applied cleanly to `board`.
+        let eligible = game.ply >= self.config.min_ply;
+        let features = eligible
+            .then(|| (active_features(&game.board, stm), active_features(&game.board, opposite(stm))));
+        let uci = UciMove::from_standard(mv.clone()).to_string();
+        match game
+            .board
+            .parse_uci_move(&uci)
+            .and_then(|parsed| game.board.make_move(parsed))
+        {
+            Ok(_) => {
+                if let Some((own, opp)) = features {
+                    game.positions.push((own, opp, stm, game.ply));
+                }
+                game.chess.play_unchecked(mv);
+                game.ply += 1;
+            }
+            Err(_) => game.valid = false,
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn end_game(&mut self, game: WdlGame) -> Self::Output {
+        if !game.valid || !matches!(game.result.as_str(), "1-0" | "0-1" | "1/2-1/2") {
+            return;
+        }
+        // Trim the last `end_trim` plies (mechanical), then evenly subsample to
+        // `per_game` positions (deterministic — no RNG).
+        let last_ply = game.ply;
+        let eligible: Vec<_> = game
+            .positions
+            .into_iter()
+            .filter(|(_, _, _, ply)| *ply + self.config.end_trim < last_ply)
+            .collect();
+        let picked = evenly_spaced(&eligible, self.config.per_game);
+        for (own, opp, stm, ply) in picked {
+            let target = wdl_target_for(&game.result, stm);
+            self.out.push(WdlSample {
+                target,
+                own,
+                opp,
+                ply,
+            });
+        }
+    }
+}
+
+/// The side-to-move-relative outcome as a win-probability: the side to move won
+/// -> 1.0, drew -> 0.5, lost -> 0.0.
+fn wdl_target_for(result: &str, stm: Color) -> f32 {
+    use engine_core::Color::*;
+    match (result, stm) {
+        ("1-0", White) | ("0-1", Black) => 1.0,
+        ("1/2-1/2", _) => 0.5,
+        _ => 0.0, // the side to move lost
+    }
+}
+
+/// Deterministically subsamples `items` down to at most `n` evenly spaced
+/// elements (returns them all when there are already `<= n`).
+fn evenly_spaced<T: Clone>(items: &[T], n: usize) -> Vec<T> {
+    if n == 0 {
+        return Vec::new();
+    }
+    if items.len() <= n {
+        return items.to_vec();
+    }
+    (0..n).map(|k| items[k * items.len() / n].clone()).collect()
+}
+
+/// Parses a PGN (whole games) and returns the labelled middlegame WDL samples.
+/// `&[u8]` implements `io::Read`, so the `&str` bytes feed the reader directly.
+pub fn gen_wdl_data_samples(pgn: &str, config: WdlSampleConfig) -> Vec<WdlSample> {
+    let mut builder = WdlBuilder {
+        config,
+        stream_index: 0,
+        out: Vec::new(),
+    };
+    Reader::new(pgn.as_bytes())
+        .visit_all_games(&mut builder)
+        .expect("reading an in-memory PGN cannot fail");
+    builder.out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1419,6 +1633,7 @@ mod tests {
         vector_to_eval_params, vector_to_search_params, MatchConfig, SprtConfig, SprtDecision,
         random_opening_fens, run_eval_gate_fens, run_mobility_gate, run_nnue_gauntlet,
         run_nnue_gauntlet_with_move_time, sprt_tsv_report, summarize,
+        gen_wdl_data_samples, WdlSample, WdlSampleConfig,
     };
     use engine_search::{EvalParams, Nnue, SearchParams, TaperedScore};
     use std::{sync::Arc, time::Duration};
@@ -1939,5 +2154,165 @@ mod tests {
         assert!(report.starts_with("engine_version\tcase\tdepth"));
         assert!(report.contains("mate_in_one"));
         assert!(report.contains("\t1.000000\n"));
+    }
+
+    const WDL_FIXTURE: &str = concat!(
+        "[Event \"Rated Blitz\"]\n[WhiteElo \"2400\"]\n[BlackElo \"2400\"]\n[Result \"1-0\"]\n\n",
+        "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4 Nf6 5. O-O Be7 6. Re1 b5 7. Bb3 d6 8. c3 O-O 9. h3 Nb8 10. d4 Nbd7 1-0\n",
+    );
+
+    /// Four distinct rated games (a White win, a draw, a White win, a Black win),
+    /// each 20 plies of standard theory, for the shard-partition test. Distinct
+    /// openings guarantee the sampled middlegame positions never collide across
+    /// games, so the shards are set-disjoint.
+    const WDL_MULTI_GAME_FIXTURE: &str = concat!(
+        // Game 0: Ruy Lopez, White win.
+        "[Event \"Rated Blitz\"]\n[WhiteElo \"2400\"]\n[BlackElo \"2400\"]\n[Result \"1-0\"]\n\n",
+        "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4 Nf6 5. O-O Be7 6. Re1 b5 7. Bb3 d6 8. c3 O-O 9. h3 Nb8 10. d4 Nbd7 1-0\n\n",
+        // Game 1: Italian, draw.
+        "[Event \"Rated Blitz\"]\n[WhiteElo \"2300\"]\n[BlackElo \"2350\"]\n[Result \"1/2-1/2\"]\n\n",
+        "1. e4 e5 2. Nf3 Nc6 3. Bc4 Bc5 4. c3 Nf6 5. d3 d6 6. O-O O-O 7. Re1 a6 8. Bb3 Ba7 9. h3 h6 10. Nbd2 Re8 1/2-1/2\n\n",
+        // Game 2: Queen's Gambit Declined, White win.
+        "[Event \"Rated Rapid\"]\n[WhiteElo \"2500\"]\n[BlackElo \"2450\"]\n[Result \"1-0\"]\n\n",
+        "1. d4 d5 2. c4 e6 3. Nc3 Nf6 4. Bg5 Be7 5. e3 O-O 6. Nf3 h6 7. Bh4 b6 8. cxd5 exd5 9. Bd3 Bb7 10. O-O Nbd7 1-0\n\n",
+        // Game 3: Sicilian, Black win.
+        "[Event \"Rated Blitz\"]\n[WhiteElo \"2600\"]\n[BlackElo \"2620\"]\n[Result \"0-1\"]\n\n",
+        "1. e4 c5 2. Nf3 d6 3. d4 cxd4 4. Nxd4 Nf6 5. Nc3 a6 6. Be2 e5 7. Nb3 Be7 8. O-O O-O 9. Be3 Be6 10. Nd5 Nbd7 0-1\n\n",
+    );
+
+    fn wdl_line(sample: &WdlSample) -> String {
+        let join = |indices: &[usize]| {
+            indices
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!("{}\t{}\t{}", sample.target, join(&sample.own), join(&sample.opp))
+    }
+
+    #[test]
+    fn gen_wdl_data_labels_positions_by_side_to_move_outcome() {
+        // A 1-0 game: White-to-move sampled positions score 1.0, Black-to-move 0.0.
+        let samples = gen_wdl_data_samples(
+            WDL_FIXTURE,
+            WdlSampleConfig {
+                min_ply: 8,
+                end_trim: 5,
+                per_game: 6,
+                shard: (0, 1),
+            },
+        );
+        assert!(!samples.is_empty());
+        for s in &samples {
+            assert!(s.target == 1.0 || s.target == 0.0, "1-0 game targets are 1.0/0.0");
+            // white-to-move (even ply index) -> won -> 1.0; black-to-move -> 0.0
+            assert_eq!(s.target, if s.ply % 2 == 0 { 1.0 } else { 0.0 });
+            assert!(!s.own.is_empty() && !s.opp.is_empty());
+            assert!(s.own.iter().all(|&i| i < 768) && s.opp.iter().all(|&i| i < 768));
+        }
+    }
+
+    #[test]
+    fn gen_wdl_data_is_deterministic() {
+        let config = WdlSampleConfig {
+            min_ply: 8,
+            end_trim: 5,
+            per_game: 6,
+            shard: (0, 1),
+        };
+        let first: Vec<String> = gen_wdl_data_samples(WDL_MULTI_GAME_FIXTURE, config)
+            .iter()
+            .map(wdl_line)
+            .collect();
+        let second: Vec<String> = gen_wdl_data_samples(WDL_MULTI_GAME_FIXTURE, config)
+            .iter()
+            .map(wdl_line)
+            .collect();
+        assert!(!first.is_empty());
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn gen_wdl_data_skips_the_opening_and_the_endgame() {
+        // The fixture applies exactly 20 plies, so with min_ply 8 / end_trim 5
+        // every sample must land in [8, 20 - 5).
+        let min_ply = 8;
+        let end_trim = 5;
+        let last_ply = 20;
+        let samples = gen_wdl_data_samples(
+            WDL_FIXTURE,
+            WdlSampleConfig {
+                min_ply,
+                end_trim,
+                per_game: 100,
+                shard: (0, 1),
+            },
+        );
+        assert!(!samples.is_empty());
+        for s in &samples {
+            assert!(s.ply >= min_ply, "no opening plies: {}", s.ply);
+            assert!(s.ply + end_trim < last_ply, "no endgame plies: {}", s.ply);
+        }
+    }
+
+    #[test]
+    fn gen_wdl_data_caps_positions_per_game() {
+        let per_game = 4;
+        let samples = gen_wdl_data_samples(
+            WDL_FIXTURE,
+            WdlSampleConfig {
+                min_ply: 8,
+                end_trim: 5,
+                per_game,
+                shard: (0, 1),
+            },
+        );
+        // The single-game fixture yields at most `per_game` samples.
+        assert!(!samples.is_empty());
+        assert!(samples.len() <= per_game);
+    }
+
+    #[test]
+    fn gen_wdl_data_shards_partition_disjointly() {
+        let config = |shard| WdlSampleConfig {
+            min_ply: 8,
+            end_trim: 5,
+            per_game: 6,
+            shard,
+        };
+        let lines = |shard| {
+            gen_wdl_data_samples(WDL_MULTI_GAME_FIXTURE, config(shard))
+                .iter()
+                .map(wdl_line)
+                .collect::<Vec<_>>()
+        };
+        let all = lines((0, 1));
+        let shard0 = lines((0, 3));
+        let shard1 = lines((1, 3));
+        let shard2 = lines((2, 3));
+
+        assert!(!all.is_empty());
+        // Every shard is non-empty (the four distinct games spread across 0,1,2).
+        assert!(!shard0.is_empty() && !shard1.is_empty() && !shard2.is_empty());
+
+        use std::collections::HashSet;
+        let set0: HashSet<&String> = shard0.iter().collect();
+        let set1: HashSet<&String> = shard1.iter().collect();
+        let set2: HashSet<&String> = shard2.iter().collect();
+        // No TSV line appears in more than one shard.
+        assert!(set0.is_disjoint(&set1));
+        assert!(set0.is_disjoint(&set2));
+        assert!(set1.is_disjoint(&set2));
+
+        // The union of the three shards equals the full (0/1) set exactly.
+        let union: HashSet<&String> = set0.union(&set1).cloned().collect::<HashSet<_>>()
+            .union(&set2)
+            .cloned()
+            .collect();
+        let all_set: HashSet<&String> = all.iter().collect();
+        assert_eq!(union, all_set);
+        // And the shards partition the samples with no duplication.
+        assert_eq!(shard0.len() + shard1.len() + shard2.len(), all.len());
     }
 }
