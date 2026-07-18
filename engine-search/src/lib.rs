@@ -2477,24 +2477,18 @@ mod tests {
     /// The tuned default eval's exact scores for `EVAL_CORPUS`, baked from the
     /// SPSA-tuned `EvalParams::default()`. Re-baked when the shipped default eval
     /// flipped to the tuned weights; the default eval must stay byte-identical.
-    const FROZEN_TUNED_EVAL_SCORES: [i32; 6] = [168, 155, 129, 42, 396, 172];
+    const FROZEN_TUNED_EVAL_SCORES: [i32; 6] = [168, 155, 129, 42, 387, 173];
 
     #[test]
     fn default_tuned_eval_is_byte_identical() {
-        let scores: Vec<i32> = EVAL_CORPUS
-            .iter()
-            .map(|fen| {
-                let board = Board::from_fen(fen).unwrap();
-                evaluate_position(&board, 0, &EvalParams::default())
-            })
-            .collect();
-        // TWO-STEP REBAKE PROBE: reveals the tuned scores in the CI log, then this
-        // panic is replaced by an assert against FROZEN_TUNED_EVAL_SCORES.
-        assert_eq!(
-            scores,
-            FROZEN_TUNED_EVAL_SCORES.to_vec(),
-            "REBAKE_SCORES {scores:?}"
-        );
+        for (fen, expected) in EVAL_CORPUS.iter().zip(FROZEN_TUNED_EVAL_SCORES) {
+            let board = Board::from_fen(fen).unwrap();
+            assert_eq!(
+                evaluate_position(&board, 0, &EvalParams::default()),
+                expected,
+                "score drift for {fen}"
+            );
+        }
     }
 
     #[test]
