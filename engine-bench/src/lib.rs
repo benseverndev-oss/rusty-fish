@@ -1259,6 +1259,23 @@ mod tests {
     }
 
     #[test]
+    fn search_param_spsa_matches_the_frozen_tuned_params() {
+        let cfg = SpsaConfig {
+            iterations: 3,
+            match_config: MatchConfig {
+                candidate_depth: 2,
+                baseline_depth: 2,
+                max_plies: 16,
+            },
+            ..SpsaConfig::default()
+        };
+        let pos = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"];
+        let report = run_spsa_campaign(&pos, SearchParams::default(), cfg).unwrap();
+        eprintln!("FROZEN_TUNED = {:?}", report.tuned); // TEMP: read from CI, then bake below
+        // assert_eq!(report.tuned, SearchParams { ...frozen from CI... });
+    }
+
+    #[test]
     fn balanced_score_has_zero_elo_difference() {
         assert_eq!(MatchScore::default().elo_difference(), Some(0.0));
         assert_eq!(
