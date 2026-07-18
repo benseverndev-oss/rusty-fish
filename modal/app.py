@@ -102,6 +102,37 @@ def mobility_gate_shard(movetime_ms: int, openings_text: str) -> tuple[int, int,
 
 
 @app.function(image=rust_image)
+def eval_gate_shard(movetime_ms: int, tuned_tsv: str, openings_text: str) -> tuple[int, int, int]:
+    """Play the tuned eval (mobility on) vs the default eval over one opening shard."""
+    with tempfile.TemporaryDirectory() as directory:
+        openings_path = f"{directory}/openings.txt"
+        tuned_path = f"{directory}/tuned.tsv"
+        with open(openings_path, "w", encoding="utf-8") as handle:
+            handle.write(openings_text)
+        with open(tuned_path, "w", encoding="utf-8") as handle:
+            handle.write(tuned_tsv)
+        result = subprocess.run(
+            [BIN, "eval-gate-file", openings_path, tuned_path, str(movetime_ms)],
+            capture_output=True, text=True, check=True,
+        )
+    wins, draws, losses = (int(x) for x in result.stdout.strip().split("\t"))
+    return wins, draws, losses
+
+
+# A generous timeout: the eval SPSA campaign runs its iterations sequentially in
+# one container (the loop is Rust, only the matches are sequential here), so it
+# needs hours, not minutes. Matches how train_net runs the trainer.
+@app.function(image=rust_image, timeout=60 * 60 * 3)
+def spsa_tune_run(iterations: int, openings: int, movetime_ms: int) -> str:
+    """Run the eval SPSA campaign in one container; return the tuned EvalParams TSV."""
+    result = subprocess.run(
+        [BIN, "spsa-eval", str(iterations), str(openings), str(movetime_ms)],
+        capture_output=True, text=True, check=True,
+    )
+    return result.stdout.strip()
+
+
+@app.function(image=rust_image)
 def sprt_verdict(wins: int, draws: int, losses: int) -> str:
     result = subprocess.run(
         [BIN, "sprt", str(wins), str(draws), str(losses)],
@@ -188,4 +219,45 @@ def mobility_gate(
         draws += d
         losses += l
     print(f"mobility gate over {len(openings) * 2} games: {wins}W {draws}D {losses}L")
+    print(sprt_verdict.remote(wins, draws, losses))
+
+
+@app.local_entrypoint()
+def spsa_tune(iterations: int = 40, openings: int = 24, movetime_ms: int = 20):
+    """Tune the hand-crafted eval weights via SPSA self-play, in one container.
+
+    Prints the tuned EvalParams as an 18-value TSV — feed it to `eval_gate` to
+    verify it beats the current default.
+
+        modal run modal/app.py::spsa_tune
+        modal run modal/app.py::spsa_tune --iterations 60 --openings 32 --movetime-ms 20
+    """
+    tuned_tsv = spsa_tune_run.remote(iterations, openings, movetime_ms)
+    print("TUNED_EVAL_PARAMS_TSV")
+    print(tuned_tsv)
+
+
+@app.local_entrypoint()
+def eval_gate(
+    tuned: str,
+    gate_openings: int = 2048,
+    gate_plies: int = 8,
+    movetime_ms: int = 50,
+    gate_shard_size: int = 32,
+):
+    """Powered SPRT of a tuned eval (mobility on) vs today's default, fanned out.
+
+    `tuned` is the 18-value TSV printed by `spsa_tune`.
+
+        modal run modal/app.py::eval_gate --tuned "$(cat tuned.tsv)"
+    """
+    openings = [line for line in make_openings.remote(gate_openings, gate_plies, 1).splitlines() if line]
+    shard_texts = list(_chunks(openings, gate_shard_size))
+    results = eval_gate_shard.starmap([(movetime_ms, tuned, text) for text in shard_texts])
+    wins = draws = losses = 0
+    for w, d, l in results:
+        wins += w
+        draws += d
+        losses += l
+    print(f"eval gate over {len(openings) * 2} games: {wins}W {draws}D {losses}L")
     print(sprt_verdict.remote(wins, draws, losses))
