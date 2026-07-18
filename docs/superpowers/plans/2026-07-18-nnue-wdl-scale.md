@@ -125,21 +125,24 @@ def sha_probe_one(name: str, url: str) -> str:
 
 @app.local_entrypoint()
 def sha_probe():
-    """Print sha256 for every corpus month with a missing/empty SHA.
+    """Print sha256 for EVERY corpus month (incl. the already-pinned 2017-01, so it
+    serves as a cross-check anchor against the digest copied from the book manifest).
 
         modal run modal/app.py::sha_probe
     """
-    months = [m for m in _load_wdl_corpus() if not m.get("sha256")]
+    months = _load_wdl_corpus()
     for line in sha_probe_one.starmap([(m["name"], m["url"]) for m in months]):
         print(line)
 ```
+
+(Probing all six re-downloads 2017-01 once — cheap for a one-time step and worth it: 2017-01's probed digest must match the pinned `d1236dcd…12f6`, catching any typo in the pinned value.)
 
 - [ ] **Step 3: Run the probe, pin the SHAs, commit**
 
 Run (detached not needed — it is short-ish but downloads ~5 files; use `--detach` and read logs to be safe):
 
 ```
-PYTHONUTF8=1 PYTHONIOENCODING=utf-8 infisical run --env dev -- uv run --with modal -- modal run modal/app.py::sha_probe
+PYTHONUTF8=1 PYTHONIOENCODING=utf-8 infisical run --env dev -- uv run --with modal --python 3.12 -- modal run modal/app.py::sha_probe
 ```
 
 Copy each printed `SHA_PROBE <name> <digest>` into the matching `sha256 = ""` in `assets/nnue/wdl-corpus.toml`. Sanity check: `2017-01`'s probed digest MUST equal the already-pinned `d1236dcd…12f6` (same file) — if it does not, stop and investigate. Then:
@@ -237,7 +240,7 @@ def train(data_path, hidden, epochs, batch_size, lr, device, wdl_target=False):
     train_idx = all_idx[~is_val]
     val_idx = all_idx[is_val]
 
-    model = <Nnue defined above>.to(device)
+    model = Nnue(hidden).to(device)   # the module class from Step 2
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
@@ -271,6 +274,8 @@ def train(data_path, hidden, epochs, batch_size, lr, device, wdl_target=False):
 ```
 
 (The model class stays defined inside `train` as today, or hoist it to module scope — either is fine; keep it inside to minimize churn.)
+
+**int32-index note:** `own_t`/`opp_t` are int32. Modern torch (2.x) indexes `nn.Embedding` with int32 fine, and the Step 5 parity check exercises this exact path on CPU so a failure surfaces there. If a given torch build raises `Expected ... scalar type Long`, cast the minibatch at the call site — `model(own_t[idx].long(), opp_t[idx].long())` — rather than storing int64 (keeps the resident tensors at ~2.3 GB; the transient batch cast is negligible).
 
 - [ ] **Step 4: Fix `quantize_and_write` to drop the padding row**
 
@@ -351,7 +356,11 @@ def label_wdl_shard(name: str, i: int, n: int, per_game: int) -> int:
         return sum(1 for line in handle if line.strip())
 ```
 
-`train_wdl_run`'s `sorted(glob.glob("/vol/samples-*.tsv"))` already matches `samples-2017-01-0.tsv` etc., so it needs **no change** beyond receiving `hidden`/`epochs` (already parameters). Raise its `timeout` to `60 * 60 * 3` for the larger dataset.
+**`train_wdl_run` needs three changes** (do NOT leave its glob as-is):
+
+1. **Narrow the glob** from `samples-*.tsv` to `samples-*-*.tsv`. The `rusty-fish-wdl` Volume is persistent and **still holds v1's `samples-0.tsv`…`samples-15.tsv`** (the single-month shards that produced the −325 baseline). The broad glob would silently concatenate ~1.5M stale single-month samples into the new corpus. The `samples-*-*.tsv` pattern matches the new `samples-<month>-<i>.tsv` names and excludes the v1 `samples-<i>.tsv` names. As a belt-and-braces cleanup, delete stale one-token shards first: `for p in glob.glob("/vol/samples-*.tsv"):` and remove any whose basename has fewer than two `-`-separated index segments (or simply `os.remove` every `/vol/samples-*.tsv` that does not match `/vol/samples-*-*.tsv`), plus remove a stale `/vol/data.tsv` before rewriting it.
+2. **Set a host-memory floor:** add `memory=32768` to the `@app.function(...)` decorator. `_load_samples` holds ~9M own+opp Python index-lists and `_pad_rows` transiently builds a ~150M-int `flat` list per perspective — this is host RAM, not GPU RAM, and can OOM a default-sized container before anything reaches the GPU. 32 GB is a safe floor.
+3. Receive `hidden`/`epochs` (already parameters) and raise `timeout` to `60 * 60 * 3` for the larger dataset.
 
 - [ ] **Step 3: Movetime gate (orchestration-only)**
 
@@ -430,7 +439,7 @@ git commit -m "feat(nnue): multi-month WDL corpus fan-out + movetime gate, hidde
 - [ ] **Step 3: Short Modal validation** — 2 months, tiny config, to confirm multi-month download, `(month,shard)` fan-out, the batched trainer, and the movetime gate all work end-to-end:
 
 ```
-PYTHONUTF8=1 PYTHONIOENCODING=utf-8 infisical run --env dev -- uv run --with modal -- \
+PYTHONUTF8=1 PYTHONIOENCODING=utf-8 infisical run --env dev -- uv run --with modal --python 3.12 -- \
   modal run --detach modal/app.py::train_wdl \
   --months 2017-01,2017-02 --shards-per-month 2 --per-game 2 --hidden 64 --epochs 2 \
   --gate-openings 64 --gate-shard-size 16 --move-time-ms 50
@@ -441,7 +450,7 @@ Retrieve via `modal app logs <app-id>`: confirm a labeled-sample count, a traine
 - [ ] **Step 4: Real run** — all six months, hidden 512, 60 epochs, powered gate:
 
 ```
-PYTHONUTF8=1 PYTHONIOENCODING=utf-8 infisical run --env dev -- uv run --with modal -- \
+PYTHONUTF8=1 PYTHONIOENCODING=utf-8 infisical run --env dev -- uv run --with modal --python 3.12 -- \
   modal run --detach modal/app.py::train_wdl \
   --shards-per-month 8 --per-game 12 --hidden 512 --epochs 60 \
   --gate-openings 2048 --gate-shard-size 32 --move-time-ms 50
