@@ -898,7 +898,7 @@ pub fn search_params_to_vector(params: &SearchParams) -> [f64; SPSA_DIMENSIONS] 
 /// Reconstructs a [`SearchParams`] from a tunable vector, clamping to bounds and
 /// rounding to each field's integer type.
 pub fn vector_to_search_params(vector: &[f64; SPSA_DIMENSIONS]) -> SearchParams {
-    let clamped = clamp_vector(vector);
+    let clamped = clamp_vector(vector, &SPSA_SPECS);
     SearchParams {
         aspiration_window: clamped[0].round() as i32,
         razor_margin_base: clamped[1].round() as i32,
@@ -912,24 +912,28 @@ pub fn vector_to_search_params(vector: &[f64; SPSA_DIMENSIONS]) -> SearchParams 
     }
 }
 
-fn clamp_vector(vector: &[f64; SPSA_DIMENSIONS]) -> [f64; SPSA_DIMENSIONS] {
-    let mut out = *vector;
-    for (value, spec) in out.iter_mut().zip(SPSA_SPECS.iter()) {
-        *value = value.clamp(spec.min, spec.max);
-    }
-    out
+/// Narrows a generalized SPSA vector back to the fixed-width search-param array
+/// so it can feed [`vector_to_search_params`].
+fn to_array(v: &[f64]) -> [f64; SPSA_DIMENSIONS] {
+    v.try_into().expect("len")
 }
 
-fn perturb(
-    theta: &[f64; SPSA_DIMENSIONS],
-    direction: &[f64; SPSA_DIMENSIONS],
-    sign: f64,
-) -> [f64; SPSA_DIMENSIONS] {
-    let mut out = *theta;
-    for index in 0..SPSA_DIMENSIONS {
-        out[index] += sign * direction[index] * SPSA_SPECS[index].step;
-    }
-    clamp_vector(&out)
+fn clamp_vector(vector: &[f64], specs: &[SpsaSpec]) -> Vec<f64> {
+    vector
+        .iter()
+        .zip(specs)
+        .map(|(v, s)| v.clamp(s.min, s.max))
+        .collect()
+}
+
+fn perturb(theta: &[f64], direction: &[f64], sign: f64, specs: &[SpsaSpec]) -> Vec<f64> {
+    let stepped: Vec<f64> = theta
+        .iter()
+        .zip(direction)
+        .zip(specs)
+        .map(|((t, d), s)| t + sign * d * s.step)
+        .collect();
+    clamp_vector(&stepped, specs)
 }
 
 /// A small deterministic xorshift64* PRNG. Seeding it identically reproduces the
@@ -957,12 +961,10 @@ impl SpsaRng {
     }
 
     /// Draws a Rademacher (+/-1) perturbation direction for every dimension.
-    pub fn direction(&mut self) -> [f64; SPSA_DIMENSIONS] {
-        let mut direction = [0.0; SPSA_DIMENSIONS];
-        for value in direction.iter_mut() {
-            *value = if self.next_u64() & 1 == 0 { -1.0 } else { 1.0 };
-        }
-        direction
+    pub fn direction(&mut self, dimensions: usize) -> Vec<f64> {
+        (0..dimensions)
+            .map(|_| if self.next_u64() & 1 == 0 { -1.0 } else { 1.0 })
+            .collect()
     }
 }
 
@@ -995,17 +997,20 @@ impl Default for SpsaConfig {
 /// its mirror (`theta - step`); `candidate_score` is that match's score fraction
 /// in `[0, 1]`. The result is clamped to the spec bounds.
 pub fn spsa_update(
-    theta: &[f64; SPSA_DIMENSIONS],
-    direction: &[f64; SPSA_DIMENSIONS],
+    theta: &[f64],
+    direction: &[f64],
     candidate_score: f64,
     learning_rate: f64,
-) -> [f64; SPSA_DIMENSIONS] {
+    specs: &[SpsaSpec],
+) -> Vec<f64> {
     let gradient = 2.0 * candidate_score - 1.0;
-    let mut next = *theta;
-    for index in 0..SPSA_DIMENSIONS {
-        next[index] += learning_rate * gradient * direction[index] * SPSA_SPECS[index].step;
-    }
-    clamp_vector(&next)
+    let next: Vec<f64> = theta
+        .iter()
+        .zip(direction)
+        .zip(specs)
+        .map(|((t, d), s)| t + learning_rate * gradient * d * s.step)
+        .collect();
+    clamp_vector(&next, specs)
 }
 
 #[derive(Clone, Debug)]
@@ -1032,14 +1037,16 @@ pub fn run_spsa_campaign(
     initial: SearchParams,
     config: SpsaConfig,
 ) -> Result<SpsaReport, String> {
-    let mut theta = search_params_to_vector(&initial);
+    let mut theta = search_params_to_vector(&initial).to_vec();
     let mut rng = SpsaRng::new(config.seed);
     let mut iterations = Vec::with_capacity(config.iterations);
 
     for iteration in 0..config.iterations {
-        let direction = rng.direction();
-        let plus = vector_to_search_params(&perturb(&theta, &direction, 1.0));
-        let minus = vector_to_search_params(&perturb(&theta, &direction, -1.0));
+        let direction = rng.direction(SPSA_DIMENSIONS);
+        let plus_vector = perturb(&theta, &direction, 1.0, &SPSA_SPECS);
+        let minus_vector = perturb(&theta, &direction, -1.0, &SPSA_SPECS);
+        let plus = vector_to_search_params(&to_array(&plus_vector));
+        let minus = vector_to_search_params(&to_array(&minus_vector));
 
         let mut score = MatchScore::default();
         for fen in positions {
@@ -1055,18 +1062,18 @@ pub fn run_spsa_campaign(
         }
 
         let fraction = score.score_fraction().unwrap_or(0.5);
-        theta = spsa_update(&theta, &direction, fraction, config.learning_rate);
+        theta = spsa_update(&theta, &direction, fraction, config.learning_rate, &SPSA_SPECS);
         iterations.push(SpsaIterationRecord {
             iteration,
             score,
             candidate_score_fraction: fraction,
-            params: vector_to_search_params(&theta),
+            params: vector_to_search_params(&to_array(&theta)),
         });
     }
 
     Ok(SpsaReport {
         initial,
-        tuned: vector_to_search_params(&theta),
+        tuned: vector_to_search_params(&to_array(&theta)),
         iterations,
     })
 }
@@ -1185,12 +1192,12 @@ mod tests {
         let mut a = SpsaRng::new(42);
         let mut b = SpsaRng::new(42);
         let mut c = SpsaRng::new(43);
-        let first = a.direction();
-        assert_eq!(first, b.direction());
+        let first = a.direction(SPSA_DIMENSIONS);
+        assert_eq!(first, b.direction(SPSA_DIMENSIONS));
         // Every drawn component is a Rademacher +/-1.
         assert!(first.iter().all(|value| *value == 1.0 || *value == -1.0));
         // A different seed almost surely differs over the whole run.
-        let differs = (0..8).any(|_| a.direction() != c.direction());
+        let differs = (0..8).any(|_| a.direction(SPSA_DIMENSIONS) != c.direction(SPSA_DIMENSIONS));
         assert!(differs);
     }
 
@@ -1205,8 +1212,8 @@ mod tests {
     fn spsa_update_moves_toward_the_winning_side() {
         let theta = search_params_to_vector(&SearchParams::default());
         let direction = [1.0; SPSA_DIMENSIONS];
-        let up = spsa_update(&theta, &direction, 1.0, 1.0);
-        let down = spsa_update(&theta, &direction, 0.0, 1.0);
+        let up = spsa_update(&theta, &direction, 1.0, 1.0, &SPSA_SPECS);
+        let down = spsa_update(&theta, &direction, 0.0, 1.0, &SPSA_SPECS);
         for index in 0..SPSA_DIMENSIONS {
             // Defaults sit strictly inside the bounds, so a decisive result moves
             // every parameter in the direction of the stronger side.
@@ -1214,7 +1221,7 @@ mod tests {
             assert!(down[index] < theta[index], "dimension {index} should decrease");
         }
         // A drawn result leaves the parameters unchanged.
-        assert_eq!(spsa_update(&theta, &direction, 0.5, 1.0), theta);
+        assert_eq!(spsa_update(&theta, &direction, 0.5, 1.0, &SPSA_SPECS), theta);
     }
 
     #[test]
@@ -1222,7 +1229,7 @@ mod tests {
         let at_max: Vec<f64> = SPSA_SPECS.iter().map(|spec| spec.max).collect();
         let theta: [f64; SPSA_DIMENSIONS] = at_max.try_into().unwrap();
         let direction = [1.0; SPSA_DIMENSIONS];
-        let stepped = spsa_update(&theta, &direction, 1.0, 1.0);
+        let stepped = spsa_update(&theta, &direction, 1.0, 1.0, &SPSA_SPECS);
         for index in 0..SPSA_DIMENSIONS {
             assert!(stepped[index] <= SPSA_SPECS[index].max);
             assert_eq!(stepped[index], SPSA_SPECS[index].max);
