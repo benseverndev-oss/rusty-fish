@@ -6,7 +6,7 @@ use std::thread;
 use std::time::Duration;
 
 use engine_core::{Board, Color, GameStatus};
-use engine_search::{Nnue, SearchLimits, SearchParams, Searcher};
+use engine_search::{EvalParams, Nnue, SearchLimits, SearchParams, Searcher, TaperedScore};
 
 pub mod train;
 
@@ -536,26 +536,33 @@ fn play_game(fen: &str, candidate_color: Color, config: MatchConfig) -> Result<G
         fen,
         candidate_color,
         SearchParams::default(),
+        EvalParams::default(),
         SearchParams::default(),
+        EvalParams::default(),
         config,
     )
 }
 
 /// Plays one self-play game between two parameter sets. The candidate searches
-/// with `candidate_params`, the baseline with `baseline_params`; this is the
-/// objective the SPSA tuner optimises.
+/// with `candidate_params`/`candidate_eval`, the baseline with
+/// `baseline_params`/`baseline_eval`; this is the objective the SPSA tuner
+/// optimises. Per-side `EvalParams` let a match pit two eval configurations.
 pub fn play_parameter_game(
     fen: &str,
     candidate_color: Color,
     candidate_params: SearchParams,
+    candidate_eval: EvalParams,
     baseline_params: SearchParams,
+    baseline_eval: EvalParams,
     config: MatchConfig,
 ) -> Result<GameRecord, String> {
     let mut board = Board::from_fen(fen)?;
     let mut candidate = Searcher::default();
     candidate.set_search_params(candidate_params);
+    candidate.set_eval_params(candidate_eval);
     let mut baseline = Searcher::default();
     baseline.set_search_params(baseline_params);
+    baseline.set_eval_params(baseline_eval);
     for ply in 0..config.max_plies {
         let (depth, searcher) = if board.side_to_move == candidate_color {
             (config.candidate_depth, &mut candidate)
@@ -590,9 +597,10 @@ pub fn play_parameter_game(
 /// A gate searcher: the given params plus a trimmed move overhead so a small
 /// `movetime` budget is actually spent searching rather than swallowed by the
 /// default 25 ms overhead (there is no GUI latency to reserve for here).
-fn gate_searcher(params: SearchParams) -> Searcher {
+fn gate_searcher(params: SearchParams, eval: EvalParams) -> Searcher {
     let mut searcher = Searcher::default();
     searcher.set_search_params(params);
+    searcher.set_eval_params(eval);
     let mut options = searcher.options().clone();
     options.move_overhead = Duration::from_millis(3);
     searcher.set_options(options);
@@ -607,13 +615,15 @@ fn play_mobility_game(
     fen: &str,
     candidate_color: Color,
     candidate_params: SearchParams,
+    candidate_eval: EvalParams,
     baseline_params: SearchParams,
+    baseline_eval: EvalParams,
     move_time: Duration,
     max_plies: u32,
 ) -> Result<GameRecord, String> {
     let mut board = Board::from_fen(fen)?;
-    let mut candidate = gate_searcher(candidate_params);
-    let mut baseline = gate_searcher(baseline_params);
+    let mut candidate = gate_searcher(candidate_params, candidate_eval);
+    let mut baseline = gate_searcher(baseline_params, baseline_eval);
     for ply in 0..max_plies {
         let searcher = if board.side_to_move == candidate_color {
             &mut candidate
@@ -678,6 +688,43 @@ pub fn run_mobility_gate_fens<S: AsRef<str>>(
                 fen.as_ref(),
                 candidate_color,
                 candidate,
+                EvalParams::default(),
+                baseline,
+                EvalParams::default(),
+                move_time,
+                max_plies,
+            )?);
+        }
+    }
+    Ok(records)
+}
+
+/// The eval gate over an explicit set of opening FENs — the shardable core so a
+/// Modal fan-out can play a slice per container. Plays the `candidate`
+/// `EvalParams` (mobility on, `mobility_scale = 100`) against the `baseline`
+/// `EvalParams` (mobility off) over each FEN color-swapped, at the same
+/// `move_time` per move, capped at `max_plies`. Because the candidate also turns
+/// mobility on while the baseline leaves it off, the SPRT measures the *combined*
+/// tuned-eval-plus-mobility-on change versus the current default — not a pure
+/// eval-only A/B (that would require both sides to share one mobility setting).
+pub fn run_eval_gate_fens<S: AsRef<str>>(
+    fens: &[S],
+    candidate: EvalParams,
+    baseline: EvalParams,
+    move_time: Duration,
+    max_plies: u32,
+) -> Result<Vec<GameRecord>, String> {
+    let candidate_params = SearchParams { mobility_scale: 100, ..SearchParams::default() };
+    let baseline_params = SearchParams::default(); // mobility_scale == 0
+    let mut records = Vec::with_capacity(fens.len() * 2);
+    for fen in fens {
+        for candidate_color in [Color::White, Color::Black] {
+            records.push(play_mobility_game(
+                fen.as_ref(),
+                candidate_color,
+                candidate_params,
+                candidate,
+                baseline_params,
                 baseline,
                 move_time,
                 max_plies,
@@ -898,7 +945,7 @@ pub fn search_params_to_vector(params: &SearchParams) -> [f64; SPSA_DIMENSIONS] 
 /// Reconstructs a [`SearchParams`] from a tunable vector, clamping to bounds and
 /// rounding to each field's integer type.
 pub fn vector_to_search_params(vector: &[f64; SPSA_DIMENSIONS]) -> SearchParams {
-    let clamped = clamp_vector(vector);
+    let clamped = clamp_vector(vector, &SPSA_SPECS);
     SearchParams {
         aspiration_window: clamped[0].round() as i32,
         razor_margin_base: clamped[1].round() as i32,
@@ -912,24 +959,164 @@ pub fn vector_to_search_params(vector: &[f64; SPSA_DIMENSIONS]) -> SearchParams 
     }
 }
 
-fn clamp_vector(vector: &[f64; SPSA_DIMENSIONS]) -> [f64; SPSA_DIMENSIONS] {
-    let mut out = *vector;
-    for (value, spec) in out.iter_mut().zip(SPSA_SPECS.iter()) {
-        *value = value.clamp(spec.min, spec.max);
-    }
-    out
+/// Narrows a generalized SPSA vector back to the fixed-width search-param array
+/// so it can feed [`vector_to_search_params`].
+fn to_array(v: &[f64]) -> [f64; SPSA_DIMENSIONS] {
+    v.try_into().expect("len")
 }
 
-fn perturb(
-    theta: &[f64; SPSA_DIMENSIONS],
-    direction: &[f64; SPSA_DIMENSIONS],
-    sign: f64,
-) -> [f64; SPSA_DIMENSIONS] {
-    let mut out = *theta;
-    for index in 0..SPSA_DIMENSIONS {
-        out[index] += sign * direction[index] * SPSA_SPECS[index].step;
+/// Number of tunable eval dimensions: 4 piece values x (mg, eg) = 8, 4 mobility
+/// weights x (mg, eg) = 8, plus `bishop_pair` and `passed_pawn_base`. Kept next
+/// to [`EVAL_SPSA_SPECS`] and the projection functions so the table and vector
+/// lengths cannot drift.
+pub const EVAL_DIMENSIONS: usize = 18;
+
+/// The fixed, documented order of the eval SPSA vector. **This order is the
+/// interchange contract** shared by [`eval_params_to_vector`],
+/// [`vector_to_eval_params`], and the `eval-gate-file` / `spsa-eval` TSV: any
+/// producer and consumer must agree on it. The 18 slots are, in order:
+///
+/// | Index | Weight |
+/// |-------|--------|
+/// | 0  | `knight.middlegame`          |
+/// | 1  | `knight.endgame`             |
+/// | 2  | `bishop.middlegame`          |
+/// | 3  | `bishop.endgame`             |
+/// | 4  | `rook.middlegame`            |
+/// | 5  | `rook.endgame`               |
+/// | 6  | `queen.middlegame`           |
+/// | 7  | `queen.endgame`              |
+/// | 8  | `knight_mobility.middlegame` |
+/// | 9  | `knight_mobility.endgame`    |
+/// | 10 | `bishop_mobility.middlegame` |
+/// | 11 | `bishop_mobility.endgame`    |
+/// | 12 | `rook_mobility.middlegame`   |
+/// | 13 | `rook_mobility.endgame`      |
+/// | 14 | `queen_mobility.middlegame`  |
+/// | 15 | `queen_mobility.endgame`     |
+/// | 16 | `bishop_pair`                |
+/// | 17 | `passed_pawn_base`           |
+pub const EVAL_SPSA_SPECS: [SpsaSpec; EVAL_DIMENSIONS] = [
+    // Piece values: default +/- 120, step 12 (mg and eg share the same window).
+    SpsaSpec { name: "knight_mg", min: 200.0, max: 440.0, step: 12.0 },
+    SpsaSpec { name: "knight_eg", min: 200.0, max: 440.0, step: 12.0 },
+    SpsaSpec { name: "bishop_mg", min: 210.0, max: 450.0, step: 12.0 },
+    SpsaSpec { name: "bishop_eg", min: 210.0, max: 450.0, step: 12.0 },
+    SpsaSpec { name: "rook_mg", min: 380.0, max: 620.0, step: 12.0 },
+    SpsaSpec { name: "rook_eg", min: 380.0, max: 620.0, step: 12.0 },
+    SpsaSpec { name: "queen_mg", min: 780.0, max: 1020.0, step: 12.0 },
+    SpsaSpec { name: "queen_eg", min: 780.0, max: 1020.0, step: 12.0 },
+    // Mobility weights: 0..12, step 1.
+    SpsaSpec { name: "knight_mobility_mg", min: 0.0, max: 12.0, step: 1.0 },
+    SpsaSpec { name: "knight_mobility_eg", min: 0.0, max: 12.0, step: 1.0 },
+    SpsaSpec { name: "bishop_mobility_mg", min: 0.0, max: 12.0, step: 1.0 },
+    SpsaSpec { name: "bishop_mobility_eg", min: 0.0, max: 12.0, step: 1.0 },
+    SpsaSpec { name: "rook_mobility_mg", min: 0.0, max: 12.0, step: 1.0 },
+    SpsaSpec { name: "rook_mobility_eg", min: 0.0, max: 12.0, step: 1.0 },
+    SpsaSpec { name: "queen_mobility_mg", min: 0.0, max: 12.0, step: 1.0 },
+    SpsaSpec { name: "queen_mobility_eg", min: 0.0, max: 12.0, step: 1.0 },
+    SpsaSpec { name: "bishop_pair", min: 0.0, max: 80.0, step: 6.0 },
+    SpsaSpec { name: "passed_pawn_base", min: 0.0, max: 60.0, step: 6.0 },
+];
+
+/// Projects an [`EvalParams`] onto the fixed 18-wide eval SPSA vector, in the
+/// order documented on [`EVAL_SPSA_SPECS`].
+pub fn eval_params_to_vector(params: &EvalParams) -> [f64; EVAL_DIMENSIONS] {
+    [
+        params.knight.middlegame as f64,
+        params.knight.endgame as f64,
+        params.bishop.middlegame as f64,
+        params.bishop.endgame as f64,
+        params.rook.middlegame as f64,
+        params.rook.endgame as f64,
+        params.queen.middlegame as f64,
+        params.queen.endgame as f64,
+        params.knight_mobility.middlegame as f64,
+        params.knight_mobility.endgame as f64,
+        params.bishop_mobility.middlegame as f64,
+        params.bishop_mobility.endgame as f64,
+        params.rook_mobility.middlegame as f64,
+        params.rook_mobility.endgame as f64,
+        params.queen_mobility.middlegame as f64,
+        params.queen_mobility.endgame as f64,
+        params.bishop_pair as f64,
+        params.passed_pawn_base as f64,
+    ]
+}
+
+/// Reconstructs an [`EvalParams`] from the 18-wide eval SPSA vector, clamping
+/// each slot to its [`EVAL_SPSA_SPECS`] bounds and rounding to `i32`.
+pub fn vector_to_eval_params(vector: &[f64; EVAL_DIMENSIONS]) -> EvalParams {
+    let clamped = clamp_vector(vector, &EVAL_SPSA_SPECS);
+    let at = |index: usize| clamped[index].round() as i32;
+    EvalParams {
+        knight: TaperedScore::new(at(0), at(1)),
+        bishop: TaperedScore::new(at(2), at(3)),
+        rook: TaperedScore::new(at(4), at(5)),
+        queen: TaperedScore::new(at(6), at(7)),
+        knight_mobility: TaperedScore::new(at(8), at(9)),
+        bishop_mobility: TaperedScore::new(at(10), at(11)),
+        rook_mobility: TaperedScore::new(at(12), at(13)),
+        queen_mobility: TaperedScore::new(at(14), at(15)),
+        bishop_pair: at(16),
+        passed_pawn_base: at(17),
     }
-    clamp_vector(&out)
+}
+
+/// Narrows a generalized SPSA vector back to the fixed-width eval array so it
+/// can feed [`vector_to_eval_params`].
+pub fn to_eval_array(v: &[f64]) -> [f64; EVAL_DIMENSIONS] {
+    v.try_into().expect("len")
+}
+
+/// Serializes an [`EvalParams`] to the one-line TSV the `eval-gate-file` /
+/// `spsa-eval` commands interchange: the 18 vector values, tab-separated, in the
+/// [`EVAL_SPSA_SPECS`] order.
+pub fn eval_params_to_tsv(params: &EvalParams) -> String {
+    eval_params_to_vector(params)
+        .iter()
+        .map(|value| format!("{value:.0}"))
+        .collect::<Vec<_>>()
+        .join("\t")
+}
+
+/// Parses the [`eval_params_to_tsv`] one-line TSV back into an [`EvalParams`].
+/// Accepts tab- or whitespace-separated values; requires exactly
+/// [`EVAL_DIMENSIONS`] of them.
+pub fn eval_params_from_tsv(contents: &str) -> Result<EvalParams, String> {
+    let values: Vec<f64> = contents
+        .split_whitespace()
+        .map(|token| {
+            token
+                .parse::<f64>()
+                .map_err(|error| format!("invalid eval TSV value `{token}`: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.len() != EVAL_DIMENSIONS {
+        return Err(format!(
+            "eval TSV must have {EVAL_DIMENSIONS} values, found {}",
+            values.len()
+        ));
+    }
+    Ok(vector_to_eval_params(&to_eval_array(&values)))
+}
+
+fn clamp_vector(vector: &[f64], specs: &[SpsaSpec]) -> Vec<f64> {
+    vector
+        .iter()
+        .zip(specs)
+        .map(|(v, s)| v.clamp(s.min, s.max))
+        .collect()
+}
+
+fn perturb(theta: &[f64], direction: &[f64], sign: f64, specs: &[SpsaSpec]) -> Vec<f64> {
+    let stepped: Vec<f64> = theta
+        .iter()
+        .zip(direction)
+        .zip(specs)
+        .map(|((t, d), s)| t + sign * d * s.step)
+        .collect();
+    clamp_vector(&stepped, specs)
 }
 
 /// A small deterministic xorshift64* PRNG. Seeding it identically reproduces the
@@ -957,12 +1144,10 @@ impl SpsaRng {
     }
 
     /// Draws a Rademacher (+/-1) perturbation direction for every dimension.
-    pub fn direction(&mut self) -> [f64; SPSA_DIMENSIONS] {
-        let mut direction = [0.0; SPSA_DIMENSIONS];
-        for value in direction.iter_mut() {
-            *value = if self.next_u64() & 1 == 0 { -1.0 } else { 1.0 };
-        }
-        direction
+    pub fn direction(&mut self, dimensions: usize) -> Vec<f64> {
+        (0..dimensions)
+            .map(|_| if self.next_u64() & 1 == 0 { -1.0 } else { 1.0 })
+            .collect()
     }
 }
 
@@ -995,17 +1180,20 @@ impl Default for SpsaConfig {
 /// its mirror (`theta - step`); `candidate_score` is that match's score fraction
 /// in `[0, 1]`. The result is clamped to the spec bounds.
 pub fn spsa_update(
-    theta: &[f64; SPSA_DIMENSIONS],
-    direction: &[f64; SPSA_DIMENSIONS],
+    theta: &[f64],
+    direction: &[f64],
     candidate_score: f64,
     learning_rate: f64,
-) -> [f64; SPSA_DIMENSIONS] {
+    specs: &[SpsaSpec],
+) -> Vec<f64> {
     let gradient = 2.0 * candidate_score - 1.0;
-    let mut next = *theta;
-    for index in 0..SPSA_DIMENSIONS {
-        next[index] += learning_rate * gradient * direction[index] * SPSA_SPECS[index].step;
-    }
-    clamp_vector(&next)
+    let next: Vec<f64> = theta
+        .iter()
+        .zip(direction)
+        .zip(specs)
+        .map(|((t, d), s)| t + learning_rate * gradient * d * s.step)
+        .collect();
+    clamp_vector(&next, specs)
 }
 
 #[derive(Clone, Debug)]
@@ -1032,20 +1220,29 @@ pub fn run_spsa_campaign(
     initial: SearchParams,
     config: SpsaConfig,
 ) -> Result<SpsaReport, String> {
-    let mut theta = search_params_to_vector(&initial);
+    let mut theta = search_params_to_vector(&initial).to_vec();
     let mut rng = SpsaRng::new(config.seed);
     let mut iterations = Vec::with_capacity(config.iterations);
 
     for iteration in 0..config.iterations {
-        let direction = rng.direction();
-        let plus = vector_to_search_params(&perturb(&theta, &direction, 1.0));
-        let minus = vector_to_search_params(&perturb(&theta, &direction, -1.0));
+        let direction = rng.direction(SPSA_DIMENSIONS);
+        let plus_vector = perturb(&theta, &direction, 1.0, &SPSA_SPECS);
+        let minus_vector = perturb(&theta, &direction, -1.0, &SPSA_SPECS);
+        let plus = vector_to_search_params(&to_array(&plus_vector));
+        let minus = vector_to_search_params(&to_array(&minus_vector));
 
         let mut score = MatchScore::default();
         for fen in positions {
             for candidate_color in [Color::White, Color::Black] {
-                let record =
-                    play_parameter_game(fen, candidate_color, plus, minus, config.match_config)?;
+                let record = play_parameter_game(
+                    fen,
+                    candidate_color,
+                    plus,
+                    EvalParams::default(),
+                    minus,
+                    EvalParams::default(),
+                    config.match_config,
+                )?;
                 match record.outcome {
                     GameOutcome::Win => score.wins += 1,
                     GameOutcome::Draw => score.draws += 1,
@@ -1055,18 +1252,126 @@ pub fn run_spsa_campaign(
         }
 
         let fraction = score.score_fraction().unwrap_or(0.5);
-        theta = spsa_update(&theta, &direction, fraction, config.learning_rate);
+        theta = spsa_update(&theta, &direction, fraction, config.learning_rate, &SPSA_SPECS);
         iterations.push(SpsaIterationRecord {
             iteration,
             score,
             candidate_score_fraction: fraction,
-            params: vector_to_search_params(&theta),
+            params: vector_to_search_params(&to_array(&theta)),
         });
     }
 
     Ok(SpsaReport {
         initial,
-        tuned: vector_to_search_params(&theta),
+        tuned: vector_to_search_params(&to_array(&theta)),
+        iterations,
+    })
+}
+
+/// Configuration for an eval SPSA campaign ([`run_eval_spsa_campaign`]). Unlike
+/// [`SpsaConfig`], the per-iteration match is bounded by a per-move `move_time`
+/// (not a search depth) and a `max_plies` cap, so the whole campaign's cost is
+/// `iterations * positions * 2 * max_plies * move_time` — mirroring the movetime
+/// discipline of the eval gate ([`run_eval_gate_fens`]).
+#[derive(Clone, Copy, Debug)]
+pub struct EvalSpsaConfig {
+    pub iterations: usize,
+    pub learning_rate: f64,
+    pub seed: u64,
+    pub move_time: Duration,
+    pub max_plies: u32,
+}
+
+impl Default for EvalSpsaConfig {
+    fn default() -> Self {
+        Self {
+            iterations: 32,
+            learning_rate: 1.0,
+            seed: 0x0DDB_1A5E_5BAD_5EED,
+            move_time: Duration::from_millis(50),
+            max_plies: 120,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EvalSpsaIterationRecord {
+    pub iteration: usize,
+    pub score: MatchScore,
+    pub candidate_score_fraction: f64,
+    pub params: EvalParams,
+}
+
+#[derive(Clone, Debug)]
+pub struct EvalSpsaReport {
+    pub initial: EvalParams,
+    pub tuned: EvalParams,
+    pub iterations: Vec<EvalSpsaIterationRecord>,
+}
+
+/// Runs an eval SPSA campaign over the supplied positions, starting
+/// from `initial`. The perturbation schedule is deterministic (fixed-seed
+/// [`SpsaRng`] and deterministic openings), but the **match outcomes are not**:
+/// each move is movetime-bounded, so per-move search depth — and thus the tuned
+/// result — varies with CPU speed and load. Do not freeze the tuned output in a
+/// test the way the search campaign's `search_param_spsa_matches_the_frozen_...`
+/// test does; assert only that it stays in-bounds. Mirrors [`run_spsa_campaign`] but tunes the eval vector
+/// (`EVAL_SPSA_SPECS`, [`EVAL_DIMENSIONS`] wide): each iteration perturbs the eval
+/// vector, plays a `theta+` vs `theta-` self-play match across all positions and
+/// both colours, and steps the eval params. **Both sides run mobility-on**
+/// (`mobility_scale = 100`) so the tuned mobility weights are actually exercised;
+/// the only difference between the two players is their [`EvalParams`]. Each move
+/// is bounded by `config.move_time` (not depth), games capped at
+/// `config.max_plies`. Returns the per-iteration record and the final tuned
+/// `EvalParams`.
+pub fn run_eval_spsa_campaign(
+    positions: &[&str],
+    initial: EvalParams,
+    config: EvalSpsaConfig,
+) -> Result<EvalSpsaReport, String> {
+    let mobility_on = SearchParams { mobility_scale: 100, ..SearchParams::default() };
+    let mut theta = eval_params_to_vector(&initial).to_vec();
+    let mut rng = SpsaRng::new(config.seed);
+    let mut iterations = Vec::with_capacity(config.iterations);
+
+    for iteration in 0..config.iterations {
+        let direction = rng.direction(EVAL_DIMENSIONS);
+        let plus_vector = perturb(&theta, &direction, 1.0, &EVAL_SPSA_SPECS);
+        let minus_vector = perturb(&theta, &direction, -1.0, &EVAL_SPSA_SPECS);
+        let plus = vector_to_eval_params(&to_eval_array(&plus_vector));
+        let minus = vector_to_eval_params(&to_eval_array(&minus_vector));
+
+        // theta+ (candidate) vs theta- (baseline), both mobility-on, color-swapped
+        // over every position — the eval analog of run_eval_gate_fens's match.
+        let mut records = Vec::with_capacity(positions.len() * 2);
+        for fen in positions {
+            for candidate_color in [Color::White, Color::Black] {
+                records.push(play_mobility_game(
+                    fen,
+                    candidate_color,
+                    mobility_on,
+                    plus,
+                    mobility_on,
+                    minus,
+                    config.move_time,
+                    config.max_plies,
+                )?);
+            }
+        }
+        let score = summarize(&records);
+        let fraction = score.score_fraction().unwrap_or(0.5);
+        theta = spsa_update(&theta, &direction, fraction, config.learning_rate, &EVAL_SPSA_SPECS);
+        iterations.push(EvalSpsaIterationRecord {
+            iteration,
+            score,
+            candidate_score_fraction: fraction,
+            params: vector_to_eval_params(&to_eval_array(&theta)),
+        });
+    }
+
+    Ok(EvalSpsaReport {
+        initial,
+        tuned: vector_to_eval_params(&to_eval_array(&theta)),
         iterations,
     })
 }
@@ -1100,16 +1405,18 @@ pub fn spsa_tsv_report(report: &SpsaReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_TACTICAL_SUITE, ExternalMatchConfig, MatchScore, SPSA_DIMENSIONS, SPSA_SPECS,
-        SpsaConfig, SpsaRng, classify_bestmove_token, external_match_game_count,
-        external_tsv_report, measure_throughput,
+        DEFAULT_TACTICAL_SUITE, EVAL_DIMENSIONS, EVAL_SPSA_SPECS, EvalSpsaConfig,
+        ExternalMatchConfig, MatchScore,
+        SPSA_DIMENSIONS, SPSA_SPECS, SpsaConfig, SpsaRng, classify_bestmove_token,
+        eval_params_from_tsv, eval_params_to_tsv, eval_params_to_vector, external_match_game_count,
+        external_tsv_report, measure_throughput, run_eval_spsa_campaign,
         run_spsa_campaign, run_tactical_suite, search_params_to_vector, spsa_tsv_report,
         spsa_update, sprt, tactical_solve_rate, tactical_tsv_report, throughput_tsv_report,
-        vector_to_search_params, MatchConfig, SprtConfig, SprtDecision, random_opening_fens,
-        run_mobility_gate, run_nnue_gauntlet, run_nnue_gauntlet_with_move_time, sprt_tsv_report,
-        summarize,
+        vector_to_eval_params, vector_to_search_params, MatchConfig, SprtConfig, SprtDecision,
+        random_opening_fens, run_eval_gate_fens, run_mobility_gate, run_nnue_gauntlet,
+        run_nnue_gauntlet_with_move_time, sprt_tsv_report, summarize,
     };
-    use engine_search::{Nnue, SearchParams};
+    use engine_search::{EvalParams, Nnue, SearchParams, TaperedScore};
     use std::{sync::Arc, time::Duration};
 
     #[test]
@@ -1142,6 +1449,162 @@ mod tests {
         assert_eq!(records.len(), 4); // 2 openings x 2 colors
         let report = sprt_tsv_report(summarize(&records), SprtConfig::default());
         assert!(report.contains("decision"));
+    }
+
+    #[test]
+    fn eval_vector_round_trips_default_params() {
+        let params = EvalParams::default();
+        let restored = vector_to_eval_params(&eval_params_to_vector(&params));
+        assert_eq!(restored, params);
+        // The vector width is pinned to the spec table so they cannot drift.
+        assert_eq!(eval_params_to_vector(&params).len(), EVAL_DIMENSIONS);
+        assert_eq!(EVAL_SPSA_SPECS.len(), EVAL_DIMENSIONS);
+    }
+
+    #[test]
+    fn eval_vector_projection_uses_the_documented_order() {
+        // Distinct values in every slot pin the fixed order (queen mg/eg is
+        // slots 6/7, bishop_pair is 16, passed_pawn_base is 17).
+        let params = EvalParams {
+            knight: TaperedScore::new(300, 310),
+            bishop: TaperedScore::new(320, 330),
+            rook: TaperedScore::new(490, 500),
+            queen: TaperedScore::new(880, 900),
+            knight_mobility: TaperedScore::new(3, 4),
+            bishop_mobility: TaperedScore::new(2, 3),
+            rook_mobility: TaperedScore::new(1, 5),
+            queen_mobility: TaperedScore::new(0, 2),
+            bishop_pair: 40,
+            passed_pawn_base: 24,
+        };
+        let vector = eval_params_to_vector(&params);
+        let expected = [
+            300.0, 310.0, 320.0, 330.0, 490.0, 500.0, 880.0, 900.0, 3.0, 4.0, 2.0, 3.0, 1.0, 5.0,
+            0.0, 2.0, 40.0, 24.0,
+        ];
+        assert_eq!(vector, expected);
+        assert_eq!(vector_to_eval_params(&vector), params);
+    }
+
+    #[test]
+    fn vector_to_eval_params_clamps_out_of_range() {
+        // Wildly out-of-range in both directions; every slot must land on its
+        // spec bound.
+        let mut low = [0.0_f64; EVAL_DIMENSIONS];
+        let mut high = [0.0_f64; EVAL_DIMENSIONS];
+        for index in 0..EVAL_DIMENSIONS {
+            low[index] = EVAL_SPSA_SPECS[index].min - 1000.0;
+            high[index] = EVAL_SPSA_SPECS[index].max + 1000.0;
+        }
+        let low_params = eval_params_to_vector(&vector_to_eval_params(&low));
+        let high_params = eval_params_to_vector(&vector_to_eval_params(&high));
+        for index in 0..EVAL_DIMENSIONS {
+            assert_eq!(low_params[index], EVAL_SPSA_SPECS[index].min);
+            assert_eq!(high_params[index], EVAL_SPSA_SPECS[index].max);
+        }
+    }
+
+    #[test]
+    fn each_eval_spec_governs_its_own_vector_slot() {
+        // Perturb exactly ONE slot far past its own spec bound, starting from the
+        // default (which sits inside every window). The perturbed slot must clamp
+        // to THAT spec's min/max, and — critically — every OTHER slot must stay at
+        // its default. That isolation proves spec index i governs vector slot i and
+        // that the field at slot i is the one clamped: a specs/vector misordering
+        // (e.g. queen bounds landing on a mobility slot, or `vector_to_eval_params`
+        // reading slot i into the wrong field) would either bleed into a neighbour
+        // slot or miss the bound here. The default round-trip test cannot catch
+        // this because the defaults never touch a bound.
+        let default_vector = eval_params_to_vector(&EvalParams::default());
+        for slot in 0..EVAL_DIMENSIONS {
+            let spec = EVAL_SPSA_SPECS[slot];
+            for (perturbed, expected) in
+                [(spec.max + 1000.0, spec.max), (spec.min - 1000.0, spec.min)]
+            {
+                let mut vector = default_vector;
+                vector[slot] = perturbed;
+                let result = eval_params_to_vector(&vector_to_eval_params(&vector));
+                assert_eq!(
+                    result[slot], expected,
+                    "slot {slot} ({}) must clamp to its own spec bound",
+                    spec.name
+                );
+                for other in 0..EVAL_DIMENSIONS {
+                    if other != slot {
+                        assert_eq!(
+                            result[other], default_vector[other],
+                            "perturbing slot {slot} ({}) must not disturb slot {other} ({})",
+                            spec.name, EVAL_SPSA_SPECS[other].name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn eval_tsv_round_trips_and_rejects_wrong_arity() {
+        let params = EvalParams::default();
+        let tsv = eval_params_to_tsv(&params);
+        assert_eq!(tsv.split('\t').count(), EVAL_DIMENSIONS);
+        assert_eq!(eval_params_from_tsv(&tsv).unwrap(), params);
+        assert!(eval_params_from_tsv("1\t2\t3").is_err());
+    }
+
+    #[test]
+    fn eval_gate_default_vs_default_is_well_formed() {
+        let fens = random_opening_fens(2, 8, 0xE7A1);
+        let records = run_eval_gate_fens(
+            &fens,
+            EvalParams::default(),
+            EvalParams::default(),
+            Duration::from_millis(5),
+            10,
+        )
+        .expect("eval gate runs");
+        assert_eq!(records.len(), 4); // 2 openings x 2 colors
+        let report = sprt_tsv_report(summarize(&records), SprtConfig::default());
+        assert!(report.contains("decision"));
+    }
+
+    #[test]
+    fn eval_gate_rejects_a_materially_broken_candidate() {
+        // A candidate that values its pieces far below a pawn throws them away
+        // and collapses to a near-bare king — a lopsidedly bad eval. The gate
+        // must not reward it. The decisive signal this self-play harness
+        // produces is *wins*: `outcome_from_status` maps a search that returns
+        // no move (`Ongoing`, no best move) to a draw, so a side that foresees
+        // the forced mate against it "resigns into a draw" rather than being
+        // recorded as a loss. Getting mated on the board is therefore rare, but
+        // a materially broken candidate can never *beat* the sound default. So
+        // we assert it takes zero wins and does not exceed an even score — a
+        // sound tuned candidate, by contrast, would win games and exceed 0.5.
+        let crippled = EvalParams {
+            knight: TaperedScore::equal(20),
+            bishop: TaperedScore::equal(20),
+            rook: TaperedScore::equal(20),
+            queen: TaperedScore::equal(20),
+            ..EvalParams::default()
+        };
+        let fens = random_opening_fens(8, 8, 0x10517);
+        let records = run_eval_gate_fens(
+            &fens,
+            crippled,
+            EvalParams::default(),
+            Duration::from_millis(30),
+            160,
+        )
+        .expect("eval gate runs");
+        assert_eq!(records.len(), 16); // 8 openings x 2 colors
+        let score = summarize(&records);
+        assert_eq!(
+            score.wins, 0,
+            "a materially broken candidate must not beat the default eval: {score:?}"
+        );
+        assert!(
+            score.score_fraction().is_some_and(|fraction| fraction <= 0.5),
+            "a materially broken candidate must not exceed an even score: {score:?}"
+        );
     }
 
     #[test]
@@ -1185,12 +1648,12 @@ mod tests {
         let mut a = SpsaRng::new(42);
         let mut b = SpsaRng::new(42);
         let mut c = SpsaRng::new(43);
-        let first = a.direction();
-        assert_eq!(first, b.direction());
+        let first = a.direction(SPSA_DIMENSIONS);
+        assert_eq!(first, b.direction(SPSA_DIMENSIONS));
         // Every drawn component is a Rademacher +/-1.
         assert!(first.iter().all(|value| *value == 1.0 || *value == -1.0));
         // A different seed almost surely differs over the whole run.
-        let differs = (0..8).any(|_| a.direction() != c.direction());
+        let differs = (0..8).any(|_| a.direction(SPSA_DIMENSIONS) != c.direction(SPSA_DIMENSIONS));
         assert!(differs);
     }
 
@@ -1205,8 +1668,8 @@ mod tests {
     fn spsa_update_moves_toward_the_winning_side() {
         let theta = search_params_to_vector(&SearchParams::default());
         let direction = [1.0; SPSA_DIMENSIONS];
-        let up = spsa_update(&theta, &direction, 1.0, 1.0);
-        let down = spsa_update(&theta, &direction, 0.0, 1.0);
+        let up = spsa_update(&theta, &direction, 1.0, 1.0, &SPSA_SPECS);
+        let down = spsa_update(&theta, &direction, 0.0, 1.0, &SPSA_SPECS);
         for index in 0..SPSA_DIMENSIONS {
             // Defaults sit strictly inside the bounds, so a decisive result moves
             // every parameter in the direction of the stronger side.
@@ -1214,7 +1677,7 @@ mod tests {
             assert!(down[index] < theta[index], "dimension {index} should decrease");
         }
         // A drawn result leaves the parameters unchanged.
-        assert_eq!(spsa_update(&theta, &direction, 0.5, 1.0), theta);
+        assert_eq!(spsa_update(&theta, &direction, 0.5, 1.0, &SPSA_SPECS), theta);
     }
 
     #[test]
@@ -1222,7 +1685,7 @@ mod tests {
         let at_max: Vec<f64> = SPSA_SPECS.iter().map(|spec| spec.max).collect();
         let theta: [f64; SPSA_DIMENSIONS] = at_max.try_into().unwrap();
         let direction = [1.0; SPSA_DIMENSIONS];
-        let stepped = spsa_update(&theta, &direction, 1.0, 1.0);
+        let stepped = spsa_update(&theta, &direction, 1.0, 1.0, &SPSA_SPECS);
         for index in 0..SPSA_DIMENSIONS {
             assert!(stepped[index] <= SPSA_SPECS[index].max);
             assert_eq!(stepped[index], SPSA_SPECS[index].max);
@@ -1256,6 +1719,63 @@ mod tests {
         let tsv = spsa_tsv_report(&report);
         assert!(tsv.starts_with("engine_version\titeration"));
         assert!(tsv.contains("aspiration_window"));
+    }
+
+    #[test]
+    fn eval_spsa_smoke_campaign_returns_in_bounds_parameters() {
+        // Two iterations over one position at a tiny movetime/ply budget: enough
+        // to exercise perturb -> per-side-eval match -> spsa_update and prove the
+        // tuned EvalParams land inside every EVAL_SPSA_SPECS window.
+        let config = EvalSpsaConfig {
+            iterations: 2,
+            learning_rate: 1.0,
+            seed: 7,
+            move_time: Duration::from_millis(5),
+            max_plies: 16,
+        };
+        let report = run_eval_spsa_campaign(
+            &["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"],
+            EvalParams::default(),
+            config,
+        )
+        .expect("eval smoke campaign runs");
+        assert_eq!(report.iterations.len(), 2);
+        let tuned = eval_params_to_vector(&report.tuned);
+        for index in 0..EVAL_DIMENSIONS {
+            assert!(tuned[index] >= EVAL_SPSA_SPECS[index].min, "slot {index} below its min");
+            assert!(tuned[index] <= EVAL_SPSA_SPECS[index].max, "slot {index} above its max");
+        }
+    }
+
+    #[test]
+    fn search_param_spsa_matches_the_frozen_tuned_params() {
+        let cfg = SpsaConfig {
+            iterations: 3,
+            match_config: MatchConfig {
+                candidate_depth: 2,
+                baseline_depth: 2,
+                max_plies: 16,
+            },
+            ..SpsaConfig::default()
+        };
+        let pos = ["rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"];
+        let report = run_spsa_campaign(&pos, SearchParams::default(), cfg).unwrap();
+        // Pre-refactor snapshot captured from CI. The generalization of the SPSA
+        // primitives (slices + specs argument) must reproduce these exactly.
+        assert_eq!(
+            report.tuned,
+            SearchParams {
+                aspiration_window: 50,
+                razor_margin_base: 120,
+                razor_margin_scale: 80,
+                reverse_futility_base: 100,
+                reverse_futility_scale: 90,
+                late_move_pruning_base: 3,
+                late_move_pruning_scale: 2,
+                null_move_reduction: 3,
+                mobility_scale: 0,
+            }
+        );
     }
 
     #[test]

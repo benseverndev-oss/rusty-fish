@@ -498,6 +498,7 @@ pub struct Searcher {
     counter_moves: Vec<Option<ChessMove>>,
     options: SearchOptions,
     params: SearchParams,
+    eval_params: EvalParams,
     nnue: Option<Arc<Nnue>>,
     nnue_accumulator: Option<nnue::Accumulator>,
     nnue_stack: Vec<NnueDelta>,
@@ -533,6 +534,7 @@ impl Default for Searcher {
             counter_moves: vec![None; HISTORY_SIZE],
             options: SearchOptions::default(),
             params: SearchParams::default(),
+            eval_params: EvalParams::default(),
             nnue: None,
             nnue_accumulator: None,
             nnue_stack: Vec::new(),
@@ -768,6 +770,12 @@ impl Searcher {
         self.params = params;
     }
 
+    /// Sets the hand-crafted evaluation weights. Only affects the fallback
+    /// hand-crafted evaluation, not an installed NNUE network.
+    pub fn set_eval_params(&mut self, eval_params: EvalParams) {
+        self.eval_params = eval_params;
+    }
+
     /// Installs an NNUE network as the evaluation. Passing `None` restores the
     /// hand-crafted evaluation. The network is shared (read-only) across Lazy
     /// SMP helper threads.
@@ -795,6 +803,7 @@ impl Searcher {
         tt: Arc<SharedTranspositionTable>,
         options: SearchOptions,
         params: SearchParams,
+        eval_params: EvalParams,
         nnue: Option<Arc<Nnue>>,
     ) -> Self {
         Self {
@@ -809,6 +818,7 @@ impl Searcher {
             counter_moves: vec![None; HISTORY_SIZE],
             options,
             params,
+            eval_params,
             nnue,
             nnue_accumulator: None,
             nnue_stack: Vec::new(),
@@ -960,11 +970,12 @@ impl Searcher {
                 let tt = Arc::clone(&self.tt);
                 let options = self.options.clone();
                 let params = self.params;
+                let eval_params = self.eval_params;
                 let nnue = self.nnue.clone();
                 let helper_board = board.clone();
                 let stop = Arc::clone(&shared_stop);
                 helper_handles.push(thread::spawn(move || {
-                    Searcher::helper(tt, options, params, nnue).run_lazy_smp_helper(
+                    Searcher::helper(tt, options, params, eval_params, nnue).run_lazy_smp_helper(
                         &helper_board,
                         max_depth,
                         deadline,
@@ -1437,7 +1448,7 @@ impl Searcher {
                 // search): fall back to a full refresh.
                 None => nnue.evaluate(board, board.side_to_move),
             },
-            None => evaluate_position(board, self.params.mobility_scale),
+            None => evaluate_position(board, self.params.mobility_scale, &self.eval_params),
         }
     }
 
@@ -1838,20 +1849,20 @@ fn piece_kind_value(kind: PieceKind) -> i32 {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct TaperedScore {
-    middlegame: i32,
-    endgame: i32,
+pub struct TaperedScore {
+    pub middlegame: i32,
+    pub endgame: i32,
 }
 
 impl TaperedScore {
-    const fn new(middlegame: i32, endgame: i32) -> Self {
+    pub const fn new(middlegame: i32, endgame: i32) -> Self {
         Self {
             middlegame,
             endgame,
         }
     }
 
-    const fn equal(value: i32) -> Self {
+    pub const fn equal(value: i32) -> Self {
         Self::new(value, value)
     }
 
@@ -1875,30 +1886,51 @@ impl TaperedScore {
     }
 }
 
-#[derive(Clone, Copy)]
-struct EvalParams {
-    pawn: TaperedScore,
-    knight: TaperedScore,
-    bishop: TaperedScore,
-    rook: TaperedScore,
-    queen: TaperedScore,
+/// The tunable hand-crafted evaluation weights. `Default` reproduces today's
+/// hardcoded constants exactly, so the default eval is byte-identical. The pawn
+/// value (the material anchor) and the mobility offsets stay fixed and are not
+/// part of this struct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EvalParams {
+    pub knight: TaperedScore,
+    pub bishop: TaperedScore,
+    pub rook: TaperedScore,
+    pub queen: TaperedScore,
+    pub knight_mobility: TaperedScore,
+    pub bishop_mobility: TaperedScore,
+    pub rook_mobility: TaperedScore,
+    pub queen_mobility: TaperedScore,
+    pub bishop_pair: i32,
+    pub passed_pawn_base: i32,
 }
 
-const EVAL_PARAMS: EvalParams = EvalParams {
-    pawn: TaperedScore::equal(100),
-    knight: TaperedScore::equal(320),
-    bishop: TaperedScore::equal(330),
-    rook: TaperedScore::equal(500),
-    queen: TaperedScore::equal(900),
-};
+impl Default for EvalParams {
+    fn default() -> Self {
+        Self {
+            knight: TaperedScore::equal(320),
+            bishop: TaperedScore::equal(330),
+            rook: TaperedScore::equal(500),
+            queen: TaperedScore::equal(900),
+            knight_mobility: TaperedScore::new(4, 4),
+            bishop_mobility: TaperedScore::new(3, 3),
+            rook_mobility: TaperedScore::new(2, 4),
+            queen_mobility: TaperedScore::new(1, 2),
+            bishop_pair: 35,
+            passed_pawn_base: 20,
+        }
+    }
+}
 
-fn tapered_piece_value(piece: Piece) -> TaperedScore {
+/// The fixed pawn value: the material anchor, deliberately not tunable.
+const PAWN_VALUE: TaperedScore = TaperedScore::equal(100);
+
+fn tapered_piece_value(piece: Piece, params: &EvalParams) -> TaperedScore {
     match piece.kind {
-        PieceKind::Pawn => EVAL_PARAMS.pawn,
-        PieceKind::Knight => EVAL_PARAMS.knight,
-        PieceKind::Bishop => EVAL_PARAMS.bishop,
-        PieceKind::Rook => EVAL_PARAMS.rook,
-        PieceKind::Queen => EVAL_PARAMS.queen,
+        PieceKind::Pawn => PAWN_VALUE,
+        PieceKind::Knight => params.knight,
+        PieceKind::Bishop => params.bishop,
+        PieceKind::Rook => params.rook,
+        PieceKind::Queen => params.queen,
         PieceKind::King => TaperedScore::equal(0),
     }
 }
@@ -1986,25 +2018,25 @@ fn nnue_changed_squares(board: &Board, mv: ChessMove) -> ([Square; 4], usize) {
 /// The hand-crafted evaluation of `board` from the side-to-move's perspective,
 /// in centipawns. Exposed as the teacher signal for NNUE training.
 pub fn hand_crafted_evaluation(board: &Board) -> i32 {
-    evaluate_position(board, 0)
+    evaluate_position(board, 0, &EvalParams::default())
 }
 
-fn mobility_score(kind: PieceKind, mobility: i32) -> TaperedScore {
+fn mobility_score(kind: PieceKind, mobility: i32, params: &EvalParams) -> TaperedScore {
     // Centered by a per-piece offset so an average-mobility piece scores near
-    // zero (material already accounts for having the piece). Hand-set starting
-    // weights; tuned later via SPSA.
-    let (mg, eg, offset) = match kind {
-        PieceKind::Knight => (4, 4, 4),
-        PieceKind::Bishop => (3, 3, 6),
-        PieceKind::Rook => (2, 4, 7),
-        PieceKind::Queen => (1, 2, 13),
-        _ => (0, 0, 0),
+    // zero (material already accounts for having the piece). The weights are
+    // tunable (`EvalParams`); the offsets stay fixed.
+    let (weight, offset) = match kind {
+        PieceKind::Knight => (params.knight_mobility, 4),
+        PieceKind::Bishop => (params.bishop_mobility, 6),
+        PieceKind::Rook => (params.rook_mobility, 7),
+        PieceKind::Queen => (params.queen_mobility, 13),
+        _ => (TaperedScore::new(0, 0), 0),
     };
     let centered = mobility - offset;
-    TaperedScore::new(mg * centered, eg * centered)
+    TaperedScore::new(weight.middlegame * centered, weight.endgame * centered)
 }
 
-fn evaluate_position(board: &Board, mobility_scale: i32) -> i32 {
+fn evaluate_position(board: &Board, mobility_scale: i32, params: &EvalParams) -> i32 {
     let mut features = EvalFeatures::default();
     let mut white_pawn_files = [0u8; 8];
     let mut black_pawn_files = [0u8; 8];
@@ -2019,7 +2051,7 @@ fn evaluate_position(board: &Board, mobility_scale: i32) -> i32 {
         };
         features.add(
             piece.color,
-            tapered_piece_value(piece).add(piece_square_bonus(piece, idx)),
+            tapered_piece_value(piece, params).add(piece_square_bonus(piece, idx)),
             endgame_phase,
         );
 
@@ -2031,7 +2063,7 @@ fn evaluate_position(board: &Board, mobility_scale: i32) -> i32 {
         {
             let mobility =
                 (board.attacks(square, piece) & !board.occupancy(piece.color)).count_ones() as i32;
-            let raw = mobility_score(piece.kind, mobility);
+            let raw = mobility_score(piece.kind, mobility, params);
             let scaled = TaperedScore::new(
                 raw.middlegame * mobility_scale / 100,
                 raw.endgame * mobility_scale / 100,
@@ -2067,10 +2099,18 @@ fn evaluate_position(board: &Board, mobility_scale: i32) -> i32 {
     }
 
     if white_bishops >= 2 {
-        features.add(Color::White, TaperedScore::equal(35), endgame_phase);
+        features.add(
+            Color::White,
+            TaperedScore::equal(params.bishop_pair),
+            endgame_phase,
+        );
     }
     if black_bishops >= 2 {
-        features.add(Color::Black, TaperedScore::equal(35), endgame_phase);
+        features.add(
+            Color::Black,
+            TaperedScore::equal(params.bishop_pair),
+            endgame_phase,
+        );
     }
 
     for idx in 0..64 {
@@ -2087,6 +2127,7 @@ fn evaluate_position(board: &Board, mobility_scale: i32) -> i32 {
                     piece.color,
                     &white_pawn_files,
                     &black_pawn_files,
+                    params,
                 )),
                 endgame_phase,
             );
@@ -2299,6 +2340,7 @@ fn pawn_structure_bonus(
     color: Color,
     white_pawn_files: &[u8; 8],
     black_pawn_files: &[u8; 8],
+    params: &EvalParams,
 ) -> i32 {
     let own_files = match color {
         Color::White => white_pawn_files,
@@ -2327,7 +2369,7 @@ fn pawn_structure_bonus(
             Color::White => square.rank() as i32,
             Color::Black => (7 - square.rank()) as i32,
         };
-        score += 20 + advancement * 10;
+        score += params.passed_pawn_base + advancement * 10;
     }
 
     if enemy_files[file] == 0 {
@@ -2404,7 +2446,7 @@ mod tests {
     use pyrrhic_rs::{Piece as TbPiece, WdlProbeResult};
 
     use super::{
-        Bound, ClockControl, MATE_SCORE, Nnue, OpeningBook, SearchLimits, SearchOptions,
+        Bound, ClockControl, EvalParams, MATE_SCORE, Nnue, OpeningBook, SearchLimits, SearchOptions,
         SearchParams, Searcher, SharedTranspositionTable, SyzygyRootProbe,
         SyzygyTablebases, SyzygyWdl, TaperedScore, TranspositionEntry, TranspositionTable,
         evaluate_position, history_index, late_move_reduction, passed_pawn_extension,
@@ -2417,6 +2459,51 @@ mod tests {
     #[test]
     fn default_search_options_use_one_thread() {
         assert_eq!(SearchOptions::default().threads, 1);
+    }
+
+    /// A spread of positions that exercise every eval term: startpos, an open
+    /// middlegame, a closed one, a pawn endgame, a bishop-pair position, and a
+    /// passed-pawn position. Used to freeze today's default-eval output so the
+    /// `EvalParams` threading stays byte-identical.
+    const EVAL_CORPUS: [&str; 6] = [
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 1",
+        "rnbqk2r/ppp1bppp/3p1n2/4p3/2PpP3/2NP1N2/PP3PPP/R1BQKB1R w KQkq - 0 1",
+        "8/5pk1/6p1/8/8/6P1/5PK1/8 w - - 0 1",
+        "2b1k3/8/8/8/8/8/8/2B1KB2 w - - 0 1",
+        "4k3/8/8/3P4/8/8/8/4K3 w - - 0 1",
+    ];
+
+    /// Today's exact default-eval scores for `EVAL_CORPUS`, baked from the
+    /// pre-change two-arg `evaluate_position`. Threading `EvalParams` must keep
+    /// these byte-identical.
+    const FROZEN_EVAL_SCORES: [i32; 6] = [168, 155, 129, 42, 396, 172];
+
+    #[test]
+    fn default_eval_is_byte_identical() {
+        for (fen, expected) in EVAL_CORPUS.iter().zip(FROZEN_EVAL_SCORES) {
+            let board = Board::from_fen(fen).unwrap();
+            assert_eq!(
+                evaluate_position(&board, 0, &EvalParams::default()),
+                expected,
+                "score drift for {fen}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_eval_params_match_the_original_constants() {
+        let params = EvalParams::default();
+        assert_eq!(params.knight, TaperedScore::equal(320));
+        assert_eq!(params.bishop, TaperedScore::equal(330));
+        assert_eq!(params.rook, TaperedScore::equal(500));
+        assert_eq!(params.queen, TaperedScore::equal(900));
+        assert_eq!(params.knight_mobility, TaperedScore::new(4, 4));
+        assert_eq!(params.bishop_mobility, TaperedScore::new(3, 3));
+        assert_eq!(params.rook_mobility, TaperedScore::new(2, 4));
+        assert_eq!(params.queen_mobility, TaperedScore::new(1, 2));
+        assert_eq!(params.bishop_pair, 35);
+        assert_eq!(params.passed_pawn_base, 20);
     }
 
     #[test]
@@ -2900,8 +2987,8 @@ mod tests {
     fn evaluation_prefers_passed_pawn_and_bishop_pair() {
         let white_edge = Board::from_fen("4k3/8/8/3P4/8/8/4BB2/4K3 w - - 0 1").unwrap();
         let black_edge = Board::from_fen("4k3/4bb2/8/8/3p4/8/8/4K3 b - - 0 1").unwrap();
-        assert!(evaluate_position(&white_edge, 0) > 0);
-        assert!(evaluate_position(&black_edge, 0) > 0);
+        assert!(evaluate_position(&white_edge, 0, &EvalParams::default()) > 0);
+        assert!(evaluate_position(&black_edge, 0, &EvalParams::default()) > 0);
     }
 
     #[test]
@@ -2935,15 +3022,18 @@ mod tests {
     fn endgame_evaluation_rewards_an_active_king() {
         let active = Board::from_fen("4k3/8/8/8/4K3/8/4P3/8 w - - 0 1").unwrap();
         let passive = Board::from_fen("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1").unwrap();
-        assert!(evaluate_position(&active, 0) > evaluate_position(&passive, 0));
+        assert!(
+            evaluate_position(&active, 0, &EvalParams::default())
+                > evaluate_position(&passive, 0, &EvalParams::default())
+        );
     }
 
     #[test]
     fn mobility_scale_rewards_the_more_active_side() {
         // White knight on d4 (8 targets), black knight on a8 (2 targets).
         let board = Board::from_fen("n6k/8/8/8/3N4/8/8/7K w - - 0 1").unwrap();
-        let off = evaluate_position(&board, 0);
-        let on = evaluate_position(&board, 100);
+        let off = evaluate_position(&board, 0, &EvalParams::default());
+        let on = evaluate_position(&board, 100, &EvalParams::default());
         // White is to move, so a positive mobility difference raises the score.
         assert!(on > off, "mobility should favor the side with the more active knight: on={on} off={off}");
     }
@@ -2951,7 +3041,7 @@ mod tests {
     #[test]
     fn king_safety_handles_a_king_on_the_board_edge() {
         let board = Board::from_fen("6K1/8/8/8/8/8/8/4k3 w - - 0 1").unwrap();
-        let _ = evaluate_position(&board, 0);
+        let _ = evaluate_position(&board, 0, &EvalParams::default());
     }
 
     #[test]
@@ -2985,8 +3075,8 @@ mod tests {
     fn mirrored_position_keeps_side_to_move_perspective() {
         let white = Board::from_fen("4k3/8/8/8/8/8/4Q3/4K3 w - - 0 1").unwrap();
         let black = Board::from_fen("4k3/4q3/8/8/8/8/8/4K3 b - - 0 1").unwrap();
-        assert!(evaluate_position(&white, 0) > 0);
-        assert!(evaluate_position(&black, 0) > 0);
+        assert!(evaluate_position(&white, 0, &EvalParams::default()) > 0);
+        assert!(evaluate_position(&black, 0, &EvalParams::default()) > 0);
         assert_eq!(white.side_to_move, Color::White);
     }
 
