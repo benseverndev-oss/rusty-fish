@@ -64,34 +64,66 @@ only *new* months (or a new `n…-pg…` dataset) are labeled. This makes labeli
 
 ### Labeling: `label_into_store`
 
-`label_sf_shard` gains a store mount and writes to
-`/store/sf/n<nodes>-pg<per_game>/samples-<name>-<i>.tsv`. A new
-`ensure_sf_labels(months, per_game, nodes, shards_per_month)` entrypoint:
+`label_sf_shard` gains the store mount and writes to
+`/store/sf/n<nodes>-pg<per_game>/samples-<name>-<i>.tsv`. Because the local
+entrypoint runs **client-side with no volume mounted**, the marker read and write
+must be small **volume-mounted Modal functions**, not inline entrypoint code:
 
-1. `prepare_export` the requested months into `rusty-fish-wdl` (idempotent, as
-   today).
-2. For each requested `month`, check `/store/sf/n<nodes>-pg<per_game>/<month>.complete`.
-   If present, **skip** (already labeled). Otherwise fan `label_sf_shard` across
-   that month's shards, and — only after all its shards return and commit — write
-   the `<month>.complete` marker and commit. (Per-month markers, not per-run, so a
-   partial run's completed months are still reusable.)
-3. Print a summary: months skipped (cache hits) vs labeled (delta), and the store's
+- `missing_sf_months(dataset, months) -> list[str]` — mounts the store,
+  `labels_volume.reload()`, returns the months whose
+  `/store/sf/<dataset>/<month>.complete` marker is absent.
+- `mark_sf_month_complete(dataset, month)` — mounts the store, writes the marker,
+  `labels_volume.commit()`.
+
+The `ensure_sf_labels(months, per_game, nodes, shards_per_month)` **local
+entrypoint** orchestrates:
+
+1. `prepare_export.starmap` the requested months into `rusty-fish-wdl` (idempotent,
+   as today).
+2. `missing = missing_sf_months.remote("n<nodes>-pg<per_game>", months)`.
+3. For each `month` in `missing`:
+   a. `wipe_sf_month.remote(dataset, month)` — a single volume-mounted function that
+      deletes any existing `samples-<month>-*.tsv` in **this dataset dir and month
+      only** (a month-scoped delete, NOT the global footgun) and commits. This runs
+      **once, before** the shards, so an earlier crashed attempt at a *different*
+      `shards_per_month` cannot leave orphan shards that later get concatenated. It
+      must NOT be inside `label_sf_shard` — parallel shards would clobber each
+      other's fresh output.
+   b. `list(label_sf_shard.starmap([...]))` across that month's shards (blocks on
+      all; each shard writes its file and commits).
+   c. **Only after** all of the month's shards return: `mark_sf_month_complete.remote(dataset, month)`.
+4. Print a summary: months skipped (cache hit) vs labeled (delta), and the store's
    total sample count.
 
-The labeling functions mount both volumes: read the export from `rusty-fish-wdl`,
-write labels to `rusty-fish-labels`. They **never delete**.
+Labeling mounts both volumes (read export from `rusty-fish-wdl`, write labels to
+`rusty-fish-labels`) and **never deletes across months or datasets** — the only
+deletes are the month-scoped `wipe_sf_month` pre-step, which is bounded to the one
+(dataset, month) about to be re-labeled.
 
 ### Training: `train_from_store`
 
 `train_sf_run` is replaced by a store reader that **never mutates the store**:
 
-- Takes a **dataset selector** — e.g. a list of `n<nodes>-pg<per_game>` dataset
-  names (default: all `sf/n*-pg*` present) — plus `hidden`, `epochs`.
-- Globs the selected datasets' `samples-*.tsv`, concatenates them into a **scratch**
-  `data.tsv` in the container's ephemeral `/tmp` (NOT in the store volume), and
-  trains (`wdl_target=False` cp mode, unchanged).
-- Returns the RFNN bytes. The **destructive cleanup is deleted** — no `glob + unlink`
-  of store shards, ever.
+- `@app.function(image=torch_image, gpu="A10G", memory=32768, timeout=60*60*3,
+  volumes={"/store": labels_volume})` — carry the `memory`/`timeout`/GPU config
+  forward (concatenating multiple datasets is at least as memory-heavy as today).
+- Takes a **dataset selector** — a list of `n<nodes>-pg<per_game>` dataset names
+  (default: all `sf/n*-pg*` present) — plus `hidden`, `epochs`.
+- `labels_volume.reload()` first (so freshly-committed shards from this run's
+  labeling step are visible — the current code reloads for exactly this reason),
+  then globs the selected datasets' `samples-*.tsv`, concatenates into a **scratch**
+  `/tmp/data.tsv` (the container's ephemeral disk, NOT the store — the current code
+  writes `/vol/sf/data.tsv`, which must change), and trains (`wdl_target=False` cp
+  mode, unchanged).
+- **Canonical net write (Gap: `gate_net`):** the current `train_sf_run` writes the
+  net to `/vol/net.rfnn` on the working volume, which `read_net`/`gate_net` read
+  back. Since `train_from_store` mounts the store instead, write the net to
+  `/store/nets/latest.rfnn` and commit, and point `read_net`/`gate_net` at
+  `rusty-fish-labels:/nets/latest.rfnn`, so a post-hoc `gate_net` re-gates *this*
+  net, not a stale one.
+- Returns the RFNN bytes (the primary gate still flows in-memory via
+  `nnue_gate_run(net_bytes)`). The **destructive cleanup is deleted** — no
+  `glob + unlink` of store shards, ever.
 - Dedup note: mixing two datasets that sample the *same* games at different
   densities can double-count positions. v1 keeps this simple — the caller selects
   compatible datasets (typically one `n…-pg…`); a dedup pass is out of scope and
@@ -122,9 +154,10 @@ copies are left as-is.)
 - **Idempotency check (the core property), on Modal:** after migration, run
   `train_sf` for the six already-labeled months at (100k, pg4) — confirm from
   `modal app logs` that it reports **all six months skipped (cache hit), zero
-  labeled**, trains, and gates. Then add ONE new month (e.g. 2017-07, pinned in
-  `wdl-corpus.toml`) and confirm only that month labels (the delta), the prior six
-  still skip, and the store grows.
+  labeled**, trains, and gates. Then add ONE new month (2017-07 — pin it in
+  `wdl-corpus.toml`, which needs `sha_probe` run first since `train_sf` asserts
+  each month has a `sha256`) and confirm only that month labels (the delta), the
+  prior six still skip, and the store grows.
 - **Non-destruction check:** confirm the store's SF shard count is **>= the
   starting count after every run** (a labeling/training run never lowers it) — read
   it via `modal volume ls` before/after.
@@ -134,6 +167,12 @@ copies are left as-is.)
 
 ## Out of scope
 
+- **`train_wdl_run`'s identical destructive cleanup** (`glob("/vol/samples-*.tsv")`
+  + unlink non-expected on the WDL volume) is a live footgun too, but is
+  **explicitly deferred** here — the WDL/outcome labels carry no Stockfish cost, so
+  they are far cheaper to regenerate. This slice converts the SF path only; the WDL
+  path keeps its current behaviour until a later slice (noted so it is not
+  forgotten).
 - The gate ladder, the experiment harness, and cold-start/warm-image reduction
   (follow-on specs #2–#4).
 - Cross-dataset position dedup (v1 selects compatible datasets).
