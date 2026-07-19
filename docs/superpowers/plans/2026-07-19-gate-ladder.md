@@ -62,7 +62,7 @@ fn baseline_searcher(mode: BaselineMode) -> Searcher {
 
 Thread `mode: BaselineMode` into `run_nnue_gauntlet_with_optional_move_time` and `play_nnue_game`; in `play_nnue_game` build `let mut baseline = baseline_searcher(mode);` (replacing the inline `Searcher::default()` + `set_nnue(None)`). The two public wrappers `run_nnue_gauntlet` and `run_nnue_gauntlet_with_move_time` keep their current signatures and pass `BaselineMode::Champion`. Add one public entry `run_nnue_gauntlet_with_move_time_and_baseline(positions, net, config, move_time, mode)` for `gate-file` to call.
 
-- [ ] **Step 4: `gate-file` mode arg.** In `main.rs`, parse the mode by **token match** (robust to position): `let mode = if std::env::args().any(|a| a == "handcrafted") { BaselineMode::Handcrafted } else { BaselineMode::Champion };`. Call `run_nnue_gauntlet_with_move_time_and_baseline(&fens, Arc::new(net), config, move_time, mode)`. Update the usage string to `gate-file <net> <depth> <openings_file> [move_time_ms] [champion|handcrafted]` and the command's comment (it now defaults to **champion**, not hand-crafted).
+- [ ] **Step 4: `gate-file` mode arg.** In `main.rs`, **add `BaselineMode` and `run_nnue_gauntlet_with_move_time_and_baseline` to the `use engine_bench::{…}` import block** (lines 3-14), and **drop the now-unused `run_nnue_gauntlet_with_move_time` import** (gate-file was its only main.rs user; leaving it is an unused-import warning). Parse the mode by **token match** (robust to position): `let mode = if std::env::args().any(|a| a == "handcrafted") { BaselineMode::Handcrafted } else { BaselineMode::Champion };`. Call `run_nnue_gauntlet_with_move_time_and_baseline(&fens, Arc::new(net), config, move_time, mode)`. Update the usage string to `gate-file <net> <depth> <openings_file> [move_time_ms] [champion|handcrafted]` and the command's comment (it now defaults to **champion**, not hand-crafted).
 
 - [ ] **Step 5: Push, confirm green.** (`nnue-sprt` still compiles — `run_nnue_gauntlet` signature unchanged.)
 
@@ -74,7 +74,10 @@ Thread `mode: BaselineMode` into `run_nnue_gauntlet_with_optional_move_time` and
 
 - [ ] **Step 1: `train()` returns `(model, val_loss)`.** In `train_nnue.py`, init `val = float("nan")` before the epoch loop (so it is defined even for `epochs == 0`), keep the last epoch's `val`, and change `return model` → `return model, val`.
 
-- [ ] **Step 2: Update all three callers to unpack.** In `app.py`: `train_net` and `train_wdl_run` → `model, _ = train_nnue.train(...)` (they don't need the loss). `train_from_store` → `model, val_loss = train_nnue.train(...)` and change its return to `return (handle.read(), val_loss)` (the net bytes AND the loss). Its `@app.function` signature return annotation becomes `-> tuple[bytes, float]`.
+- [ ] **Step 2: Update ALL FOUR callers to unpack.** There are four, not three:
+  - `modal/train_nnue.py`'s own `main()` (~line 238): `model, _ = train(...)` before `quantize_and_write(model, ...)` — else `model` is a tuple and the standalone `python train_nnue.py` path breaks. (Same file as Step 1.)
+  - `app.py` `train_net` and `train_wdl_run` → `model, _ = train_nnue.train(...)` (they don't need the loss).
+  - `app.py` `train_from_store` → `model, val_loss = train_nnue.train(...)` and change its return to `return (handle.read(), val_loss)` (net bytes AND loss); its return annotation becomes `-> tuple[bytes, float]`.
 
 - [ ] **Step 3: Update `train_sf` to unpack `train_from_store`'s new return** (keep the OLD `nnue_gate_run` gate for now — the ladder is Task 3): `net_bytes, val_loss = train_from_store.remote([_sf_dataset(nodes, per_game)], hidden, epochs)` (the `val_loss` is used in Task 3). `nnue_gate_run.remote(net_bytes, ...)` unchanged this task.
 
@@ -112,7 +115,14 @@ def gate_ladder_run(
             wins += w; draws += d; losses += l
         played += len(openings)
         verdict = sprt_verdict.remote(wins, draws, losses)
-        decision = verdict.strip().splitlines()[-2].split("\t")[-1]  # TSV decision column
+        # Defensively find the TSV values line: the last line whose final
+        # tab-field is a decision token (avoids off-by-one if stderr is empty).
+        tokens = {"AcceptH0", "AcceptH1", "Continue"}
+        decision = next(
+            (ln.split("\t")[-1] for ln in reversed(verdict.splitlines())
+             if ln.split("\t")[-1] in tokens),
+            "Continue",
+        )
         if decision in ("AcceptH0", "AcceptH1"):
             break
     summary = (f"gate ladder: {wins}W {draws}D {losses}L over {played * 2} games "
@@ -151,7 +161,7 @@ def gate_ladder(gate_depth: int = 64, gate_plies: int = 8, move_time_ms: int = 5
                                  gate_shard_size, chunk_openings, max_openings))
 ```
 
-- [ ] **Step 5: Docstrings + py_compile + commit.** Update the stale "vs the hand-crafted baseline" language in `nnue_gate_run`, `train_sf`, `train_wdl`, `gate_net` docstrings to "vs the bundled champion net" (they all gate net-vs-champion now). `uv run --python 3.12 python -m py_compile modal/app.py`. Commit `feat(nnue): sequential SPRT gate ladder vs the champion net`.
+- [ ] **Step 5: Docstrings + py_compile + commit.** Update the stale "vs the hand-crafted baseline" language in `gate_shard`, `nnue_gate_run`, `train_sf`, `train_wdl`, `gate_net` docstrings to "vs the bundled champion net" (they all gate net-vs-champion now). **Also fix `train_sf`'s docstring example invocations** (they still pass `--gate-openings 64` / `--gate-openings 2048`, an invalid flag after the swap) to `--chunk-openings`/`--max-openings`, consistent with Task 4 Step 3. `uv run --python 3.12 python -m py_compile modal/app.py`. Commit `feat(nnue): sequential SPRT gate ladder vs the champion net`.
 
 ---
 
