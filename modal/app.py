@@ -44,7 +44,7 @@ def _load_wdl_corpus() -> list[dict]:
 # Image A: builds the engine-bench release binary from the repo source.
 rust_image = (
     modal.Image.debian_slim()
-    .apt_install("curl", "build-essential", "pkg-config", "zstd")
+    .apt_install("curl", "build-essential", "pkg-config", "zstd", "stockfish")
     .run_commands(
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs "
         "| sh -s -- -y --default-toolchain stable"
@@ -231,6 +231,30 @@ def label_wdl_shard(name: str, i: int, n: int, per_game: int) -> int:
         return sum(1 for line in handle if line.strip())
 
 
+@app.function(image=rust_image, volumes={"/vol": wdl_volume}, timeout=60 * 90)
+def label_sf_shard(name: str, i: int, n: int, per_game: int, nodes: int) -> int:
+    """One Stockfish-eval labeling shard: sample FEN positions, then replace each
+    with its fixed-node Stockfish cp eval.
+
+    Streams a month's export through `gen-eval-positions` (same sampling as
+    `gen-wdl-data`) and pipes the FEN+features lines through `label-sf`, which
+    drives one persistent Stockfish process at `go nodes {nodes}`. Output lands in
+    the `/vol/sf/` subdirectory so it stays disjoint from the top-level WDL shards.
+    """
+    import os
+    os.makedirs("/vol/sf", exist_ok=True)
+    out = f"/vol/sf/samples-{name}-{i}.tsv"
+    cmd = (
+        f"set -euo pipefail; zstdcat /vol/export-{name}.pgn.zst | "
+        f"{BIN} gen-eval-positions - --shard {i}/{n} --per-game {per_game} | "
+        f"{BIN} label-sf - {nodes} > {out}"
+    )
+    subprocess.run(["bash", "-c", cmd], check=True)
+    wdl_volume.commit()
+    with open(out, "r", encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())
+
+
 @app.function(
     image=torch_image, gpu="A10G", timeout=60 * 60 * 3, memory=32768, volumes={"/vol": wdl_volume}
 )
@@ -269,6 +293,56 @@ def train_wdl_run(shard_names: list[str], hidden: int, epochs: int) -> bytes:
     out_path = "/vol/net.rfnn"
     model = train_nnue.train(
         data_path, hidden, epochs, batch_size=1024, lr=1e-3, device="cuda", wdl_target=True
+    )
+    train_nnue.quantize_and_write(model, hidden, out_path)
+    with open(out_path, "rb") as handle:
+        return handle.read()
+
+
+@app.function(
+    image=torch_image, gpu="A10G", timeout=60 * 60 * 3, memory=32768, volumes={"/vol": wdl_volume}
+)
+def train_sf_run(shard_names: list[str], hidden: int, epochs: int) -> bytes:
+    """GPU train on EXACTLY this run's Stockfish-cp shards -> quantised RFNN bytes.
+
+    `shard_names` is the explicit set of `/vol/`-relative basenames the current
+    run's SF labelers produced (e.g. "sf/samples-2017-01-0.tsv"), which resolve to
+    `/vol/sf/samples-...`. Trains in cp mode (`wdl_target=False`) on those and only
+    those. Everything is scoped to the `/vol/sf/` subdirectory so it never touches
+    the top-level WDL shards.
+    """
+    import train_nnue
+
+    wdl_volume.reload()
+    # The persistent Volume can hold SF shards from prior runs with a DIFFERENT
+    # month set or shard count, plus a stale /vol/sf/data.tsv. Any of those would
+    # silently contaminate training, so delete every /vol/sf/samples-*.tsv that is
+    # NOT one of this run's expected shards. Scoped to /vol/sf/ — the top-level WDL
+    # shards (/vol/samples-*-*.tsv) are never globbed or touched.
+    expected = {f"/vol/{n}" for n in shard_names}
+    for stale in glob.glob("/vol/sf/samples-*.tsv"):
+        if stale not in expected:
+            pathlib.Path(stale).unlink(missing_ok=True)
+    stale_data = pathlib.Path("/vol/sf/data.tsv")
+    if stale_data.exists():
+        stale_data.unlink()
+    # Train on exactly the expected shards; a missing one means a labeler didn't
+    # produce it, so fail loudly rather than train on a partial corpus.
+    shard_paths = sorted(expected)
+    for shard_path in shard_paths:
+        assert pathlib.Path(shard_path).exists(), f"expected shard missing: {shard_path}"
+    data_path = "/vol/sf/data.tsv"
+    with open(data_path, "w", encoding="utf-8") as out:
+        for shard_path in shard_paths:
+            with open(shard_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    out.write(line)
+    # Write the RFNN to the canonical /vol/net.rfnn (same as train_wdl_run) so a
+    # post-hoc `gate_net` can re-gate the latest net; the primary gate flows
+    # in-memory via the returned bytes.
+    out_path = "/vol/net.rfnn"
+    model = train_nnue.train(
+        data_path, hidden, epochs, batch_size=1024, lr=1e-3, device="cuda", wdl_target=False
     )
     train_nnue.quantize_and_write(model, hidden, out_path)
     with open(out_path, "rb") as handle:
@@ -474,6 +548,63 @@ def train_wdl(
           f"({len(corpus)} months x {shards_per_month})")
 
     net_bytes = train_wdl_run.remote(shard_names, hidden, epochs)
+    print(f"trained network: {len(net_bytes)} bytes")
+
+    print(nnue_gate_run.remote(net_bytes, gate_depth, gate_openings, gate_plies,
+                               gate_shard_size, move_time_ms))
+
+
+@app.local_entrypoint()
+def train_sf(
+    shards_per_month: int = 16,
+    per_game: int = 4,
+    nodes: int = 100000,
+    hidden: int = 512,
+    epochs: int = 60,
+    gate_openings: int = 2048,
+    gate_plies: int = 8,
+    gate_depth: int = 64,        # high; movetime binds first
+    gate_shard_size: int = 16,
+    move_time_ms: int = 50,
+    months: str = "",            # comma-sep subset (e.g. "2017-01,2017-02") for short runs; empty = all
+):
+    """Train an NNUE on fixed-node Stockfish cp labels across many months, then
+    gate it movetime-bounded via SPRT.
+
+    Downloads + verifies each pinned month from `assets/nnue/wdl-corpus.toml` into
+    a shared volume once, fans out `gen-eval-positions | label-sf` labeling over
+    every (month, shard) pair into `/vol/sf/`, trains on a GPU in cp mode
+    (`wdl_target=False`, hidden 512 by default), and runs the parallel movetime
+    SPRT gate vs the hand-crafted baseline.
+
+        # short validation (1 month, tiny config, low nodes — plumbing only):
+        modal run modal/app.py::train_sf --months 2017-01 --shards-per-month 2 --per-game 2 --nodes 5000 --hidden 64 --epochs 2 --gate-openings 64 --gate-shard-size 16
+
+        # real run (all six months, 100k nodes, hidden 512, powered gate):
+        modal run modal/app.py::train_sf --shards-per-month 16 --per-game 4 --nodes 100000 --hidden 512 --epochs 60 --gate-openings 2048 --gate-shard-size 16 --move-time-ms 50
+    """
+    corpus = _load_wdl_corpus()
+    if months:
+        wanted = set(months.split(","))
+        corpus = [m for m in corpus if m["name"] in wanted]
+        missing = wanted - {m["name"] for m in corpus}
+        assert not missing, f"unknown months: {sorted(missing)}"
+        assert corpus, "no months selected"
+    for m in corpus:
+        assert m.get("sha256"), f"month {m['name']} has no pinned sha256 — run sha_probe first"
+
+    # .starmap is lazy; wrap in list() so every export is downloaded + verified
+    # before any labeler runs.
+    list(prepare_export.starmap([(m["name"], m["url"], m["sha256"]) for m in corpus]))
+    label_args = [(m["name"], i, shards_per_month, per_game, nodes)
+                  for m in corpus for i in range(shards_per_month)]
+    shard_names = [f"sf/samples-{m['name']}-{i}.tsv"
+                   for m in corpus for i in range(shards_per_month)]
+    counts = label_sf_shard.starmap(label_args)
+    print(f"labeled {sum(counts)} Stockfish-cp samples across {len(label_args)} shards "
+          f"({len(corpus)} months x {shards_per_month})")
+
+    net_bytes = train_sf_run.remote(shard_names, hidden, epochs)
     print(f"trained network: {len(net_bytes)} bytes")
 
     print(nnue_gate_run.remote(net_bytes, gate_depth, gate_openings, gate_plies,
