@@ -857,6 +857,28 @@ impl UciProcess {
         }
     }
 
+    /// Fixed-node Stockfish evaluation of `fen`, side-to-move-relative
+    /// centipawns. Sends `ucinewgame` first to clear the transposition table so
+    /// a fixed node budget is reproducible regardless of the scan order, then
+    /// keeps the last `score` reported before `bestmove`.
+    fn score_position(&mut self, fen: &str, nodes: u64) -> Result<i32, String> {
+        self.send("ucinewgame")?;
+        self.send("isready")?;
+        self.wait_for("readyok")?;
+        self.send(&format!("position fen {fen}"))?;
+        self.send(&format!("go nodes {nodes}"))?;
+        let mut last = None;
+        loop {
+            let line = self.next_line()?;
+            if let Some(cp) = parse_uci_score_cp(&line) {
+                last = Some(cp);
+            }
+            if line.starts_with("bestmove") {
+                return last.ok_or_else(|| format!("no score for fen {fen}"));
+            }
+        }
+    }
+
     fn send(&mut self, command: &str) -> Result<(), String> {
         writeln!(self.stdin, "{command}")
             .map_err(|error| format!("failed to send UCI command `{command}`: {error}"))?;
@@ -886,6 +908,41 @@ impl Drop for UciProcess {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Centipawn magnitude a `score mate N` line collapses to. Well past the
+/// trainer's eval clamp / sigmoid saturation, so a forced mate reads as a
+/// decisive-but-finite label rather than an infinity the trainer can't fit.
+pub const MATE_CP: i32 = 30000;
+
+/// Extracts the side-to-move centipawn score from a single UCI `info` line.
+///
+/// Returns `Some(N)` for `score cp N`, `Some(MATE_CP * sign(N))` for
+/// `score mate N` (non-negative mate distance -> `+MATE_CP`), and `None` for
+/// any line without a `score cp`/`score mate` pair (the caller keeps the last
+/// score it saw). A trailing `lowerbound`/`upperbound` qualifier sits after the
+/// value, so scanning the token right after `cp`/`mate` naturally ignores it.
+fn parse_uci_score_cp(line: &str) -> Option<i32> {
+    let mut tokens = line.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token != "score" {
+            continue;
+        }
+        match tokens.next() {
+            Some("cp") => {
+                if let Some(value) = tokens.next().and_then(|value| value.parse::<i32>().ok()) {
+                    return Some(value);
+                }
+            }
+            Some("mate") => {
+                if let Some(value) = tokens.next().and_then(|value| value.parse::<i32>().ok()) {
+                    return Some(if value >= 0 { MATE_CP } else { -MATE_CP });
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Classifies the token following `bestmove `. Returns `None` when the engine
@@ -1793,6 +1850,51 @@ pub fn gen_eval_positions_from_reader<R: std::io::Read>(
         .visit_all_games(&mut builder)
         .map_err(|error| format!("failed to read PGN: {error}"))?;
     Ok(builder.out)
+}
+
+/// Drives one persistent Stockfish process to relabel `fen<TAB>own<TAB>opp`
+/// lines with a fixed-node cp eval, printing `cp<TAB>own<TAB>opp` (own/opp
+/// passed through verbatim) — the `target<TAB>own<TAB>opp` format the trainer
+/// reads. Streams line by line so a multi-GB shard never buffers.
+///
+/// Robustness matters here: a shard is tens of thousands of positions, so one
+/// malformed line or one Stockfish scoring error must not abort it. Bad lines
+/// are counted and skipped, and the skip total is reported on stderr at the
+/// end. Starts the engine with `start`, which spawns the process and completes
+/// the `uci`/`isready` handshake.
+pub fn run_label_sf<R: std::io::Read>(
+    reader: R,
+    nodes: u64,
+    engine_path: &str,
+) -> Result<(), String> {
+    let mut engine = UciProcess::start(engine_path, Duration::from_secs(60))?;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    let mut skipped: u64 = 0;
+    for line in BufReader::new(reader).lines() {
+        let line = line.map_err(|error| format!("failed to read positions: {error}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut fields = line.split('\t');
+        let (Some(fen), Some(own), Some(opp), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            skipped += 1;
+            continue;
+        };
+        match engine.score_position(fen, nodes) {
+            Ok(cp) => writeln!(out, "{cp}\t{own}\t{opp}")
+                .map_err(|error| format!("failed to write labelled position: {error}"))?,
+            Err(_) => skipped += 1,
+        }
+    }
+    out.flush()
+        .map_err(|error| format!("failed to flush labelled positions: {error}"))?;
+    if skipped > 0 {
+        eprintln!("label-sf: skipped {skipped} positions (malformed or unscored)");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

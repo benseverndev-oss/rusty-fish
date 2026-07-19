@@ -10,7 +10,7 @@ use engine_bench::{
     run_spsa_campaign, run_tactical_suite,
     spsa_tsv_report, sprt, sprt_tsv_report, summarize, tactical_tsv_report, throughput_tsv_report,
     gen_wdl_data_samples_from_reader, WdlSampleConfig,
-    gen_eval_positions_from_reader,
+    gen_eval_positions_from_reader, run_label_sf,
 };
 use engine_bench::train::{generate_training_samples, train_nnue, TrainConfig};
 use engine_search::{EvalParams, Nnue, SearchParams};
@@ -469,6 +469,57 @@ fn main() -> Result<(), String> {
                 join_usize(&sample.own),
                 join_usize(&sample.opp)
             );
+        }
+        return Ok(());
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("label-sf") {
+        // label-sf <positions_or_-> <nodes> [--engine PATH]: drive one persistent
+        // Stockfish process (default /usr/games/stockfish, the Debian package
+        // location on Modal) to relabel `fen\town\topp` lines (path or `-` for
+        // stdin) with a fixed-node cp eval, printing `cp\town\topp` — the format
+        // the trainer reads. One malformed line or scoring error is skipped, not
+        // fatal, so a bad position can't kill a shard of tens of thousands.
+        let mut source: Option<String> = None;
+        let mut nodes: Option<u64> = None;
+        let mut engine_path = "/usr/games/stockfish".to_string();
+        let mut args = std::env::args().skip(2);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--engine" => {
+                    engine_path = args
+                        .next()
+                        .ok_or_else(|| "usage: label-sf <positions_or_-> <nodes> [--engine PATH]".to_string())?;
+                }
+                _ => {
+                    if source.is_none() {
+                        source = Some(arg);
+                    } else if nodes.is_none() {
+                        nodes = Some(
+                            arg.parse::<u64>()
+                                .map_err(|_| format!("invalid nodes value: {arg}"))?,
+                        );
+                    } else {
+                        return Err(format!("unexpected argument: {arg}"));
+                    }
+                }
+            }
+        }
+        let source = source
+            .ok_or_else(|| "usage: label-sf <positions_or_-> <nodes> [--engine PATH]".to_string())?;
+        let nodes = nodes
+            .ok_or_else(|| "usage: label-sf <positions_or_-> <nodes> [--engine PATH]".to_string())?;
+        if nodes == 0 {
+            return Err("invalid nodes 0: need nodes >= 1".to_string());
+        }
+        // Stream the positions rather than buffering (see gen-eval-positions):
+        // a shard is piped via `gen-eval-positions - | label-sf - <nodes>`.
+        if source == "-" {
+            run_label_sf(std::io::stdin().lock(), nodes, &engine_path)?;
+        } else {
+            let file = std::fs::File::open(&source)
+                .map_err(|error| format!("failed to open positions {source}: {error}"))?;
+            run_label_sf(std::io::BufReader::new(file), nodes, &engine_path)?;
         }
         return Ok(());
     }
