@@ -28,61 +28,117 @@ honest about the fact that the engine now evaluates with NNUE.
 ## The net asset
 
 The trained network is committed as `assets/nnue/rusty-fish-net.rfnn` (789,520
-bytes — hidden 512). A `.gitattributes` entry marks it binary (`-text` /
-`binary`) so no CRLF/LF mangling corrupts the bytes (the opening-book fixtures
-needed the same discipline; a corrupted net would fail `from_bytes`). A short
-`assets/nnue/README.md` (or a comment header where it's referenced) records
-provenance: trained on ~3M Lichess positions labelled by Stockfish at 100k nodes,
-hidden 512, and gated at +8.0 Elo / AcceptH1 over 16384 games vs the tuned
-hand-crafted eval.
+bytes — hidden 512). **This is step zero and a hard build prerequisite:**
+`include_bytes!` is compile-time, so the workspace will not build until the real
+trained net bytes are committed at that path (the file does not exist yet;
+`assets/nnue/` currently holds only `wdl-corpus.toml`). The bytes are already
+retrieved off the Modal Volume to the local scratchpad — the plan copies them in.
+
+The repo's `.gitattributes` already exists (it pins `assets/opening-book/*` to
+`text eol=lf`). **Append** an entry for the net that marks it binary —
+`assets/nnue/*.rfnn binary` (equivalently `-text`), NOT `text eol=lf` — so no
+CRLF/LF mangling corrupts the bytes (a corrupted net fails `from_bytes`). A short
+`assets/nnue/README.md` records provenance: trained on ~3M Lichess positions
+labelled by Stockfish at 100k nodes, hidden 512, gated at +8.0 Elo / AcceptH1 over
+16384 games vs the tuned hand-crafted eval.
 
 ## Bundling and the default flip
 
-- `engine-search` gains `Nnue::bundled() -> &'static Nnue` (or a
-  `fn default_network() -> Arc<Nnue>`): `include_bytes!` the asset and parse it
-  once via the existing `from_bytes`, behind a `OnceLock`/`LazyLock` so it is
-  parsed a single time and shared. A parse failure is a programming/asset error
-  (the bytes are compiled in), so it may `expect(...)` with a clear message.
-- The default flips at the **library `Searcher` level**: the default construction
-  path installs the bundled net (`nnue = Some(bundled)`), so every `Searcher`
-  evaluates with NNUE unless a caller explicitly clears it. This is the honest
-  adoption — the engine plays NNUE everywhere, not only through the UCI binary.
-  `Searcher::evaluate` already prefers the net, so no evaluation-path change is
-  needed beyond the default.
+- `engine-search` gains `fn bundled_network() -> Arc<Nnue>` returning a cloned
+  `Arc` from a `static BUNDLED: LazyLock<Arc<Nnue>>` that `include_bytes!`es the
+  asset (`include_bytes!("../../assets/nnue/rusty-fish-net.rfnn")` from
+  `engine-search/src/`) and parses it once via the existing `from_bytes`. The
+  `Arc<Nnue>` shape (not `&'static Nnue`) is required because every install site is
+  `set_nnue(Some(Arc<Nnue>))`. A parse failure is a compiled-in-asset programming
+  error, so `expect(...)` with a clear message is fine.
+- The default flips at the **library `Searcher` level**: `impl Default for
+  Searcher` (the single origination point — `lib.rs` ~521) installs the bundled net
+  (`nnue: Some(bundled_network())`) instead of `None`. This is a **one-place**
+  change: the only other `Searcher` struct literal, `Searcher::helper`, takes
+  `nnue` as a parameter and is fed `self.nnue.clone()` at spawn, so Lazy SMP helper
+  threads inherit the net automatically with no extra edit. `Searcher::evaluate`
+  already prefers the net, so no evaluation-path change is needed beyond the
+  default.
+
+## UCI startup wiring (the library flip alone is NOT enough)
+
+**Critical:** flipping `Searcher::default()` does not make the shipped UCI binary
+play NNUE. `start_search` builds a fresh `Searcher::default()` and then
+*unconditionally* calls `searcher.set_nnue(state.nnue)` (`engine-uci/src/main.rs`
+~116-122), and `EngineState` derives `Default` → `nnue: None`. So the flipped
+library default is immediately overwritten by `None` on every `go`. The binary
+plays NNUE only if **`state.nnue` is initialised to the bundled net** — a separate,
+required change from the library flip.
+
+Model `EngineState`'s eval selection as a composed state, not a single `Option`, so
+the toggle and a custom `EvalFile` net compose correctly:
+
+- Store `use_nnue: bool` (default `true`) and `eval_file: Option<Arc<Nnue>>`
+  (default `None`) on `EngineState`, and recompute the effective net whenever
+  either changes: `state.nnue = if !use_nnue { None } else {
+  eval_file.clone().or_else(|| Some(bundled_network())) }`. A custom `EngineState`
+  default (not `#[derive(Default)]`) sets `use_nnue = true` so the bundled net is
+  installed at startup.
+- **`EvalFile <path>`** sets `eval_file = Some(from_file(path))` and recomputes;
+  it continues to override with a custom network.
+- A new **`UseNNUE` check option** (default `true`) sets `use_nnue` and recomputes.
+  `false` → hand-crafted (`state.nnue = None`); `true` → the custom `EvalFile` net
+  if one is loaded, else the bundled net. This composition means `UseNNUE true`
+  after an `EvalFile` load does NOT clobber the custom net (the bug a naive
+  `true → Some(bundled)` would cause).
+
+Advertise it in `write_uci_header` as a static line `option name UseNNUE type check
+default true` (no signature change). The `apply_option` arity guard
+(`tokens.len() < 4`) is not a problem: a check option always carries `true`/`false`
+(4 tokens), so it never hits the empty-value gotcha.
 
 ## Hand-crafted fallback
 
-The hand-crafted eval stays first-class and reachable:
-
-- **Library:** `set_nnue(None)` restores `evaluate_position` exactly as today.
-- **UCI:** a new `UseNNUE` check option (default `true`). `true` keeps the bundled
-  net (or a custom `EvalFile` net); `false` clears the net so the engine plays the
-  hand-crafted eval. `EvalFile <path>` continues to override with a custom network.
-  The option ordering must let `UseNNUE false` win over the bundled default (the
-  engine installs the bundled net at startup; `UseNNUE false` calls
-  `set_nnue(None)`).
-- Rationale: debugging, a safety valve if a net regresses, and the gate baseline.
+The hand-crafted eval stays first-class and reachable: at the **library** level
+`set_nnue(None)` restores `evaluate_position` exactly as today, and at the **UCI**
+level `UseNNUE false` reaches it (above). Rationale: debugging, a safety valve if a
+net regresses, and the gate baseline.
 
 ## engine-bench ripple (required by the default flip)
 
-Because the library default is now NNUE, code that builds a `Searcher` and relied
-on the hand-crafted default changes behaviour. Two deliberate, opposite
-adjustments:
+Because the library default is now NNUE, **every `Searcher::default()` site in
+engine-bench that relied on the hand-crafted default changes behaviour.** The plan
+must handle each one deliberately. Sites that must **explicitly disable NNUE**
+(`set_nnue(None)`) to keep their meaning:
 
-- **SPSA eval / mobility gate baselines must explicitly disable NNUE.**
-  `run_eval_gate_fens`, `run_mobility_gate_fens`, and the SPSA campaign compare
-  *hand-crafted eval parameter configs* against each other. With NNUE now the
-  default, both sides would silently become the identical bundled net (zero
-  signal). These functions must `set_nnue(None)` on both Searchers so they keep
-  comparing hand-crafted eval configs. (This is the same "gate baselines are
-  pinned, not 'current default'" caveat recorded when the tuned eval shipped —
-  here it becomes a required code change, not just a note.)
-- **The external SF gauntlet should run the bundled net.** The gauntlet measures
-  "how strong is our engine vs Stockfish"; with NNUE as the engine's eval, the
-  gauntlet's candidate should now use the bundled net (either via the new default,
-  or by explicitly installing it) so the measurement reflects the shipped engine.
-  If the gauntlet's `Searcher` uses the default construction path, it picks up
-  NNUE automatically — confirm and keep it.
+- **`gate_searcher`** (`engine-bench/src/lib.rs` ~605) — the shared builder behind
+  `run_eval_gate_fens`, `run_mobility_gate_fens`, and `run_eval_spsa_campaign`.
+  These compare *hand-crafted eval-parameter configs*; under the flip both sides
+  become the identical bundled net (zero signal). `set_nnue(None)` here covers all
+  three at once.
+- **`play_game` / `play_parameter_game`** (~565) — the search-parameter SPSA
+  (`run_spsa_campaign`). This is not zero-signal (both sides differ in search
+  params), but under the flip it silently starts tuning search params *on top of
+  NNUE*. To keep it tuning the frozen hand-crafted engine (so its frozen snapshot
+  stays meaningful), disable NNUE here too. (Re-tuning search on NNUE is future
+  work, out of scope.)
+- **`play_nnue_game`'s baseline** (`lib.rs` ~439) — the NNUE gauntlet builds
+  `candidate` (installs a net) vs `baseline` (`Searcher::default()`, commented
+  "hand-crafted evaluation"). Under the flip the baseline silently becomes NNUE,
+  making it NNUE-vs-NNUE. `baseline.set_nnue(None)`.
+- **`generate_training_samples`'s labeler** (`engine-bench/src/train.rs` ~66) — the
+  local self-play data-gen labels positions with a depth-N search whose leaves are
+  documented as "the hand-crafted evaluation." Under the flip the leaves become
+  NNUE, silently changing the distilled teacher. `labeler.set_nnue(None)`. (Its
+  test only asserts labels *differ* from the static eval, so this would rot
+  silently otherwise.)
+
+Sites that should **keep NNUE** (they measure the shipped engine, so the flip is
+correct — reassess their CI output, do not disable):
+
+- **The external SF gauntlet** (`play_external_game`, `lib.rs` ~756) builds
+  `Searcher::default()` and never calls `set_nnue`, so it inherits NNUE
+  automatically — the honest "how strong is our engine vs Stockfish" measurement.
+- **The tactical suite** and **throughput benchmark** — see CI impact below.
+
+None of these mis-flips fail a test loudly (the gauntlet/labeler tests only check
+counts / that labels differ), so each must be handled by inspection, not by relying
+on CI to catch it.
 
 ## CI impact
 
