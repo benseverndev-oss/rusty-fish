@@ -1422,7 +1422,7 @@ fn opposite(color: Color) -> Color {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct WdlSampleConfig {
     /// Skip the opening: only positions at or past this ply are eligible.
     pub min_ply: u32,
@@ -2563,6 +2563,29 @@ mod tests {
             .iter()
             .zip(&wdl)
             .all(|(e, w)| e.own == w.own && e.opp == w.opp && e.ply == w.ply));
+    }
+
+    #[test]
+    fn gen_eval_positions_matches_wdl_sampling_across_configs() {
+        // The eval sampler must stay 1:1 with the WDL sampler at *every* config,
+        // not just the single (8/5/6) point the test above checks. Vary min_ply,
+        // end_trim, per_game, and shard so any future divergence between the two
+        // samplers (eligibility, trim, subsample, sharding) trips CI structurally.
+        let configs = [
+            WdlSampleConfig { min_ply: 4, end_trim: 2, per_game: 20, shard: (0, 1) },
+            WdlSampleConfig { min_ply: 12, end_trim: 8, per_game: 3, shard: (0, 1) },
+            WdlSampleConfig { min_ply: 8, end_trim: 5, per_game: 6, shard: (0, 2) },
+            WdlSampleConfig { min_ply: 8, end_trim: 5, per_game: 6, shard: (1, 2) },
+        ];
+        for cfg in configs {
+            let eval = gen_eval_positions(WDL_FIXTURE, cfg);
+            let wdl = gen_wdl_data_samples(WDL_FIXTURE, cfg);
+            assert_eq!(eval.len(), wdl.len(), "count mismatch at {cfg:?}");
+            assert!(
+                eval.iter().zip(&wdl).all(|(e, w)| e.own == w.own && e.opp == w.opp && e.ply == w.ply),
+                "sampled positions diverged at {cfg:?}",
+            );
+        }
     }
 
     #[test]

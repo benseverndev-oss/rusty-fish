@@ -15,6 +15,13 @@ use engine_bench::{
 use engine_bench::train::{generate_training_samples, train_nnue, TrainConfig};
 use engine_search::{EvalParams, Nnue, SearchParams};
 
+/// Shared middlegame sampling window for both `gen-wdl-data` and
+/// `gen-eval-positions`. Single-sourced so the Stockfish teacher labels the
+/// exact same position distribution the WDL data trains on — tuning one
+/// without the other would silently drift the two apart.
+const SAMPLE_MIN_PLY: u32 = 8;
+const SAMPLE_END_TRIM: u32 = 5;
+
 const BENCHMARKS: &[(&str, u8)] = &[
     (
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
@@ -362,8 +369,8 @@ fn main() -> Result<(), String> {
         let source = source
             .ok_or_else(|| "usage: gen-wdl-data <pgn_or_-> [--shard i/n] [--per-game N]".to_string())?;
         let config = WdlSampleConfig {
-            min_ply: 8,
-            end_trim: 5,
+            min_ply: SAMPLE_MIN_PLY,
+            end_trim: SAMPLE_END_TRIM,
             per_game,
             shard,
         };
@@ -440,8 +447,8 @@ fn main() -> Result<(), String> {
         let source = source
             .ok_or_else(|| "usage: gen-eval-positions <pgn_or_-> [--shard i/n] [--per-game N]".to_string())?;
         let config = WdlSampleConfig {
-            min_ply: 8,
-            end_trim: 5,
+            min_ply: SAMPLE_MIN_PLY,
+            end_trim: SAMPLE_END_TRIM,
             per_game,
             shard,
         };
