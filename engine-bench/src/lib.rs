@@ -1646,6 +1646,7 @@ mod tests {
         random_opening_fens, run_eval_gate_fens, run_mobility_gate, run_nnue_gauntlet,
         run_nnue_gauntlet_with_move_time, sprt_tsv_report, summarize,
         gen_wdl_data_samples, gen_wdl_data_samples_from_reader, WdlSample, WdlSampleConfig,
+        gen_eval_positions, gen_eval_positions_from_reader, EvalPositionSample,
     };
     use engine_search::{EvalParams, Nnue, SearchParams, TaperedScore};
     use std::{sync::Arc, time::Duration};
@@ -2351,6 +2352,150 @@ mod tests {
         let all_set: HashSet<&String> = all.iter().collect();
         assert_eq!(union, all_set);
         // And the shards partition the samples with no duplication.
+        assert_eq!(shard0.len() + shard1.len() + shard2.len(), all.len());
+    }
+
+    fn eval_line(sample: &EvalPositionSample) -> String {
+        let join = |indices: &[usize]| {
+            indices
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!("{}\t{}\t{}", sample.fen, join(&sample.own), join(&sample.opp))
+    }
+
+    #[test]
+    fn gen_eval_positions_emits_fen_and_valid_features() {
+        let samples = gen_eval_positions(
+            WDL_FIXTURE,
+            WdlSampleConfig {
+                min_ply: 8,
+                end_trim: 5,
+                per_game: 6,
+                shard: (0, 1),
+            },
+        );
+        assert!(!samples.is_empty());
+        for s in &samples {
+            // FEN parses back to a legal position.
+            assert!(engine_core::Board::from_fen(&s.fen).is_ok(), "fen parses: {}", s.fen);
+            assert!(!s.own.is_empty() && !s.opp.is_empty());
+            assert!(s.own.iter().all(|&i| i < 768) && s.opp.iter().all(|&i| i < 768));
+        }
+        // Same sampled positions as the WDL sampler for the same config (same games,
+        // same plies) — only the payload differs.
+        let wdl = gen_wdl_data_samples(
+            WDL_FIXTURE,
+            WdlSampleConfig {
+                min_ply: 8,
+                end_trim: 5,
+                per_game: 6,
+                shard: (0, 1),
+            },
+        );
+        assert_eq!(samples.len(), wdl.len());
+        assert!(samples
+            .iter()
+            .zip(&wdl)
+            .all(|(e, w)| e.own == w.own && e.opp == w.opp && e.ply == w.ply));
+    }
+
+    #[test]
+    fn gen_eval_positions_reader_matches_str_path() {
+        let config = WdlSampleConfig {
+            min_ply: 8,
+            end_trim: 5,
+            per_game: 6,
+            shard: (0, 1),
+        };
+        let via_str: Vec<String> = gen_eval_positions(WDL_MULTI_GAME_FIXTURE, config)
+            .iter()
+            .map(eval_line)
+            .collect();
+        let via_reader: Vec<String> =
+            gen_eval_positions_from_reader(WDL_MULTI_GAME_FIXTURE.as_bytes(), config)
+                .expect("reader path succeeds")
+                .iter()
+                .map(eval_line)
+                .collect();
+        assert!(!via_str.is_empty());
+        assert_eq!(via_str, via_reader);
+    }
+
+    #[test]
+    fn gen_eval_positions_is_deterministic() {
+        let config = WdlSampleConfig {
+            min_ply: 8,
+            end_trim: 5,
+            per_game: 6,
+            shard: (0, 1),
+        };
+        let first: Vec<String> = gen_eval_positions(WDL_MULTI_GAME_FIXTURE, config)
+            .iter()
+            .map(eval_line)
+            .collect();
+        let second: Vec<String> = gen_eval_positions(WDL_MULTI_GAME_FIXTURE, config)
+            .iter()
+            .map(eval_line)
+            .collect();
+        assert!(!first.is_empty());
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn gen_eval_positions_caps_positions_per_game() {
+        let per_game = 4;
+        let samples = gen_eval_positions(
+            WDL_FIXTURE,
+            WdlSampleConfig {
+                min_ply: 8,
+                end_trim: 5,
+                per_game,
+                shard: (0, 1),
+            },
+        );
+        assert!(!samples.is_empty());
+        assert!(samples.len() <= per_game);
+    }
+
+    #[test]
+    fn gen_eval_positions_shards_partition_disjointly() {
+        let config = |shard| WdlSampleConfig {
+            min_ply: 8,
+            end_trim: 5,
+            per_game: 6,
+            shard,
+        };
+        let lines = |shard| {
+            gen_eval_positions(WDL_MULTI_GAME_FIXTURE, config(shard))
+                .iter()
+                .map(eval_line)
+                .collect::<Vec<_>>()
+        };
+        let all = lines((0, 1));
+        let shard0 = lines((0, 3));
+        let shard1 = lines((1, 3));
+        let shard2 = lines((2, 3));
+
+        assert!(!all.is_empty());
+        assert!(!shard0.is_empty() && !shard1.is_empty() && !shard2.is_empty());
+
+        use std::collections::HashSet;
+        let set0: HashSet<&String> = shard0.iter().collect();
+        let set1: HashSet<&String> = shard1.iter().collect();
+        let set2: HashSet<&String> = shard2.iter().collect();
+        assert!(set0.is_disjoint(&set1));
+        assert!(set0.is_disjoint(&set2));
+        assert!(set1.is_disjoint(&set2));
+
+        let union: HashSet<&String> = set0.union(&set1).cloned().collect::<HashSet<_>>()
+            .union(&set2)
+            .cloned()
+            .collect();
+        let all_set: HashSet<&String> = all.iter().collect();
+        assert_eq!(union, all_set);
         assert_eq!(shard0.len() + shard1.len() + shard2.len(), all.len());
     }
 }
