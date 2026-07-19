@@ -154,6 +154,9 @@ fn write_best_move(mut stdout: impl Write, result: SearchResult) -> io::Result<(
 
 struct EngineState {
     board: Board,
+    // A config holder only: `start_search` spawns its own `Searcher` per `go`, so
+    // this one never evaluates. Its (bundled) net is never read — `state.nnue` is
+    // the effective network the search actually installs.
     searcher: Searcher,
     options: SearchOptions,
     syzygy_path: Option<String>,
