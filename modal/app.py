@@ -268,28 +268,83 @@ def label_wdl_shard(name: str, i: int, n: int, per_game: int) -> int:
         return sum(1 for line in handle if line.strip())
 
 
-@app.function(image=rust_image, volumes={"/vol": wdl_volume}, timeout=60 * 90)
-def label_sf_shard(name: str, i: int, n: int, per_game: int, nodes: int) -> int:
+@app.function(volumes={"/store": labels_volume}, timeout=60 * 10)
+def missing_sf_months(dataset: str, months: list[str]) -> list[str]:
+    """Return the months in `months` that have no `<month>.complete` marker in the
+    store dataset dir (i.e. still need labeling). Read-only on the store."""
+    import os
+    labels_volume.reload()
+    return [m for m in months if not os.path.exists(f"/store/sf/{dataset}/{m}.complete")]
+
+
+@app.function(volumes={"/store": labels_volume}, timeout=60 * 10)
+def wipe_sf_month(dataset: str, month: str) -> int:
+    """Remove any existing shards for one (dataset, month) before its labelers run,
+    so a re-label can't leave stale shards from a different shard count. Run once
+    per month by the orchestrator, before the parallel shards."""
+    import os, glob
+    labels_volume.reload()
+    removed = 0
+    for p in glob.glob(f"/store/sf/{dataset}/samples-{month}-*.tsv"):
+        os.remove(p); removed += 1
+    labels_volume.commit()
+    return removed
+
+
+@app.function(volumes={"/store": labels_volume}, timeout=60 * 10)
+def mark_sf_month_complete(dataset: str, month: str) -> None:
+    """Write the `<month>.complete` marker after all of a month's shards land, so a
+    later run treats the month as a cache hit."""
+    import os
+    os.makedirs(f"/store/sf/{dataset}", exist_ok=True)
+    with open(f"/store/sf/{dataset}/{month}.complete", "w") as h:
+        h.write("done\n")
+    labels_volume.commit()
+
+
+@app.function(image=rust_image, volumes={"/vol": wdl_volume, "/store": labels_volume}, timeout=60 * 90)
+def label_sf_shard(dataset: str, name: str, i: int, n: int, per_game: int, nodes: int) -> int:
     """One Stockfish-eval labeling shard: sample FEN positions, then replace each
     with its fixed-node Stockfish cp eval.
 
     Streams a month's export through `gen-eval-positions` (same sampling as
     `gen-wdl-data`) and pipes the FEN+features lines through `label-sf`, which
-    drives one persistent Stockfish process at `go nodes {nodes}`. Output lands in
-    the `/vol/sf/` subdirectory so it stays disjoint from the top-level WDL shards.
+    drives one persistent Stockfish process at `go nodes {nodes}`. Reads the export
+    from `/vol` and writes the labelled shard into the store dataset dir
+    `/store/sf/{dataset}/`. It does NOT wipe the month (that's `wipe_sf_month`, run
+    once per month by the orchestrator, so parallel shards can't clobber each other).
     """
     import os
-    os.makedirs("/vol/sf", exist_ok=True)
-    out = f"/vol/sf/samples-{name}-{i}.tsv"
+    os.makedirs(f"/store/sf/{dataset}", exist_ok=True)
+    out = f"/store/sf/{dataset}/samples-{name}-{i}.tsv"
     cmd = (
         f"set -euo pipefail; zstdcat /vol/export-{name}.pgn.zst | "
         f"{BIN} gen-eval-positions - --shard {i}/{n} --per-game {per_game} | "
         f"{BIN} label-sf - {nodes} > {out}"
     )
     subprocess.run(["bash", "-c", cmd], check=True)
-    wdl_volume.commit()
+    labels_volume.commit()
     with open(out, "r", encoding="utf-8") as handle:
         return sum(1 for line in handle if line.strip())
+
+
+def ensure_sf_labels(corpus, per_game, nodes, shards_per_month) -> None:
+    """Client-side orchestration: label only the missing (dataset, month) shards
+    into the store, skipping months that already have a `<month>.complete` marker.
+
+    Derives the dataset from the data identity, asks the store which months are
+    missing, then for each missing month wipes it once, fans out its shards, and
+    writes the completion marker. A fully-cached corpus does zero labeling."""
+    dataset = _sf_dataset(nodes, per_game)
+    names = [m["name"] for m in corpus]
+    missing = missing_sf_months.remote(dataset, names)
+    print(f"SF store {dataset}: {len(names) - len(missing)} months cached, labeling {missing}")
+    for month in missing:
+        wipe_sf_month.remote(dataset, month)  # once, before the shards
+        list(label_sf_shard.starmap(
+            [(dataset, month, i, shards_per_month, per_game, nodes) for i in range(shards_per_month)]
+        ))
+        mark_sf_month_complete.remote(dataset, month)
 
 
 @app.function(
