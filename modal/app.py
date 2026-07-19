@@ -65,6 +65,43 @@ app = modal.App("rusty-fish-nnue")
 # Persistent volume holding the (large) Lichess export and the labelled shards, so
 # the download happens once and the GPU trainer can read every shard by path.
 wdl_volume = modal.Volume.from_name("rusty-fish-wdl", create_if_missing=True)
+labels_volume = modal.Volume.from_name("rusty-fish-labels", create_if_missing=True)
+
+
+def _sf_dataset(nodes: int, per_game: int) -> str:
+    """The store dataset dir keyed on data identity (teacher budget + density)."""
+    return f"n{nodes}-pg{per_game}"
+
+
+@app.function(volumes={"/store": labels_volume}, timeout=60 * 30)
+def migrate_flat_sf_labels() -> str:
+    import os, glob, re, shutil
+    labels_volume.reload()
+    dataset = _sf_dataset(100000, 4)
+    dst = f"/store/sf/{dataset}"
+    os.makedirs(dst, exist_ok=True)
+    moved, months = 0, set()
+    for p in glob.glob("/store/sf/samples-*.tsv"):  # flat, top-level only (no recursion)
+        base = os.path.basename(p)
+        shutil.move(p, f"{dst}/{base}")
+        moved += 1
+        m = re.match(r"samples-(\d{4}-\d{2})-\d+\.tsv", base)
+        if m:
+            months.add(m.group(1))
+    for month in sorted(months):
+        with open(f"{dst}/{month}.complete", "w") as h:
+            h.write("migrated\n")
+    if os.path.exists("/store/sf/data.tsv"):
+        os.remove("/store/sf/data.tsv")  # stale flat concat; datasets are re-concatenated on train
+    labels_volume.commit()
+    report = f"moved {moved} shards into sf/{dataset}, markers: {sorted(months)}"
+    print(f"MIGRATE_DONE {report}", flush=True)
+    return report
+
+
+@app.local_entrypoint()
+def migrate_labels():
+    print(migrate_flat_sf_labels.remote())
 
 
 @app.function(image=rust_image)
