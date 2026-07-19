@@ -1810,6 +1810,7 @@ mod tests {
         run_nnue_gauntlet_with_move_time, sprt_tsv_report, summarize,
         gen_wdl_data_samples, gen_wdl_data_samples_from_reader, WdlSample, WdlSampleConfig,
         gen_eval_positions, gen_eval_positions_from_reader, EvalPositionSample,
+        parse_uci_score_cp, MATE_CP,
     };
     use engine_search::{EvalParams, Nnue, SearchParams, TaperedScore};
     use std::{sync::Arc, time::Duration};
@@ -1824,6 +1825,20 @@ mod tests {
         assert_eq!(classify_bestmove_token("(none)"), None);
         assert_eq!(classify_bestmove_token("0000"), None);
         assert_eq!(classify_bestmove_token(""), None);
+    }
+
+    #[test]
+    fn parse_uci_score_reads_last_cp_and_clamps_mate() {
+        // cp from the last info line before bestmove
+        assert_eq!(parse_uci_score_cp("info depth 20 score cp 37 nodes 1 pv e2e4"), Some(37));
+        assert_eq!(parse_uci_score_cp("info depth 20 score cp -145 pv"), Some(-145));
+        // mate -> clamped +/- MATE_CP
+        assert_eq!(parse_uci_score_cp("info depth 30 score mate 3 pv"), Some(MATE_CP));
+        assert_eq!(parse_uci_score_cp("info depth 30 score mate -2 pv"), Some(-MATE_CP));
+        // bound qualifier follows the value -> value kept, qualifier ignored
+        assert_eq!(parse_uci_score_cp("info depth 20 score cp 37 lowerbound nodes 1"), Some(37));
+        // non-score info line -> None (caller keeps the previous score)
+        assert_eq!(parse_uci_score_cp("info depth 1 nodes 20"), None);
     }
 
     #[test]
