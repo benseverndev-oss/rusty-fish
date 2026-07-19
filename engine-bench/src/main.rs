@@ -10,6 +10,7 @@ use engine_bench::{
     run_spsa_campaign, run_tactical_suite,
     spsa_tsv_report, sprt, sprt_tsv_report, summarize, tactical_tsv_report, throughput_tsv_report,
     gen_wdl_data_samples_from_reader, WdlSampleConfig,
+    gen_eval_positions_from_reader,
 };
 use engine_bench::train::{generate_training_samples, train_nnue, TrainConfig};
 use engine_search::{EvalParams, Nnue, SearchParams};
@@ -381,6 +382,83 @@ fn main() -> Result<(), String> {
             println!(
                 "{}\t{}\t{}",
                 sample.target,
+                join_usize(&sample.own),
+                join_usize(&sample.opp)
+            );
+        }
+        return Ok(());
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("gen-eval-positions") {
+        // gen-eval-positions <pgn_or_-> [--shard i/n] [--per-game N]: sample the
+        // same middlegame positions as gen-wdl-data (path or `-` for stdin) but
+        // emit each as "fen\town_csv\topp_csv" — the input label-sf reads to
+        // re-evaluate each FEN with Stockfish.
+        let mut source: Option<String> = None;
+        let mut shard = (0usize, 1usize);
+        let mut per_game = 12usize;
+        let mut args = std::env::args().skip(2);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--shard" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "usage: gen-eval-positions <pgn_or_-> [--shard i/n] [--per-game N]".to_string())?;
+                    let (i, n) = value
+                        .split_once('/')
+                        .ok_or_else(|| format!("invalid --shard value (want i/n): {value}"))?;
+                    let i = i
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid --shard index: {i}"))?;
+                    let n = n
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid --shard count: {n}"))?;
+                    if n == 0 || i >= n {
+                        return Err(format!("invalid --shard {i}/{n}: need 0 <= i < n"));
+                    }
+                    shard = (i, n);
+                }
+                "--per-game" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "usage: gen-eval-positions <pgn_or_-> [--shard i/n] [--per-game N]".to_string())?;
+                    per_game = value
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid --per-game value: {value}"))?;
+                    if per_game == 0 {
+                        return Err("invalid --per-game 0: need N >= 1".to_string());
+                    }
+                }
+                _ => {
+                    if source.is_some() {
+                        return Err(format!("unexpected argument: {arg}"));
+                    }
+                    source = Some(arg);
+                }
+            }
+        }
+        let source = source
+            .ok_or_else(|| "usage: gen-eval-positions <pgn_or_-> [--shard i/n] [--per-game N]".to_string())?;
+        let config = WdlSampleConfig {
+            min_ply: 8,
+            end_trim: 5,
+            per_game,
+            shard,
+        };
+        // Stream the PGN rather than buffering it (see gen-wdl-data): the real
+        // Lichess export is ~16 GB decompressed and is piped via
+        // `zstdcat ... | gen-eval-positions -`.
+        let samples = if source == "-" {
+            gen_eval_positions_from_reader(std::io::stdin().lock(), config)?
+        } else {
+            let file = std::fs::File::open(&source)
+                .map_err(|error| format!("failed to open PGN {source}: {error}"))?;
+            gen_eval_positions_from_reader(std::io::BufReader::new(file), config)?
+        };
+        for sample in samples {
+            println!(
+                "{}\t{}\t{}",
+                sample.fen,
                 join_usize(&sample.own),
                 join_usize(&sample.opp)
             );

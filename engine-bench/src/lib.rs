@@ -1632,6 +1632,169 @@ pub fn gen_wdl_data_samples_from_reader<R: std::io::Read>(
     Ok(builder.out)
 }
 
+/// One sampled position for the Stockfish-eval teacher: the same middlegame
+/// position `gen-wdl-data` would emit, but carrying the board `fen` (so a UCI
+/// engine can re-evaluate it) instead of the game-outcome target. The
+/// side-to-move-relative feature indices (`own`/`opp`) and `ply` correspond 1:1
+/// to the matching `WdlSample` for the same config.
+#[derive(Clone)]
+pub struct EvalPositionSample {
+    pub fen: String,
+    pub own: Vec<usize>,
+    pub opp: Vec<usize>,
+    pub ply: u32,
+}
+
+struct EvalPositionGame {
+    chess: Chess,
+    board: Board,
+    /// `(features_own, features_opp, fen, ply)` for every eligible ply.
+    positions: Vec<(Vec<usize>, Vec<usize>, String, u32)>,
+    ply: u32,
+    valid: bool,
+    result: String,
+}
+
+struct EvalPositionBuilder {
+    config: WdlSampleConfig,
+    stream_index: usize,
+    out: Vec<EvalPositionSample>,
+}
+
+impl Visitor for EvalPositionBuilder {
+    type Tags = WdlTags;
+    type Movetext = EvalPositionGame;
+    type Output = ();
+
+    fn begin_tags(&mut self) -> ControlFlow<Self::Output, Self::Tags> {
+        ControlFlow::Continue(WdlTags::default())
+    }
+
+    fn tag(
+        &mut self,
+        tags: &mut WdlTags,
+        name: &[u8],
+        value: RawTag<'_>,
+    ) -> ControlFlow<Self::Output> {
+        let value = std::str::from_utf8(value.as_bytes()).unwrap_or_default();
+        match name {
+            b"Event" => tags.event = value.to_string(),
+            b"Variant" => tags.variant = value.to_string(),
+            b"WhiteElo" => tags.white_elo = value.parse().unwrap_or(0),
+            b"BlackElo" => tags.black_elo = value.parse().unwrap_or(0),
+            b"Result" => tags.result = value.to_string(),
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn begin_movetext(&mut self, tags: WdlTags) -> ControlFlow<Self::Output, Self::Movetext> {
+        let (i, n) = self.config.shard;
+        // Count every game in stream order and gate on the index *before* the
+        // rating filter, so `0/n, 1/n, ...` partition the games disjointly —
+        // exactly as `WdlBuilder` does, so the sampled game set matches.
+        let in_shard = n == 0 || self.stream_index % n == i;
+        self.stream_index += 1;
+        let valid = in_shard && WdlBuilder::accepts_tags(&tags);
+        ControlFlow::Continue(EvalPositionGame {
+            chess: Chess::default(),
+            board: Board::startpos(),
+            positions: Vec::new(),
+            ply: 0,
+            valid,
+            result: tags.result,
+        })
+    }
+
+    fn san(&mut self, game: &mut EvalPositionGame, san: SanPlus) -> ControlFlow<Self::Output> {
+        if !game.valid {
+            return ControlFlow::Continue(());
+        }
+        let Ok(mv) = san.san.to_move(&game.chess) else {
+            game.valid = false;
+            return ControlFlow::Continue(());
+        };
+        let stm = game.board.side_to_move;
+        // Capture the pre-move features *and the pre-move FEN* for the eligible
+        // plies; only commit them once the move has applied cleanly to `board`.
+        let eligible = game.ply >= self.config.min_ply;
+        let captured = eligible.then(|| {
+            (
+                active_features(&game.board, stm),
+                active_features(&game.board, opposite(stm)),
+                game.board.to_fen(),
+            )
+        });
+        let uci = UciMove::from_standard(mv.clone()).to_string();
+        match game
+            .board
+            .parse_uci_move(&uci)
+            .and_then(|parsed| game.board.make_move(parsed))
+        {
+            Ok(_) => {
+                if let Some((own, opp, fen)) = captured {
+                    game.positions.push((own, opp, fen, game.ply));
+                }
+                game.chess.play_unchecked(mv);
+                game.ply += 1;
+            }
+            Err(_) => game.valid = false,
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn end_game(&mut self, game: EvalPositionGame) -> Self::Output {
+        if !game.valid || !matches!(game.result.as_str(), "1-0" | "0-1" | "1/2-1/2") {
+            return;
+        }
+        // Trim the last `end_trim` plies (mechanical), then evenly subsample to
+        // `per_game` positions (deterministic — no RNG). Identical to
+        // `WdlBuilder::end_game` so the sampled positions match 1:1.
+        let last_ply = game.ply;
+        let eligible: Vec<_> = game
+            .positions
+            .into_iter()
+            .filter(|(_, _, _, ply)| *ply + self.config.end_trim < last_ply)
+            .collect();
+        let picked = evenly_spaced(&eligible, self.config.per_game);
+        for (own, opp, fen, ply) in picked {
+            self.out.push(EvalPositionSample {
+                fen,
+                own,
+                opp,
+                ply,
+            });
+        }
+    }
+}
+
+/// Parses a PGN (whole games) and returns the FEN-labelled middlegame positions
+/// — the same positions `gen_wdl_data_samples` samples, carrying the board FEN
+/// instead of the game-outcome target so a UCI engine can re-evaluate them.
+pub fn gen_eval_positions(pgn: &str, config: WdlSampleConfig) -> Vec<EvalPositionSample> {
+    gen_eval_positions_from_reader(pgn.as_bytes(), config)
+        .expect("reading an in-memory PGN cannot fail")
+}
+
+/// Streams a PGN from any `io::Read` (a file, or `zstdcat | -` on stdin) and
+/// returns the FEN-labelled middlegame positions. Mirrors
+/// `gen_wdl_data_samples_from_reader`; the returned `Vec` is bounded by
+/// `per_game * games`. Propagates any read error.
+pub fn gen_eval_positions_from_reader<R: std::io::Read>(
+    reader: R,
+    config: WdlSampleConfig,
+) -> Result<Vec<EvalPositionSample>, String> {
+    let mut builder = EvalPositionBuilder {
+        config,
+        stream_index: 0,
+        out: Vec::new(),
+    };
+    Reader::new(reader)
+        .visit_all_games(&mut builder)
+        .map_err(|error| format!("failed to read PGN: {error}"))?;
+    Ok(builder.out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
