@@ -437,6 +437,8 @@ fn play_nnue_game(
     let mut candidate = Searcher::default();
     candidate.set_nnue(Some(Arc::clone(net)));
     let mut baseline = Searcher::default(); // hand-crafted evaluation
+    // Compare/label with the hand-crafted eval, not the now-default NNUE.
+    baseline.set_nnue(None);
     for ply in 0..config.max_plies {
         let (depth, searcher) = if board.side_to_move == candidate_color {
             (config.candidate_depth, &mut candidate)
@@ -563,9 +565,13 @@ pub fn play_parameter_game(
 ) -> Result<GameRecord, String> {
     let mut board = Board::from_fen(fen)?;
     let mut candidate = Searcher::default();
+    // Compare/label with the hand-crafted eval, not the now-default NNUE.
+    candidate.set_nnue(None);
     candidate.set_search_params(candidate_params);
     candidate.set_eval_params(candidate_eval);
     let mut baseline = Searcher::default();
+    // Compare/label with the hand-crafted eval, not the now-default NNUE.
+    baseline.set_nnue(None);
     baseline.set_search_params(baseline_params);
     baseline.set_eval_params(baseline_eval);
     for ply in 0..config.max_plies {
@@ -604,6 +610,8 @@ pub fn play_parameter_game(
 /// default 25 ms overhead (there is no GUI latency to reserve for here).
 fn gate_searcher(params: SearchParams, eval: EvalParams) -> Searcher {
     let mut searcher = Searcher::default();
+    // Compare/label with the hand-crafted eval, not the now-default NNUE.
+    searcher.set_nnue(None);
     searcher.set_search_params(params);
     searcher.set_eval_params(eval);
     let mut options = searcher.options().clone();

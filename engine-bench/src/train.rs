@@ -64,6 +64,8 @@ pub fn generate_training_samples(
 ) -> Result<Vec<TrainingSample>, String> {
     let mut rng = Lcg::new(seed);
     let mut labeler = Searcher::default();
+    // Compare/label with the hand-crafted eval, not the now-default NNUE.
+    labeler.set_nnue(None);
     let mut samples = Vec::new();
     for fen in seeds {
         let mut board = Board::from_fen(fen)?;
