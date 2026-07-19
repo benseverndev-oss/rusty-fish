@@ -217,7 +217,7 @@ def train_net(data_text: str, hidden: int, epochs: int) -> bytes:
         out_path = f"{directory}/net.rfnn"
         with open(data_path, "w", encoding="utf-8") as handle:
             handle.write(data_text)
-        model = train_nnue.train(data_path, hidden, epochs, batch_size=1024, lr=1e-3, device="cuda")
+        model, _ = train_nnue.train(data_path, hidden, epochs, batch_size=1024, lr=1e-3, device="cuda")
         train_nnue.quantize_and_write(model, hidden, out_path)
         with open(out_path, "rb") as handle:
             return handle.read()
@@ -383,7 +383,7 @@ def train_wdl_run(shard_names: list[str], hidden: int, epochs: int) -> bytes:
                 for line in handle:
                     out.write(line)
     out_path = "/vol/net.rfnn"
-    model = train_nnue.train(
+    model, _ = train_nnue.train(
         data_path, hidden, epochs, batch_size=1024, lr=1e-3, device="cuda", wdl_target=True
     )
     train_nnue.quantize_and_write(model, hidden, out_path)
@@ -395,7 +395,7 @@ def train_wdl_run(shard_names: list[str], hidden: int, epochs: int) -> bytes:
     image=torch_image, gpu="A10G", timeout=60 * 60 * 3, memory=32768,
     volumes={"/store": labels_volume},
 )
-def train_from_store(datasets: list[str], hidden: int, epochs: int) -> bytes:
+def train_from_store(datasets: list[str], hidden: int, epochs: int) -> tuple[bytes, float]:
     """Train (cp mode) on the concatenation of the given store datasets. Read-only
     on the store: it globs + concatenates, NEVER deletes."""
     import os, train_nnue
@@ -413,7 +413,7 @@ def train_from_store(datasets: list[str], hidden: int, epochs: int) -> bytes:
             with open(shard_path, "r", encoding="utf-8") as handle:
                 for line in handle:
                     out.write(line)
-    model = train_nnue.train(
+    model, val_loss = train_nnue.train(
         data_path, hidden, epochs, batch_size=1024, lr=1e-3, device="cuda", wdl_target=False
     )
     os.makedirs("/store/nets", exist_ok=True)
@@ -421,7 +421,7 @@ def train_from_store(datasets: list[str], hidden: int, epochs: int) -> bytes:
     train_nnue.quantize_and_write(model, hidden, out_path)
     labels_volume.commit()
     with open(out_path, "rb") as handle:
-        return handle.read()
+        return (handle.read(), val_loss)
 
 
 def _chunks(lines, size):
@@ -675,7 +675,7 @@ def train_sf(
     # them), then train read-only over the whole dataset. A fully-labeled corpus
     # goes straight to training with zero Stockfish cost.
     ensure_sf_labels(corpus, per_game, nodes, shards_per_month)
-    net_bytes = train_from_store.remote([_sf_dataset(nodes, per_game)], hidden, epochs)
+    net_bytes, val_loss = train_from_store.remote([_sf_dataset(nodes, per_game)], hidden, epochs)
     print(f"trained network: {len(net_bytes)} bytes")
 
     print(nnue_gate_run.remote(net_bytes, gate_depth, gate_openings, gate_plies,

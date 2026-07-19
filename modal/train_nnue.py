@@ -160,6 +160,7 @@ def train(
             total += loss_on(chunk).item() * chunk.numel()
         return total / idx.numel()
 
+    val = float("nan")
     for epoch in range(epochs):
         model.train()
         perm = train_idx[torch.randperm(train_idx.numel(), device=device)]
@@ -182,7 +183,7 @@ def train(
             file=sys.stderr,
         )
 
-    return model
+    return model, val
 
 
 def quantize_and_write(model, hidden: int, out_path: str):
@@ -235,7 +236,7 @@ def main():
     import torch
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model = train(
+    model, _ = train(
         args.data, args.hidden, args.epochs, args.batch_size, args.lr, device,
         wdl_target=args.wdl_target,
     )
