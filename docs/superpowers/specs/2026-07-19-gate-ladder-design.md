@@ -32,10 +32,30 @@ a **baseline mode** through `run_nnue_gauntlet…` → `play_nnue_game`:
 - **handcrafted** (opt-in, for the record / eval-development): the baseline calls
   `set_nnue(None)` as today.
 
+Thread the mode as a small `BaselineMode { Champion, Handcrafted }` enum
+(defaulting to `Champion`) added only to the inner
+`run_nnue_gauntlet_with_optional_move_time` + `play_nnue_game`; keep the public
+`run_nnue_gauntlet` / `run_nnue_gauntlet_with_move_time` signatures unchanged
+(default `Champion`) so the `nnue-sprt` caller in `main.rs` is untouched.
+
 The `gate-file` command gains an optional trailing arg selecting the mode
 (`gate-file <net> <depth> <openings_file> [move_time_ms] [champion|handcrafted]`,
 default `champion`). SPRT hypothesis is unchanged (`elo0=0`, `elo1=5`): AcceptH1 =
-candidate is ≥5 Elo better than the champion = adopt.
+candidate is ≥5 Elo better than the champion = adopt. **Arg-parse care:** the mode
+token sits after the optional `move_time_ms`, so a caller passing a mode must also
+pass a movetime (else the mode lands in the u64 movetime slot and is silently
+ignored) — the ladder always passes a movetime, so this is safe; the plan parses
+the mode by matching the `champion`/`handcrafted` token rather than strict
+position, and `gate_shard` forwards the mode only after the movetime.
+
+**This flips the default baseline for the existing gates too, deliberately.**
+`gate_shard` → `nnue_gate_run` is called by `train_wdl`, `train_sf`, and
+`gate_net`; with `gate-file` now defaulting to `champion`, all three gate
+candidate-vs-champion instead of candidate-vs-hand-crafted. That is the intended
+direction (it is this spec's whole thesis — hand-crafted is no longer a meaningful
+bar). The plan must **update the now-stale "vs the hand-crafted baseline"
+docstrings** on `gate_shard`, `nnue_gate_run`, `train_sf`, `train_wdl`, and
+`gate_net` so the docs match the new semantics.
 
 **Sanity property:** gating a net against an identical champion (candidate file ==
 bundled net) should trend to ~0 Elo / AcceptH0 — a useful smoke check that the gate
@@ -45,11 +65,16 @@ isn't biased.
 
 ### Rung 0 — validation-loss pre-check (free)
 
-`train_from_store` already computes a per-epoch `val_wdl_loss`. Return the final
-value alongside the net (`(net_bytes, val_loss)`), and have the ladder **reject
-before any game** if it is `NaN` or above a generous sanity ceiling (default ~0.1;
-a healthy cp-mode net is < 0.02, so this only kills diverged/broken training, it
-does not rank close nets). Zero games spent on a broken run.
+`train_from_store` trains a net whose per-epoch `val_wdl_loss` is currently only
+**printed to stderr**, not returned — `train_nnue.py`'s `train(...)` returns just
+the `model`. So this rung requires a small trainer change: **`train()` returns
+`(model, final_val_loss)`**, and its three callers unpack the tuple (`train_net`,
+`train_wdl_run`, and `train_from_store` — the plan must touch all three, not only
+`train_from_store`). `train_from_store` then returns `(net_bytes, val_loss)`, and
+the ladder **rejects before any game** if `val_loss` is `NaN` or above a generous
+sanity ceiling (default ~0.1; a healthy cp-mode net is < 0.02, so this only kills
+diverged/broken training, it does not rank close nets). Zero games spent on a
+broken run.
 
 ### Rung 1 — sequential SPRT gate vs champion (the main rung)
 
@@ -61,7 +86,9 @@ the result is decisive:
    movetime-bounded) exactly as the current gate does — but generated with a
    distinct per-chunk seed so each chunk is fresh positions.
 2. Accumulate cumulative `W/D/L` across all chunks so far and call the existing
-   `sprt` command → parse its `decision`.
+   `sprt` command → parse its `decision`. Parse the **TSV `decision` column** (the
+   last field of the values line), which is the bare token `AcceptH0` / `AcceptH1`
+   / `Continue` — not the stderr `decision = Some(...)` blob.
 3. **Stop on a decision:** `AcceptH0` → **reject** (candidate not better; a clearly
    worse net dies in ~1–2 chunks / a few hundred games), `AcceptH1` → **adopt**
    (candidate ≥5 Elo better). `Continue` → play another chunk.
