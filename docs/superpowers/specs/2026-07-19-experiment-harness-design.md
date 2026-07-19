@@ -28,10 +28,14 @@ returns a structured result (so nothing needs re-parsing client-side):
    `rejected` result with `val_loss` and no gate.
 3. Else `verdict = gate_ladder_run.remote(net_bytes, gate_depth, gate_plies,
    move_time_ms, gate_shard_size, chunk_openings, max_openings)`; parse its
-   `NNUE_LADDER_RESULT` summary line (`{W}W {D}D {L}L over {games} games
-   ({played}/{cap} openings), decision {decision}`) into W/D/L, games, decision, and
-   compute the Elo estimate from the score (`score = (W + 0.5·D)/(W+D+L)`,
-   `elo = -400·log10(1/score − 1)`, clamped for score at 0/1).
+   `NNUE_LADDER_RESULT` summary line. The real line is
+   `gate ladder: {W}W {D}D {L}L over {games} games ({played}/{max} openings),
+   decision {decision}` — anchor the regex on the `gate ladder:` prefix (or the
+   `\d+W \d+D \d+L` triple), which is stable. Compute the Elo estimate from the
+   score (`score = (W + 0.5·D)/(W+D+L)`, `elo = -400·log10(1/score − 1)`), with
+   explicit edge handling: `games == 0` → `elo` is `NA` (no games); `score == 0` →
+   a large negative floor (e.g. `-800.0`); `score == 1` → a large positive ceiling
+   (`+800.0`), avoiding the div-by-zero / `log10(0)`.
 4. Return a dict: `{dataset, hidden, epochs, lr, val_loss, wins, draws, losses,
    games, elo, decision}`.
 
@@ -66,12 +70,19 @@ It:
 
 ### The results ledger — append-only, in the store
 
-`append_results(rows, sweep_id)` mounts the label store, appends TSV rows to
-`/store/experiments/results.tsv` (writing a header first if the file does not
-exist), and commits. Columns: `sweep_id`, `timestamp` (UTC ISO, via `datetime` —
-allowed in Modal Python), `dataset`, `hidden`, `epochs`, `lr`, `val_loss`, `wins`,
-`draws`, `losses`, `games`, `elo`, `decision`. Append-only in the same spirit as
-the labels — every experiment ever run is preserved and comparable across sessions.
+`append_results(rows, sweep_id)` mounts the label store, `reload()`s, appends TSV
+rows to `/store/experiments/results.tsv` (writing a header first if the file does
+not exist), and commits. Columns: `sweep_id`, `timestamp` (UTC ISO, via `datetime`
+— allowed in Modal Python), `dataset`, `hidden`, `epochs`, `lr`, `val_loss`,
+`wins`, `draws`, `losses`, `games`, `elo`, `decision`. Append-only in the same
+spirit as the labels — every experiment ever run is preserved and comparable across
+sessions.
+
+**Sentinel for non-gated rows (keep the TSV column-aligned):** a `rejected` row
+(val pre-check failed) and an `error` row (training/gate raised) have no gate — set
+`wins`/`draws`/`losses`/`games`/`elo` to the literal `NA`, and `decision` to
+`"rejected"` or `"error"` respectively (the error message can be appended to the
+`decision` field or dropped). Every row has all columns filled.
 
 A `results` entrypoint reads and prints the ledger sorted by Elo (a
 `read_results` volume-mounted function returns the file contents; the entrypoint
