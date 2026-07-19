@@ -441,7 +441,7 @@ mod tests {
     #[test]
     fn bundled_network_round_trips() {
         let net = bundled_network();
-        assert_eq!(net.hidden(), 512);
+        assert_eq!(net.hidden(), 1024); // the shipped champion's hidden width
         // Re-serialising the parsed net reproduces the committed asset bytes exactly.
         assert_eq!(
             net.to_bytes(),

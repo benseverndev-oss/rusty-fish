@@ -6,6 +6,7 @@ on:
       - 'engine-core/**'
       - 'engine-search/**'
       - 'engine-bench/**'
+      - 'assets/nnue/*.rfnn'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/throughput-benchmark.yml'
