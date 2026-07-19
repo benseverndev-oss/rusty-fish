@@ -7,6 +7,8 @@
 //! deterministic seeded generator lets tests and CI exercise the whole pipeline
 //! — and the engine only uses it when a network is explicitly loaded.
 
+use std::sync::{Arc, LazyLock};
+
 use engine_core::{Board, Color, Piece, PieceKind, Square};
 
 /// Number of input features: (own / their) x 6 piece kinds x 64 squares.
@@ -275,6 +277,19 @@ impl Nnue {
             output_bias,
         }
     }
+}
+
+/// The engine's default NNUE, compiled into the binary. Parsed once and shared.
+static BUNDLED_NETWORK: LazyLock<Arc<Nnue>> = LazyLock::new(|| {
+    Arc::new(
+        Nnue::from_bytes(include_bytes!("../../assets/nnue/rusty-fish-net.rfnn"))
+            .expect("bundled NNUE asset is a valid RFNN network"),
+    )
+});
+
+/// A shared handle to the bundled default network.
+pub fn bundled_network() -> Arc<Nnue> {
+    BUNDLED_NETWORK.clone()
 }
 
 fn clipped_relu(value: i32) -> i32 {

@@ -11,7 +11,7 @@ use pyrrhic_rs::{
 
 mod nnue;
 
-pub use nnue::{active_features, Nnue, INPUT_DIMENSION};
+pub use nnue::{active_features, bundled_network, Nnue, INPUT_DIMENSION};
 
 const MATE_SCORE: i32 = 100_000;
 const MAX_KILLER_PLY: usize = 128;
