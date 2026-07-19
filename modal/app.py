@@ -65,6 +65,43 @@ app = modal.App("rusty-fish-nnue")
 # Persistent volume holding the (large) Lichess export and the labelled shards, so
 # the download happens once and the GPU trainer can read every shard by path.
 wdl_volume = modal.Volume.from_name("rusty-fish-wdl", create_if_missing=True)
+labels_volume = modal.Volume.from_name("rusty-fish-labels", create_if_missing=True)
+
+
+def _sf_dataset(nodes: int, per_game: int) -> str:
+    """The store dataset dir keyed on data identity (teacher budget + density)."""
+    return f"n{nodes}-pg{per_game}"
+
+
+@app.function(volumes={"/store": labels_volume}, timeout=60 * 30)
+def migrate_flat_sf_labels() -> str:
+    import os, glob, re, shutil
+    labels_volume.reload()
+    dataset = _sf_dataset(100000, 4)
+    dst = f"/store/sf/{dataset}"
+    os.makedirs(dst, exist_ok=True)
+    moved, months = 0, set()
+    for p in glob.glob("/store/sf/samples-*.tsv"):  # flat, top-level only (no recursion)
+        base = os.path.basename(p)
+        shutil.move(p, f"{dst}/{base}")
+        moved += 1
+        m = re.match(r"samples-(\d{4}-\d{2})-\d+\.tsv", base)
+        if m:
+            months.add(m.group(1))
+    for month in sorted(months):
+        with open(f"{dst}/{month}.complete", "w") as h:
+            h.write("migrated\n")
+    if os.path.exists("/store/sf/data.tsv"):
+        os.remove("/store/sf/data.tsv")  # stale flat concat; datasets are re-concatenated on train
+    labels_volume.commit()
+    report = f"moved {moved} shards into sf/{dataset}, markers: {sorted(months)}"
+    print(f"MIGRATE_DONE {report}", flush=True)
+    return report
+
+
+@app.local_entrypoint()
+def migrate_labels():
+    print(migrate_flat_sf_labels.remote())
 
 
 @app.function(image=rust_image)
@@ -231,28 +268,83 @@ def label_wdl_shard(name: str, i: int, n: int, per_game: int) -> int:
         return sum(1 for line in handle if line.strip())
 
 
-@app.function(image=rust_image, volumes={"/vol": wdl_volume}, timeout=60 * 90)
-def label_sf_shard(name: str, i: int, n: int, per_game: int, nodes: int) -> int:
+@app.function(volumes={"/store": labels_volume}, timeout=60 * 10)
+def missing_sf_months(dataset: str, months: list[str]) -> list[str]:
+    """Return the months in `months` that have no `<month>.complete` marker in the
+    store dataset dir (i.e. still need labeling). Read-only on the store."""
+    import os
+    labels_volume.reload()
+    return [m for m in months if not os.path.exists(f"/store/sf/{dataset}/{m}.complete")]
+
+
+@app.function(volumes={"/store": labels_volume}, timeout=60 * 10)
+def wipe_sf_month(dataset: str, month: str) -> int:
+    """Remove any existing shards for one (dataset, month) before its labelers run,
+    so a re-label can't leave stale shards from a different shard count. Run once
+    per month by the orchestrator, before the parallel shards."""
+    import os, glob
+    labels_volume.reload()
+    removed = 0
+    for p in glob.glob(f"/store/sf/{dataset}/samples-{month}-*.tsv"):
+        os.remove(p); removed += 1
+    labels_volume.commit()
+    return removed
+
+
+@app.function(volumes={"/store": labels_volume}, timeout=60 * 10)
+def mark_sf_month_complete(dataset: str, month: str) -> None:
+    """Write the `<month>.complete` marker after all of a month's shards land, so a
+    later run treats the month as a cache hit."""
+    import os
+    os.makedirs(f"/store/sf/{dataset}", exist_ok=True)
+    with open(f"/store/sf/{dataset}/{month}.complete", "w") as h:
+        h.write("done\n")
+    labels_volume.commit()
+
+
+@app.function(image=rust_image, volumes={"/vol": wdl_volume, "/store": labels_volume}, timeout=60 * 90)
+def label_sf_shard(dataset: str, name: str, i: int, n: int, per_game: int, nodes: int) -> int:
     """One Stockfish-eval labeling shard: sample FEN positions, then replace each
     with its fixed-node Stockfish cp eval.
 
     Streams a month's export through `gen-eval-positions` (same sampling as
     `gen-wdl-data`) and pipes the FEN+features lines through `label-sf`, which
-    drives one persistent Stockfish process at `go nodes {nodes}`. Output lands in
-    the `/vol/sf/` subdirectory so it stays disjoint from the top-level WDL shards.
+    drives one persistent Stockfish process at `go nodes {nodes}`. Reads the export
+    from `/vol` and writes the labelled shard into the store dataset dir
+    `/store/sf/{dataset}/`. It does NOT wipe the month (that's `wipe_sf_month`, run
+    once per month by the orchestrator, so parallel shards can't clobber each other).
     """
     import os
-    os.makedirs("/vol/sf", exist_ok=True)
-    out = f"/vol/sf/samples-{name}-{i}.tsv"
+    os.makedirs(f"/store/sf/{dataset}", exist_ok=True)
+    out = f"/store/sf/{dataset}/samples-{name}-{i}.tsv"
     cmd = (
         f"set -euo pipefail; zstdcat /vol/export-{name}.pgn.zst | "
         f"{BIN} gen-eval-positions - --shard {i}/{n} --per-game {per_game} | "
         f"{BIN} label-sf - {nodes} > {out}"
     )
     subprocess.run(["bash", "-c", cmd], check=True)
-    wdl_volume.commit()
+    labels_volume.commit()
     with open(out, "r", encoding="utf-8") as handle:
         return sum(1 for line in handle if line.strip())
+
+
+def ensure_sf_labels(corpus, per_game, nodes, shards_per_month) -> None:
+    """Client-side orchestration: label only the missing (dataset, month) shards
+    into the store, skipping months that already have a `<month>.complete` marker.
+
+    Derives the dataset from the data identity, asks the store which months are
+    missing, then for each missing month wipes it once, fans out its shards, and
+    writes the completion marker. A fully-cached corpus does zero labeling."""
+    dataset = _sf_dataset(nodes, per_game)
+    names = [m["name"] for m in corpus]
+    missing = missing_sf_months.remote(dataset, names)
+    print(f"SF store {dataset}: {len(names) - len(missing)} months cached, labeling {missing}")
+    for month in missing:
+        wipe_sf_month.remote(dataset, month)  # once, before the shards
+        list(label_sf_shard.starmap(
+            [(dataset, month, i, shards_per_month, per_game, nodes) for i in range(shards_per_month)]
+        ))
+        mark_sf_month_complete.remote(dataset, month)
 
 
 @app.function(
@@ -300,51 +392,34 @@ def train_wdl_run(shard_names: list[str], hidden: int, epochs: int) -> bytes:
 
 
 @app.function(
-    image=torch_image, gpu="A10G", timeout=60 * 60 * 3, memory=32768, volumes={"/vol": wdl_volume}
+    image=torch_image, gpu="A10G", timeout=60 * 60 * 3, memory=32768,
+    volumes={"/store": labels_volume},
 )
-def train_sf_run(shard_names: list[str], hidden: int, epochs: int) -> bytes:
-    """GPU train on EXACTLY this run's Stockfish-cp shards -> quantised RFNN bytes.
+def train_from_store(datasets: list[str], hidden: int, epochs: int) -> bytes:
+    """Train (cp mode) on the concatenation of the given store datasets. Read-only
+    on the store: it globs + concatenates, NEVER deletes."""
+    import os, train_nnue
 
-    `shard_names` is the explicit set of `/vol/`-relative basenames the current
-    run's SF labelers produced (e.g. "sf/samples-2017-01-0.tsv"), which resolve to
-    `/vol/sf/samples-...`. Trains in cp mode (`wdl_target=False`) on those and only
-    those. Everything is scoped to the `/vol/sf/` subdirectory so it never touches
-    the top-level WDL shards.
-    """
-    import train_nnue
-
-    wdl_volume.reload()
-    # The persistent Volume can hold SF shards from prior runs with a DIFFERENT
-    # month set or shard count, plus a stale /vol/sf/data.tsv. Any of those would
-    # silently contaminate training, so delete every /vol/sf/samples-*.tsv that is
-    # NOT one of this run's expected shards. Scoped to /vol/sf/ — the top-level WDL
-    # shards (/vol/samples-*-*.tsv) are never globbed or touched.
-    expected = {f"/vol/{n}" for n in shard_names}
-    for stale in glob.glob("/vol/sf/samples-*.tsv"):
-        if stale not in expected:
-            pathlib.Path(stale).unlink(missing_ok=True)
-    stale_data = pathlib.Path("/vol/sf/data.tsv")
-    if stale_data.exists():
-        stale_data.unlink()
-    # Train on exactly the expected shards; a missing one means a labeler didn't
-    # produce it, so fail loudly rather than train on a partial corpus.
-    shard_paths = sorted(expected)
-    for shard_path in shard_paths:
-        assert pathlib.Path(shard_path).exists(), f"expected shard missing: {shard_path}"
-    data_path = "/vol/sf/data.tsv"
+    labels_volume.reload()
+    # Glob every shard across the requested datasets and concatenate them onto the
+    # ephemeral container disk (NOT the store) — the store stays append-only.
+    shard_paths = sorted(
+        p for d in datasets for p in glob.glob(f"/store/sf/{d}/samples-*.tsv")
+    )
+    assert shard_paths, f"no shards found for datasets {datasets}"
+    data_path = "/tmp/data.tsv"  # ephemeral container disk, NOT the store
     with open(data_path, "w", encoding="utf-8") as out:
         for shard_path in shard_paths:
             with open(shard_path, "r", encoding="utf-8") as handle:
                 for line in handle:
                     out.write(line)
-    # Write the RFNN to the canonical /vol/net.rfnn (same as train_wdl_run) so a
-    # post-hoc `gate_net` can re-gate the latest net; the primary gate flows
-    # in-memory via the returned bytes.
-    out_path = "/vol/net.rfnn"
     model = train_nnue.train(
         data_path, hidden, epochs, batch_size=1024, lr=1e-3, device="cuda", wdl_target=False
     )
+    os.makedirs("/store/nets", exist_ok=True)
+    out_path = "/store/nets/latest.rfnn"
     train_nnue.quantize_and_write(model, hidden, out_path)
+    labels_volume.commit()
     with open(out_path, "rb") as handle:
         return handle.read()
 
@@ -596,26 +671,22 @@ def train_sf(
     # .starmap is lazy; wrap in list() so every export is downloaded + verified
     # before any labeler runs.
     list(prepare_export.starmap([(m["name"], m["url"], m["sha256"]) for m in corpus]))
-    label_args = [(m["name"], i, shards_per_month, per_game, nodes)
-                  for m in corpus for i in range(shards_per_month)]
-    shard_names = [f"sf/samples-{m['name']}-{i}.tsv"
-                   for m in corpus for i in range(shards_per_month)]
-    counts = label_sf_shard.starmap(label_args)
-    print(f"labeled {sum(counts)} Stockfish-cp samples across {len(label_args)} shards "
-          f"({len(corpus)} months x {shards_per_month})")
-
-    net_bytes = train_sf_run.remote(shard_names, hidden, epochs)
+    # Label only the months not already in the persistent store (cache hit skips
+    # them), then train read-only over the whole dataset. A fully-labeled corpus
+    # goes straight to training with zero Stockfish cost.
+    ensure_sf_labels(corpus, per_game, nodes, shards_per_month)
+    net_bytes = train_from_store.remote([_sf_dataset(nodes, per_game)], hidden, epochs)
     print(f"trained network: {len(net_bytes)} bytes")
 
     print(nnue_gate_run.remote(net_bytes, gate_depth, gate_openings, gate_plies,
                                gate_shard_size, move_time_ms))
 
 
-@app.function(image=rust_image, volumes={"/vol": wdl_volume})
+@app.function(volumes={"/store": labels_volume})
 def read_net() -> bytes:
-    """Read the last-trained /vol/net.rfnn back off the volume."""
-    wdl_volume.reload()
-    with open("/vol/net.rfnn", "rb") as handle:
+    """Read the last store-trained net (/store/nets/latest.rfnn) back off the store."""
+    labels_volume.reload()
+    with open("/store/nets/latest.rfnn", "rb") as handle:
         return handle.read()
 
 
@@ -627,12 +698,12 @@ def gate_net(
     gate_shard_size: int = 16,
     move_time_ms: int = 50,
 ):
-    """Gate the LAST-trained net (/vol/net.rfnn) vs the hand-crafted baseline.
+    """Gate the store-trained net (/store/nets/latest.rfnn) vs the hand-crafted baseline.
 
-    Re-gates an already-trained net without re-labeling or re-training — use
-    after a `train_wdl` run whose gate timed out or to re-measure a saved net.
-    Smaller default gate_shard_size (16) keeps each movetime shard well under the
-    per-container timeout for a slower hidden-512 net.
+    Re-gates the already-trained store net without re-labeling or re-training — use
+    to re-measure a saved net or after a gate that timed out. Smaller default
+    gate_shard_size (16) keeps each movetime shard well under the per-container
+    timeout for a slower hidden-512 net.
 
         modal run modal/app.py::gate_net
         modal run modal/app.py::gate_net --gate-openings 2048 --move-time-ms 50
