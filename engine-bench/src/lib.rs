@@ -1930,7 +1930,8 @@ mod tests {
         spsa_update, sprt, tactical_solve_rate, tactical_tsv_report, throughput_tsv_report,
         vector_to_eval_params, vector_to_search_params, MatchConfig, SprtConfig, SprtDecision,
         random_opening_fens, run_eval_gate_fens, run_mobility_gate, run_nnue_gauntlet,
-        run_nnue_gauntlet_with_move_time, sprt_tsv_report, summarize,
+        run_nnue_gauntlet_with_move_time, sprt_tsv_report, summarize, BaselineMode,
+        baseline_searcher,
         gen_wdl_data_samples, gen_wdl_data_samples_from_reader, WdlSample, WdlSampleConfig,
         gen_eval_positions, gen_eval_positions_from_reader, EvalPositionSample,
         parse_uci_score_cp, MATE_CP,
@@ -2176,6 +2177,12 @@ mod tests {
 
         assert_eq!(records.len(), 2);
         assert!(records.iter().all(|record| record.plies == 0));
+    }
+
+    #[test]
+    fn baseline_mode_selects_champion_net_or_handcrafted() {
+        assert!(baseline_searcher(BaselineMode::Champion).has_nnue(), "champion baseline keeps the bundled net");
+        assert!(!baseline_searcher(BaselineMode::Handcrafted).has_nnue(), "handcrafted baseline disables NNUE");
     }
 
     #[test]
