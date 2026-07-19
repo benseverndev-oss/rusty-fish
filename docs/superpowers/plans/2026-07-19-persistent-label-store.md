@@ -208,12 +208,19 @@ Delete the old `train_sf_run` (302-349). Leave `train_wdl_run` untouched (deferr
 ```python
 @app.function(volumes={"/store": labels_volume})
 def read_net() -> bytes:
+    """Read the last store-trained net (/store/nets/latest.rfnn) back off the store."""
     labels_volume.reload()
     with open("/store/nets/latest.rfnn", "rb") as handle:
         return handle.read()
 ```
 
-(`gate_net` and its docstring are otherwise unchanged — it still calls `read_net.remote()`.)
+`gate_net` still calls `read_net.remote()` — but **update its docstring** (currently
+mentions "after a `train_wdl` run" and `/vol/net.rfnn`): it now re-gates the
+store-trained net `/store/nets/latest.rfnn` (the SF/store path). Drop the
+`train_wdl`/`/vol/net.rfnn` language so it isn't misdocumented — `train_wdl_run`
+still writes `/vol/net.rfnn` (deferred), but nothing reads it now, so `gate_net`
+after a `train_wdl` run would gate the store net, not the WDL net; the docstring
+must not claim otherwise. (Re-adding a WDL re-gate path is out of scope.)
 
 - [ ] **Step 3: py_compile + commit.** Commit `feat(store): read-only train_from_store + store-net gate_net`.
 
@@ -223,11 +230,10 @@ def read_net() -> bytes:
 
 **Files:** Modify `modal/app.py`
 
-- [ ] **Step 1: Rewrite the `train_sf` body** to label-into-store then train-from-store then gate:
+- [ ] **Step 1: Rewrite the `train_sf` body** to label-into-store then train-from-store then gate. **Replace lines 599-611** (the old `label_args`/`shard_names`/`counts`/`label_sf_shard.starmap`/`train_sf_run.remote`/gate block) with the following. The existing `list(prepare_export.starmap(...))` at line 598 stays (shown here for placement — do NOT duplicate it):
 
 ```python
-    # ... keep the params + corpus load + months filter + sha256 asserts unchanged ...
-    list(prepare_export.starmap([(m["name"], m["url"], m["sha256"]) for m in corpus]))
+    list(prepare_export.starmap([(m["name"], m["url"], m["sha256"]) for m in corpus]))  # existing line 598
     ensure_sf_labels(corpus, per_game, nodes, shards_per_month)
     net_bytes = train_from_store.remote([_sf_dataset(nodes, per_game)], hidden, epochs)
     print(f"trained network: {len(net_bytes)} bytes")
