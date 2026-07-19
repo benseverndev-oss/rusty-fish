@@ -866,3 +866,69 @@ def sha_probe():
     months = _load_wdl_corpus()
     for line in sha_probe_one.starmap([(m["name"], m["url"]) for m in months]):
         print(line)
+
+
+@app.local_entrypoint()
+def sweep(
+    hiddens: str = "512", epochs_list: str = "60", lrs: str = "1e-3",
+    dataset: str = "n100000-pg4", gate_depth: int = 64, gate_plies: int = 8,
+    move_time_ms: int = 50, gate_shard_size: int = 16,
+    chunk_openings: int = 256, max_openings: int = 8192,
+):
+    """Sweep a cross-product of (hidden, epochs, lr) — train each from the store and
+    gate it vs the champion, in parallel — and append the results to the ledger.
+
+        modal run modal/app.py::sweep --hiddens 256,512,1024 --epochs-list 40,80 --lrs 1e-3,5e-4
+    """
+    import datetime
+    import itertools
+
+    hs = [int(x) for x in hiddens.split(",") if x.strip()]
+    es = [int(x) for x in epochs_list.split(",") if x.strip()]
+    ls = [float(x) for x in lrs.split(",") if x.strip()]
+    assert hs and es and ls, "each of --hiddens/--epochs-list/--lrs needs >=1 value"
+    configs = [
+        {"dataset": dataset, "hidden": h, "epochs": e, "lr": l,
+         "gate_depth": gate_depth, "gate_plies": gate_plies, "move_time_ms": move_time_ms,
+         "gate_shard_size": gate_shard_size, "chunk_openings": chunk_openings, "max_openings": max_openings}
+        for h, e, l in itertools.product(hs, es, ls)
+    ]
+    print(f"sweep: {len(configs)} experiments")
+    results = list(run_experiment.starmap([(c,) for c in configs]))
+
+    sweep_id = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    ts = datetime.datetime.utcnow().isoformat()
+    rows = ["\t".join(str(x) for x in [
+        sweep_id, ts, r["dataset"], r["hidden"], r["epochs"], r["lr"], r["val_loss"],
+        r["wins"], r["draws"], r["losses"], r["games"], r["elo"], r["decision"]]) for r in results]
+    append_results.remote(rows)
+
+    def elo_key(r):
+        try:
+            return float(r["elo"])
+        except (TypeError, ValueError):
+            return -1e9
+    print("=== sweep results (best first) ===")
+    for r in sorted(results, key=elo_key, reverse=True):
+        print(f"hidden={r['hidden']} epochs={r['epochs']} lr={r['lr']} "
+              f"val_loss={r['val_loss']} elo={r['elo']} decision={r['decision']}")
+
+
+@app.local_entrypoint()
+def results():
+    """Print every logged experiment, best Elo first."""
+    content = read_results.remote()
+    if not content.strip():
+        print("no experiments logged yet")
+        return
+    lines = content.strip().splitlines()
+    header, rows = lines[0], lines[1:]
+
+    def elo_key(line):
+        try:
+            return float(line.split("\t")[11])  # elo column
+        except (IndexError, ValueError):
+            return -1e9
+    print(header)
+    for line in sorted(rows, key=elo_key, reverse=True):
+        print(line)
