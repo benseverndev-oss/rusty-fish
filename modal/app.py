@@ -127,12 +127,15 @@ def make_openings(count: int, plies: int, seed: int) -> str:
 # move_time_ms per move; with a hidden-512 net that can exceed Modal's 300s
 # default (which timed out the first hidden-512 gate).
 @app.function(image=rust_image, timeout=60 * 30)
-def gate_shard(net_bytes: bytes, depth: int, openings_text: str, move_time_ms: int = 0) -> tuple[int, int, int]:
-    """Play the NNUE candidate vs the hand-crafted baseline over one opening shard.
+def gate_shard(net_bytes: bytes, depth: int, openings_text: str, move_time_ms: int = 0, baseline: str = "champion") -> tuple[int, int, int]:
+    """Play the NNUE candidate vs the bundled champion net by default over one
+    opening shard.
 
     `move_time_ms` is forwarded as the optional 5th `gate-file` arg only when
     truthy, so `move_time_ms=0` preserves the depth-only behavior the `run()`
-    entrypoint relies on.
+    entrypoint relies on. `baseline` ("champion"|"handcrafted") is the optional
+    6th arg and is appended only AFTER a truthy movetime (its positional slot),
+    so a non-default baseline requires a movetime — which the ladder always passes.
     """
     with tempfile.TemporaryDirectory() as directory:
         net_path = f"{directory}/net.rfnn"
@@ -144,6 +147,7 @@ def gate_shard(net_bytes: bytes, depth: int, openings_text: str, move_time_ms: i
         cmd = [BIN, "gate-file", net_path, str(depth), openings_path]
         if move_time_ms:
             cmd.append(str(move_time_ms))
+            cmd.append(baseline)
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     wins, draws, losses = (int(x) for x in result.stdout.strip().split("\t"))
     return wins, draws, losses
@@ -217,7 +221,7 @@ def train_net(data_text: str, hidden: int, epochs: int) -> bytes:
         out_path = f"{directory}/net.rfnn"
         with open(data_path, "w", encoding="utf-8") as handle:
             handle.write(data_text)
-        model = train_nnue.train(data_path, hidden, epochs, batch_size=1024, lr=1e-3, device="cuda")
+        model, _ = train_nnue.train(data_path, hidden, epochs, batch_size=1024, lr=1e-3, device="cuda")
         train_nnue.quantize_and_write(model, hidden, out_path)
         with open(out_path, "rb") as handle:
             return handle.read()
@@ -383,7 +387,7 @@ def train_wdl_run(shard_names: list[str], hidden: int, epochs: int) -> bytes:
                 for line in handle:
                     out.write(line)
     out_path = "/vol/net.rfnn"
-    model = train_nnue.train(
+    model, _ = train_nnue.train(
         data_path, hidden, epochs, batch_size=1024, lr=1e-3, device="cuda", wdl_target=True
     )
     train_nnue.quantize_and_write(model, hidden, out_path)
@@ -395,7 +399,7 @@ def train_wdl_run(shard_names: list[str], hidden: int, epochs: int) -> bytes:
     image=torch_image, gpu="A10G", timeout=60 * 60 * 3, memory=32768,
     volumes={"/store": labels_volume},
 )
-def train_from_store(datasets: list[str], hidden: int, epochs: int) -> bytes:
+def train_from_store(datasets: list[str], hidden: int, epochs: int) -> tuple[bytes, float]:
     """Train (cp mode) on the concatenation of the given store datasets. Read-only
     on the store: it globs + concatenates, NEVER deletes."""
     import os, train_nnue
@@ -413,7 +417,7 @@ def train_from_store(datasets: list[str], hidden: int, epochs: int) -> bytes:
             with open(shard_path, "r", encoding="utf-8") as handle:
                 for line in handle:
                     out.write(line)
-    model = train_nnue.train(
+    model, val_loss = train_nnue.train(
         data_path, hidden, epochs, batch_size=1024, lr=1e-3, device="cuda", wdl_target=False
     )
     os.makedirs("/store/nets", exist_ok=True)
@@ -421,7 +425,7 @@ def train_from_store(datasets: list[str], hidden: int, epochs: int) -> bytes:
     train_nnue.quantize_and_write(model, hidden, out_path)
     labels_volume.commit()
     with open(out_path, "rb") as handle:
-        return handle.read()
+        return (handle.read(), val_loss)
 
 
 def _chunks(lines, size):
@@ -555,7 +559,8 @@ def nnue_gate_run(
 ) -> str:
     """Runs the whole NNUE gate (fan shards, sum, SPRT) inside one remote function
     and prints the verdict to its log, so a detached run stays retrievable via
-    `modal app logs` even if the launching client disconnects.
+    `modal app logs` even if the launching client disconnects. Gates the candidate
+    vs the bundled champion net.
 
     A truthy `move_time_ms` makes the gate movetime-bounded (callers pass a high
     `gate_depth` so the movetime budget binds first)."""
@@ -570,6 +575,46 @@ def nnue_gate_run(
     summary = f"nnue gate over {len(openings) * 2} games: {wins}W {draws}D {losses}L"
     verdict = sprt_verdict.remote(wins, draws, losses)
     out = f"NNUE_GATE_RESULT_BEGIN\n{summary}\n{verdict}\nNNUE_GATE_RESULT_END"
+    print(out, flush=True)
+    return out
+
+
+@app.function(image=rust_image, timeout=60 * 60)
+def gate_ladder_run(
+    net_bytes: bytes, gate_depth: int, gate_plies: int, move_time_ms: int,
+    gate_shard_size: int, chunk_openings: int = 256, max_openings: int = 8192,
+) -> str:
+    """Sequential SPRT of a candidate net vs the bundled champion: play openings in
+    chunks, check the SPRT on the cumulative W/D/L after each, stop on a decision."""
+    wins = draws = losses = 0
+    played = 0
+    decision = "Continue"
+    chunk = 0
+    while played < max_openings:
+        chunk += 1
+        openings = [l for l in make_openings.remote(chunk_openings, gate_plies, chunk).splitlines() if l]
+        if not openings:
+            break  # no openings (e.g. chunk_openings=0) — never advances `played`; avoid an infinite loop
+        shard_texts = list(_chunks(openings, gate_shard_size))
+        for w, d, l in gate_shard.starmap(
+            [(net_bytes, gate_depth, text, move_time_ms, "champion") for text in shard_texts]
+        ):
+            wins += w; draws += d; losses += l
+        played += len(openings)
+        verdict = sprt_verdict.remote(wins, draws, losses)
+        # Defensively find the TSV values line: the last line whose final
+        # tab-field is a decision token (avoids off-by-one if stderr is empty).
+        tokens = {"AcceptH0", "AcceptH1", "Continue"}
+        decision = next(
+            (ln.split("\t")[-1] for ln in reversed(verdict.splitlines())
+             if ln.split("\t")[-1] in tokens),
+            "Continue",
+        )
+        if decision in ("AcceptH0", "AcceptH1"):
+            break
+    summary = (f"gate ladder: {wins}W {draws}D {losses}L over {played * 2} games "
+               f"({played}/{max_openings} openings), decision {decision}")
+    out = f"NNUE_LADDER_RESULT_BEGIN\n{summary}\nNNUE_LADDER_RESULT_END"
     print(out, flush=True)
     return out
 
@@ -593,7 +638,7 @@ def train_wdl(
     Downloads + verifies each pinned month from `assets/nnue/wdl-corpus.toml` into
     a shared volume once, fans out `engine-bench gen-wdl-data` labeling over every
     (month, shard) pair, trains on a GPU with the WDL loss (hidden 512 by default),
-    and runs the parallel movetime SPRT gate vs the hand-crafted baseline.
+    and runs the parallel movetime SPRT gate vs the bundled champion net.
 
         # short validation (2 months, tiny config — plumbing only):
         modal run modal/app.py::train_wdl --months 2017-01,2017-02 --shards-per-month 2 --per-game 2 --hidden 64 --epochs 2 --gate-openings 64 --gate-shard-size 16 --move-time-ms 50
@@ -636,7 +681,8 @@ def train_sf(
     nodes: int = 100000,
     hidden: int = 512,
     epochs: int = 60,
-    gate_openings: int = 2048,
+    chunk_openings: int = 256,
+    max_openings: int = 8192,
     gate_plies: int = 8,
     gate_depth: int = 64,        # high; movetime binds first
     gate_shard_size: int = 16,
@@ -644,19 +690,19 @@ def train_sf(
     months: str = "",            # comma-sep subset (e.g. "2017-01,2017-02") for short runs; empty = all
 ):
     """Train an NNUE on fixed-node Stockfish cp labels across many months, then
-    gate it movetime-bounded via SPRT.
+    gate it movetime-bounded via a sequential SPRT ladder.
 
     Downloads + verifies each pinned month from `assets/nnue/wdl-corpus.toml` into
     a shared volume once, fans out `gen-eval-positions | label-sf` labeling over
     every (month, shard) pair into `/vol/sf/`, trains on a GPU in cp mode
-    (`wdl_target=False`, hidden 512 by default), and runs the parallel movetime
-    SPRT gate vs the hand-crafted baseline.
+    (`wdl_target=False`, hidden 512 by default), then runs a free val-loss
+    pre-check and the sequential SPRT gate ladder vs the bundled champion net.
 
         # short validation (1 month, tiny config, low nodes — plumbing only):
-        modal run modal/app.py::train_sf --months 2017-01 --shards-per-month 2 --per-game 2 --nodes 5000 --hidden 64 --epochs 2 --gate-openings 64 --gate-shard-size 16
+        modal run modal/app.py::train_sf --months 2017-01 --shards-per-month 2 --per-game 2 --nodes 5000 --hidden 64 --epochs 2 --chunk-openings 64 --max-openings 512 --gate-shard-size 16
 
         # real run (all six months, 100k nodes, hidden 512, powered gate):
-        modal run modal/app.py::train_sf --shards-per-month 16 --per-game 4 --nodes 100000 --hidden 512 --epochs 60 --gate-openings 2048 --gate-shard-size 16 --move-time-ms 50
+        modal run modal/app.py::train_sf --shards-per-month 16 --per-game 4 --nodes 100000 --hidden 512 --epochs 60 --chunk-openings 256 --max-openings 8192 --gate-shard-size 16 --move-time-ms 50
     """
     corpus = _load_wdl_corpus()
     if months:
@@ -675,11 +721,14 @@ def train_sf(
     # them), then train read-only over the whole dataset. A fully-labeled corpus
     # goes straight to training with zero Stockfish cost.
     ensure_sf_labels(corpus, per_game, nodes, shards_per_month)
-    net_bytes = train_from_store.remote([_sf_dataset(nodes, per_game)], hidden, epochs)
-    print(f"trained network: {len(net_bytes)} bytes")
-
-    print(nnue_gate_run.remote(net_bytes, gate_depth, gate_openings, gate_plies,
-                               gate_shard_size, move_time_ms))
+    net_bytes, val_loss = train_from_store.remote([_sf_dataset(nodes, per_game)], hidden, epochs)
+    print(f"trained network: {len(net_bytes)} bytes, val_loss {val_loss:.6f}")
+    import math
+    if math.isnan(val_loss) or val_loss > 0.1:
+        print(f"NNUE_LADDER_RESULT_BEGIN\nrejected: val_loss {val_loss} failed the pre-check\nNNUE_LADDER_RESULT_END")
+    else:
+        print(gate_ladder_run.remote(net_bytes, gate_depth, gate_plies, move_time_ms,
+                                     gate_shard_size, chunk_openings, max_openings))
 
 
 @app.function(volumes={"/store": labels_volume})
@@ -698,7 +747,7 @@ def gate_net(
     gate_shard_size: int = 16,
     move_time_ms: int = 50,
 ):
-    """Gate the store-trained net (/store/nets/latest.rfnn) vs the hand-crafted baseline.
+    """Gate the store-trained net (/store/nets/latest.rfnn) vs the bundled champion net.
 
     Re-gates the already-trained store net without re-labeling or re-training — use
     to re-measure a saved net or after a gate that timed out. Smaller default
@@ -712,6 +761,21 @@ def gate_net(
     print(f"loaded net: {len(net_bytes)} bytes")
     print(nnue_gate_run.remote(net_bytes, gate_depth, gate_openings, gate_plies,
                                gate_shard_size, move_time_ms))
+
+
+@app.local_entrypoint()
+def gate_ladder(gate_depth: int = 64, gate_plies: int = 8, move_time_ms: int = 50,
+                gate_shard_size: int = 16, chunk_openings: int = 256, max_openings: int = 8192):
+    """Re-run the sequential SPRT gate ladder on the stored net vs the bundled
+    champion, without retraining.
+
+        modal run modal/app.py::gate_ladder
+        modal run modal/app.py::gate_ladder --chunk-openings 128 --max-openings 1024
+    """
+    net_bytes = read_net.remote()
+    print(f"loaded net: {len(net_bytes)} bytes")
+    print(gate_ladder_run.remote(net_bytes, gate_depth, gate_plies, move_time_ms,
+                                 gate_shard_size, chunk_openings, max_openings))
 
 
 @app.function(image=rust_image, timeout=60 * 60)
