@@ -918,7 +918,8 @@ pub const MATE_CP: i32 = 30000;
 /// Extracts the side-to-move centipawn score from a single UCI `info` line.
 ///
 /// Returns `Some(N)` for `score cp N`, `Some(MATE_CP * sign(N))` for
-/// `score mate N` (non-negative mate distance -> `+MATE_CP`), and `None` for
+/// `score mate N` (a strictly positive mate distance -> `+MATE_CP`; `mate 0`
+/// means the side to move is already mated, so it maps to `-MATE_CP`), and `None` for
 /// any line without a `score cp`/`score mate` pair (the caller keeps the last
 /// score it saw). A trailing `lowerbound`/`upperbound` qualifier sits after the
 /// value, so scanning the token right after `cp`/`mate` naturally ignores it.
@@ -936,7 +937,9 @@ fn parse_uci_score_cp(line: &str) -> Option<i32> {
             }
             Some("mate") => {
                 if let Some(value) = tokens.next().and_then(|value| value.parse::<i32>().ok()) {
-                    return Some(if value >= 0 { MATE_CP } else { -MATE_CP });
+                    // `score mate 0` means the side to move is already mated (a
+                    // loss), so only a strictly positive mate distance is a win.
+                    return Some(if value > 0 { MATE_CP } else { -MATE_CP });
                 }
             }
             _ => {}
@@ -1886,7 +1889,17 @@ pub fn run_label_sf<R: std::io::Read>(
         match engine.score_position(fen, nodes) {
             Ok(cp) => writeln!(out, "{cp}\t{own}\t{opp}")
                 .map_err(|error| format!("failed to write labelled position: {error}"))?,
-            Err(_) => skipped += 1,
+            Err(_) => {
+                // A per-position hiccup (timeout, or an aborted search left in an
+                // unknown state) must not poison or silently skip the rest of the
+                // shard. Drop and respawn the engine so the next position always
+                // starts from a known-clean state, rather than reusing a possibly
+                // hung process and timing out every subsequent line. If the
+                // respawn itself fails the engine is dead, so abort the shard
+                // loudly instead of looping forever on a corpse.
+                skipped += 1;
+                engine = UciProcess::start(engine_path, Duration::from_secs(60))?;
+            }
         }
     }
     out.flush()
@@ -1937,6 +1950,8 @@ mod tests {
         // mate -> clamped +/- MATE_CP
         assert_eq!(parse_uci_score_cp("info depth 30 score mate 3 pv"), Some(MATE_CP));
         assert_eq!(parse_uci_score_cp("info depth 30 score mate -2 pv"), Some(-MATE_CP));
+        // mate 0 means the side to move is already mated -> a loss, not a win
+        assert_eq!(parse_uci_score_cp("info depth 30 score mate 0 pv"), Some(-MATE_CP));
         // bound qualifier follows the value -> value kept, qualifier ignored
         assert_eq!(parse_uci_score_cp("info depth 20 score cp 37 lowerbound nodes 1"), Some(37));
         // non-score info line -> None (caller keeps the previous score)

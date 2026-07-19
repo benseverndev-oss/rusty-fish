@@ -32,7 +32,7 @@ nodes — not fixed depth — gives deterministic per-position cost (predictable
 fan-out sizing) and consistent label quality. The score is taken
 **side-to-move-relative**, which is exactly what Stockfish's `score cp` reports and
 exactly the perspective the net's target uses, so no sign flip is needed. `score
-mate N` is clamped to a large ±cp (e.g. ±3000) so the training sigmoid saturates
+mate N` is clamped to a large ±cp (`MATE_CP = 30000`, i.e. ±30000) so the training sigmoid saturates
 near 0/1 rather than seeing an undefined centipawn value.
 
 **Reproducibility requires two things the labeller must do explicitly:** the
