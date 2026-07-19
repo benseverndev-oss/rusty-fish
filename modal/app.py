@@ -868,32 +868,26 @@ def sha_probe():
         print(line)
 
 
-@app.local_entrypoint()
-def sweep(
-    hiddens: str = "512", epochs_list: str = "60", lrs: str = "1e-3",
-    dataset: str = "n100000-pg4", gate_depth: int = 64, gate_plies: int = 8,
-    move_time_ms: int = 50, gate_shard_size: int = 16,
-    chunk_openings: int = 256, max_openings: int = 8192,
-):
-    """Sweep a cross-product of (hidden, epochs, lr) — train each from the store and
-    gate it vs the champion, in parallel — and append the results to the ledger.
-
-        modal run modal/app.py::sweep --hiddens 256,512,1024 --epochs-list 40,80 --lrs 1e-3,5e-4
-    """
+@app.function(timeout=60 * 60 * 6)
+def run_sweep(
+    hs: list[int], es: list[int], ls: list[float], dataset: str,
+    gate_depth: int, gate_plies: int, move_time_ms: int, gate_shard_size: int,
+    chunk_openings: int, max_openings: int,
+) -> str:
+    """Server-side sweep orchestration: build the cross-product, run every experiment
+    in parallel, append the ledger, return a sorted summary. Runs REMOTELY so a
+    `--detach`ed sweep survives the client disconnecting (the client-side entrypoint
+    can die mid-run without losing the gather + ledger write)."""
     import datetime
     import itertools
 
-    hs = [int(x) for x in hiddens.split(",") if x.strip()]
-    es = [int(x) for x in epochs_list.split(",") if x.strip()]
-    ls = [float(x) for x in lrs.split(",") if x.strip()]
-    assert hs and es and ls, "each of --hiddens/--epochs-list/--lrs needs >=1 value"
     configs = [
         {"dataset": dataset, "hidden": h, "epochs": e, "lr": l,
          "gate_depth": gate_depth, "gate_plies": gate_plies, "move_time_ms": move_time_ms,
          "gate_shard_size": gate_shard_size, "chunk_openings": chunk_openings, "max_openings": max_openings}
         for h, e, l in itertools.product(hs, es, ls)
     ]
-    print(f"sweep: {len(configs)} experiments")
+    print(f"sweep: {len(configs)} experiments", flush=True)
     results = list(run_experiment.starmap([(c,) for c in configs]))
 
     sweep_id = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%S")
@@ -908,10 +902,34 @@ def sweep(
             return float(r["elo"])
         except (TypeError, ValueError):
             return -1e9
-    print("=== sweep results (best first) ===")
-    for r in sorted(results, key=elo_key, reverse=True):
-        print(f"hidden={r['hidden']} epochs={r['epochs']} lr={r['lr']} "
-              f"val_loss={r['val_loss']} elo={r['elo']} decision={r['decision']}")
+    lines = [f"hidden={r['hidden']} epochs={r['epochs']} lr={r['lr']} "
+             f"val_loss={r['val_loss']} elo={r['elo']} decision={r['decision']}"
+             for r in sorted(results, key=elo_key, reverse=True)]
+    summary = "SWEEP_RESULT_BEGIN\n" + "\n".join(lines) + "\nSWEEP_RESULT_END"
+    print(summary, flush=True)
+    return summary
+
+
+@app.local_entrypoint()
+def sweep(
+    hiddens: str = "512", epochs_list: str = "60", lrs: str = "1e-3",
+    dataset: str = "n100000-pg4", gate_depth: int = 64, gate_plies: int = 8,
+    move_time_ms: int = 50, gate_shard_size: int = 16,
+    chunk_openings: int = 256, max_openings: int = 8192,
+):
+    """Sweep a cross-product of (hidden, epochs, lr) — train each from the store and
+    gate it vs the champion, in parallel — appending the results to the ledger. The
+    orchestration runs server-side (`run_sweep`), so use `--detach` for long sweeps
+    and retrieve the `SWEEP_RESULT` from `modal app logs` (or `::results`).
+
+        modal run --detach modal/app.py::sweep --hiddens 256,512,1024 --epochs-list 40,80 --lrs 1e-3,5e-4
+    """
+    hs = [int(x) for x in hiddens.split(",") if x.strip()]
+    es = [int(x) for x in epochs_list.split(",") if x.strip()]
+    ls = [float(x) for x in lrs.split(",") if x.strip()]
+    assert hs and es and ls, "each of --hiddens/--epochs-list/--lrs needs >=1 value"
+    print(run_sweep.remote(hs, es, ls, dataset, gate_depth, gate_plies,
+                           move_time_ms, gate_shard_size, chunk_openings, max_openings))
 
 
 @app.local_entrypoint()
