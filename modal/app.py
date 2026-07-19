@@ -671,15 +671,11 @@ def train_sf(
     # .starmap is lazy; wrap in list() so every export is downloaded + verified
     # before any labeler runs.
     list(prepare_export.starmap([(m["name"], m["url"], m["sha256"]) for m in corpus]))
-    label_args = [(m["name"], i, shards_per_month, per_game, nodes)
-                  for m in corpus for i in range(shards_per_month)]
-    shard_names = [f"sf/samples-{m['name']}-{i}.tsv"
-                   for m in corpus for i in range(shards_per_month)]
-    counts = label_sf_shard.starmap(label_args)
-    print(f"labeled {sum(counts)} Stockfish-cp samples across {len(label_args)} shards "
-          f"({len(corpus)} months x {shards_per_month})")
-
-    net_bytes = train_sf_run.remote(shard_names, hidden, epochs)
+    # Label only the months not already in the persistent store (cache hit skips
+    # them), then train read-only over the whole dataset. A fully-labeled corpus
+    # goes straight to training with zero Stockfish cost.
+    ensure_sf_labels(corpus, per_game, nodes, shards_per_month)
+    net_bytes = train_from_store.remote([_sf_dataset(nodes, per_game)], hidden, epochs)
     print(f"trained network: {len(net_bytes)} bytes")
 
     print(nnue_gate_run.remote(net_bytes, gate_depth, gate_openings, gate_plies,
