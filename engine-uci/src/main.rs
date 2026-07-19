@@ -152,14 +152,46 @@ fn write_best_move(mut stdout: impl Write, result: SearchResult) -> io::Result<(
     }
 }
 
-#[derive(Default)]
 struct EngineState {
     board: Board,
     searcher: Searcher,
     options: SearchOptions,
     syzygy_path: Option<String>,
-    nnue: Option<Arc<Nnue>>,
+    use_nnue: bool,
+    eval_file: Option<Arc<Nnue>>,
+    nnue: Option<Arc<Nnue>>, // effective network installed for the next search
     book: Option<OpeningBook>,
+}
+
+impl Default for EngineState {
+    fn default() -> Self {
+        let mut state = Self {
+            board: Board::default(),
+            searcher: Searcher::default(),
+            options: SearchOptions::default(),
+            syzygy_path: None,
+            use_nnue: true,
+            eval_file: None,
+            nnue: None,
+            book: None,
+        };
+        state.recompute_nnue();
+        state
+    }
+}
+
+impl EngineState {
+    /// Effective net: none if NNUE is toggled off; else a custom EvalFile net if
+    /// loaded, else the bundled default.
+    fn recompute_nnue(&mut self) {
+        self.nnue = if !self.use_nnue {
+            None
+        } else {
+            self.eval_file
+                .clone()
+                .or_else(|| Some(engine_search::bundled_network()))
+        };
+    }
 }
 
 fn write_uci_header(mut stdout: impl Write, options: &SearchOptions) -> io::Result<()> {
@@ -189,6 +221,7 @@ fn write_uci_header(mut stdout: impl Write, options: &SearchOptions) -> io::Resu
         options.threads
     )?;
     writeln!(stdout, "option name EvalFile type string default")?;
+    writeln!(stdout, "option name UseNNUE type check default true")?;
     writeln!(stdout, "option name BookPath type string default")?;
     writeln!(
         stdout,
@@ -288,13 +321,18 @@ fn apply_option(state: &mut EngineState, command: &str) -> Result<(), String> {
             state.options.threads = threads.clamp(1, 256);
         }
         "EvalFile" => {
-            match value {
-                None => state.nnue = None,
-                Some(path) => {
-                    let nnue = Nnue::from_file(&path)?;
-                    state.nnue = Some(Arc::new(nnue));
-                }
-            }
+            state.eval_file = match value {
+                None => None,
+                Some(path) => Some(Arc::new(Nnue::from_file(&path)?)),
+            };
+            state.recompute_nnue();
+        }
+        "UseNNUE" => {
+            let value = value.ok_or_else(|| "missing option value".to_string())?;
+            state.use_nnue = value
+                .parse::<bool>()
+                .map_err(|_| format!("invalid UseNNUE value: {value}"))?;
+            state.recompute_nnue();
         }
         "BookPath" => {
             match value {
@@ -470,6 +508,44 @@ mod tests {
         let mut header = Vec::new();
         write_uci_header(&mut header, &state.options).unwrap();
         assert!(String::from_utf8(header).unwrap().contains("option name EvalFile type string"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn default_engine_state_installs_the_bundled_nnue() {
+        let state = EngineState::default();
+        assert!(state.nnue.is_some());
+    }
+
+    #[test]
+    fn use_nnue_false_disables_the_effective_network() {
+        let mut state = EngineState::default();
+        apply_option(&mut state, "setoption name UseNNUE value false").unwrap();
+        assert!(state.nnue.is_none());
+        apply_option(&mut state, "setoption name UseNNUE value true").unwrap();
+        assert!(state.nnue.is_some());
+    }
+
+    #[test]
+    fn eval_file_overrides_the_bundled_net_across_a_use_nnue_toggle() {
+        let mut state = EngineState::default();
+        let path = std::env::temp_dir()
+            .join(format!("rusty-fish-override-{}.rfnn", std::process::id()));
+        std::fs::write(&path, engine_search::Nnue::from_seed(7, 8).to_bytes()).unwrap();
+
+        let command = format!("setoption name EvalFile value {}", path.display());
+        apply_option(&mut state, &command).unwrap();
+        let custom = state.eval_file.clone().unwrap();
+        // The effective net is the loaded custom net, not the bundled default.
+        assert!(Arc::ptr_eq(state.nnue.as_ref().unwrap(), &custom));
+        assert!(!Arc::ptr_eq(&custom, &engine_search::bundled_network()));
+
+        // Toggling NNUE off then back on keeps the custom EvalFile net.
+        apply_option(&mut state, "setoption name UseNNUE value false").unwrap();
+        assert!(state.nnue.is_none());
+        apply_option(&mut state, "setoption name UseNNUE value true").unwrap();
+        assert!(Arc::ptr_eq(state.nnue.as_ref().unwrap(), &custom));
 
         let _ = std::fs::remove_file(&path);
     }
