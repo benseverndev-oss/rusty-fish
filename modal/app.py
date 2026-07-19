@@ -399,7 +399,7 @@ def train_wdl_run(shard_names: list[str], hidden: int, epochs: int) -> bytes:
     image=torch_image, gpu="A10G", timeout=60 * 60 * 3, memory=32768,
     volumes={"/store": labels_volume},
 )
-def train_from_store(datasets: list[str], hidden: int, epochs: int) -> tuple[bytes, float]:
+def train_from_store(datasets: list[str], hidden: int, epochs: int, lr: float = 1e-3) -> tuple[bytes, float]:
     """Train (cp mode) on the concatenation of the given store datasets. Read-only
     on the store: it globs + concatenates, NEVER deletes."""
     import os, train_nnue
@@ -418,7 +418,7 @@ def train_from_store(datasets: list[str], hidden: int, epochs: int) -> tuple[byt
                 for line in handle:
                     out.write(line)
     model, val_loss = train_nnue.train(
-        data_path, hidden, epochs, batch_size=1024, lr=1e-3, device="cuda", wdl_target=False
+        data_path, hidden, epochs, batch_size=1024, lr=lr, device="cuda", wdl_target=False
     )
     os.makedirs("/store/nets", exist_ok=True)
     out_path = "/store/nets/latest.rfnn"
