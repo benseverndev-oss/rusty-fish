@@ -11,7 +11,7 @@ use pyrrhic_rs::{
 
 mod nnue;
 
-pub use nnue::{active_features, Nnue, INPUT_DIMENSION};
+pub use nnue::{active_features, bundled_network, Nnue, INPUT_DIMENSION};
 
 const MATE_SCORE: i32 = 100_000;
 const MAX_KILLER_PLY: usize = 128;
@@ -535,7 +535,7 @@ impl Default for Searcher {
             options: SearchOptions::default(),
             params: SearchParams::default(),
             eval_params: EvalParams::default(),
-            nnue: None,
+            nnue: Some(bundled_network()),
             nnue_accumulator: None,
             nnue_stack: Vec::new(),
             opening_book: None,
@@ -2872,6 +2872,9 @@ mod tests {
     fn nnue_evaluation_overrides_the_handcrafted_score() {
         let board = Board::startpos();
         let mut searcher = Searcher::default();
+        // The default searcher now installs the bundled NNUE, so capture the
+        // hand-crafted baseline from a searcher with NNUE explicitly disabled.
+        searcher.set_nnue(None);
         let handcrafted = searcher.evaluate(&board);
 
         let net = Arc::new(Nnue::from_seed(12_345, 32));
@@ -2884,6 +2887,27 @@ mod tests {
         searcher.set_nnue(None);
         assert!(!searcher.has_nnue());
         assert_eq!(searcher.evaluate(&board), handcrafted);
+    }
+
+    #[test]
+    fn default_searcher_installs_the_bundled_nnue_and_searches() {
+        assert!(Searcher::default().has_nnue());
+
+        let board = Board::startpos();
+        let mut searcher = Searcher::default();
+        let result = searcher.search(
+            &board,
+            SearchLimits {
+                depth: Some(4),
+                ..SearchLimits::default()
+            },
+        );
+        assert!(result.best_move.is_some(), "default searcher returns a move");
+        assert!(
+            result.score_cp.abs() < MATE_SCORE,
+            "start position score is finite, got {}",
+            result.score_cp
+        );
     }
 
     #[test]
@@ -3068,7 +3092,11 @@ mod tests {
             result.best_move.map(|mv| mv.to_uci()),
             Some("e2e4".to_string())
         );
-        assert!(result.score_cp > 700);
+        assert!(
+            result.score_cp > 700,
+            "expected a clearly winning score, got {}",
+            result.score_cp
+        );
     }
 
     #[test]

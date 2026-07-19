@@ -1,3 +1,6 @@
 assets/opening-book/*.pgn text eol=lf
 assets/opening-book/*.txt text eol=lf
 assets/opening-book/*.tsv text eol=lf
+
+# NNUE network assets are binary; never rewrite line endings.
+assets/nnue/*.rfnn binary
