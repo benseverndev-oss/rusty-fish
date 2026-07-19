@@ -399,7 +399,7 @@ def train_wdl_run(shard_names: list[str], hidden: int, epochs: int) -> bytes:
     image=torch_image, gpu="A10G", timeout=60 * 60 * 3, memory=32768,
     volumes={"/store": labels_volume},
 )
-def train_from_store(datasets: list[str], hidden: int, epochs: int) -> tuple[bytes, float]:
+def train_from_store(datasets: list[str], hidden: int, epochs: int, lr: float = 1e-3) -> tuple[bytes, float]:
     """Train (cp mode) on the concatenation of the given store datasets. Read-only
     on the store: it globs + concatenates, NEVER deletes."""
     import os, train_nnue
@@ -418,7 +418,7 @@ def train_from_store(datasets: list[str], hidden: int, epochs: int) -> tuple[byt
                 for line in handle:
                     out.write(line)
     model, val_loss = train_nnue.train(
-        data_path, hidden, epochs, batch_size=1024, lr=1e-3, device="cuda", wdl_target=False
+        data_path, hidden, epochs, batch_size=1024, lr=lr, device="cuda", wdl_target=False
     )
     os.makedirs("/store/nets", exist_ok=True)
     out_path = "/store/nets/latest.rfnn"
@@ -426,6 +426,74 @@ def train_from_store(datasets: list[str], hidden: int, epochs: int) -> tuple[byt
     labels_volume.commit()
     with open(out_path, "rb") as handle:
         return (handle.read(), val_loss)
+
+
+@app.function(timeout=60 * 60 * 3)
+def run_experiment(config: dict) -> dict:
+    """Train one net from the store, val-precheck it, gate it vs the champion, and
+    return a structured result. Catches its own errors so a bad config becomes an
+    `error` row rather than sinking the whole sweep."""
+    import math
+    import re
+
+    base = {
+        "dataset": config["dataset"], "hidden": config["hidden"],
+        "epochs": config["epochs"], "lr": config["lr"], "val_loss": "NA",
+        "wins": "NA", "draws": "NA", "losses": "NA", "games": "NA",
+        "elo": "NA", "decision": "error",
+    }
+    try:
+        net_bytes, val_loss = train_from_store.remote(
+            [config["dataset"]], config["hidden"], config["epochs"], config["lr"]
+        )
+        base["val_loss"] = val_loss
+        if math.isnan(val_loss) or val_loss > 0.1:
+            return {**base, "decision": "rejected"}
+        verdict = gate_ladder_run.remote(
+            net_bytes, config["gate_depth"], config["gate_plies"], config["move_time_ms"],
+            config["gate_shard_size"], config["chunk_openings"], config["max_openings"],
+        )
+        m = re.search(r"gate ladder: (\d+)W (\d+)D (\d+)L over (\d+) games .* decision (\w+)", verdict)
+        if not m:
+            return base  # decision stays "error"
+        w, d, l, games = int(m[1]), int(m[2]), int(m[3]), int(m[4])
+        total = w + d + l
+        if total == 0:
+            elo = "NA"
+        else:
+            score = (w + 0.5 * d) / total
+            elo = -800.0 if score <= 0 else 800.0 if score >= 1 else round(-400 * math.log10(1 / score - 1), 1)
+        return {**base, "wins": w, "draws": d, "losses": l, "games": games, "elo": elo, "decision": m[5]}
+    except Exception as error:  # noqa: BLE001 — any failure becomes one error row
+        return {**base, "decision": f"error: {error}"[:120]}
+
+
+@app.function(volumes={"/store": labels_volume}, timeout=60 * 10)
+def append_results(rows: list[str]) -> None:
+    import os
+    labels_volume.reload()
+    os.makedirs("/store/experiments", exist_ok=True)
+    path = "/store/experiments/results.tsv"
+    header = ("sweep_id\ttimestamp\tdataset\thidden\tepochs\tlr\tval_loss\t"
+              "wins\tdraws\tlosses\tgames\telo\tdecision")
+    exists = os.path.exists(path)
+    with open(path, "a", encoding="utf-8") as handle:
+        if not exists:
+            handle.write(header + "\n")
+        for row in rows:
+            handle.write(row + "\n")
+    labels_volume.commit()
+
+
+@app.function(volumes={"/store": labels_volume})
+def read_results() -> str:
+    import os
+    labels_volume.reload()
+    path = "/store/experiments/results.tsv"
+    if not os.path.exists(path):
+        return ""
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.read()
 
 
 def _chunks(lines, size):
@@ -797,4 +865,70 @@ def sha_probe():
     """
     months = _load_wdl_corpus()
     for line in sha_probe_one.starmap([(m["name"], m["url"]) for m in months]):
+        print(line)
+
+
+@app.local_entrypoint()
+def sweep(
+    hiddens: str = "512", epochs_list: str = "60", lrs: str = "1e-3",
+    dataset: str = "n100000-pg4", gate_depth: int = 64, gate_plies: int = 8,
+    move_time_ms: int = 50, gate_shard_size: int = 16,
+    chunk_openings: int = 256, max_openings: int = 8192,
+):
+    """Sweep a cross-product of (hidden, epochs, lr) — train each from the store and
+    gate it vs the champion, in parallel — and append the results to the ledger.
+
+        modal run modal/app.py::sweep --hiddens 256,512,1024 --epochs-list 40,80 --lrs 1e-3,5e-4
+    """
+    import datetime
+    import itertools
+
+    hs = [int(x) for x in hiddens.split(",") if x.strip()]
+    es = [int(x) for x in epochs_list.split(",") if x.strip()]
+    ls = [float(x) for x in lrs.split(",") if x.strip()]
+    assert hs and es and ls, "each of --hiddens/--epochs-list/--lrs needs >=1 value"
+    configs = [
+        {"dataset": dataset, "hidden": h, "epochs": e, "lr": l,
+         "gate_depth": gate_depth, "gate_plies": gate_plies, "move_time_ms": move_time_ms,
+         "gate_shard_size": gate_shard_size, "chunk_openings": chunk_openings, "max_openings": max_openings}
+        for h, e, l in itertools.product(hs, es, ls)
+    ]
+    print(f"sweep: {len(configs)} experiments")
+    results = list(run_experiment.starmap([(c,) for c in configs]))
+
+    sweep_id = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    ts = datetime.datetime.utcnow().isoformat()
+    rows = ["\t".join(str(x) for x in [
+        sweep_id, ts, r["dataset"], r["hidden"], r["epochs"], r["lr"], r["val_loss"],
+        r["wins"], r["draws"], r["losses"], r["games"], r["elo"], r["decision"]]) for r in results]
+    append_results.remote(rows)
+
+    def elo_key(r):
+        try:
+            return float(r["elo"])
+        except (TypeError, ValueError):
+            return -1e9
+    print("=== sweep results (best first) ===")
+    for r in sorted(results, key=elo_key, reverse=True):
+        print(f"hidden={r['hidden']} epochs={r['epochs']} lr={r['lr']} "
+              f"val_loss={r['val_loss']} elo={r['elo']} decision={r['decision']}")
+
+
+@app.local_entrypoint()
+def results():
+    """Print every logged experiment, best Elo first."""
+    content = read_results.remote()
+    if not content.strip():
+        print("no experiments logged yet")
+        return
+    lines = content.strip().splitlines()
+    header, rows = lines[0], lines[1:]
+
+    def elo_key(line):
+        try:
+            return float(line.split("\t")[11])  # elo column
+        except (IndexError, ValueError):
+            return -1e9
+    print(header)
+    for line in sorted(rows, key=elo_key, reverse=True):
         print(line)
