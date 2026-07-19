@@ -354,7 +354,7 @@ impl SplitMix64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{feature_index, Accumulator, Nnue, INPUT_DIMENSION};
+    use super::{bundled_network, feature_index, Accumulator, Nnue, INPUT_DIMENSION};
     use engine_core::{Board, Color, Piece, PieceKind, Square};
 
     fn white_pawn() -> Piece {
@@ -421,6 +421,17 @@ mod tests {
         let second = net.evaluate(&board, Color::White);
         assert_eq!(first, second);
         assert!(first.abs() <= 20_000);
+    }
+
+    #[test]
+    fn bundled_network_round_trips() {
+        let net = bundled_network();
+        assert_eq!(net.hidden(), 512);
+        // Re-serialising the parsed net reproduces the committed asset bytes exactly.
+        assert_eq!(
+            net.to_bytes(),
+            include_bytes!("../../assets/nnue/rusty-fish-net.rfnn").to_vec()
+        );
     }
 
     #[test]
