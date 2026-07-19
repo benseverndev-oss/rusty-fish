@@ -392,51 +392,34 @@ def train_wdl_run(shard_names: list[str], hidden: int, epochs: int) -> bytes:
 
 
 @app.function(
-    image=torch_image, gpu="A10G", timeout=60 * 60 * 3, memory=32768, volumes={"/vol": wdl_volume}
+    image=torch_image, gpu="A10G", timeout=60 * 60 * 3, memory=32768,
+    volumes={"/store": labels_volume},
 )
-def train_sf_run(shard_names: list[str], hidden: int, epochs: int) -> bytes:
-    """GPU train on EXACTLY this run's Stockfish-cp shards -> quantised RFNN bytes.
+def train_from_store(datasets: list[str], hidden: int, epochs: int) -> bytes:
+    """Train (cp mode) on the concatenation of the given store datasets. Read-only
+    on the store: it globs + concatenates, NEVER deletes."""
+    import os, train_nnue
 
-    `shard_names` is the explicit set of `/vol/`-relative basenames the current
-    run's SF labelers produced (e.g. "sf/samples-2017-01-0.tsv"), which resolve to
-    `/vol/sf/samples-...`. Trains in cp mode (`wdl_target=False`) on those and only
-    those. Everything is scoped to the `/vol/sf/` subdirectory so it never touches
-    the top-level WDL shards.
-    """
-    import train_nnue
-
-    wdl_volume.reload()
-    # The persistent Volume can hold SF shards from prior runs with a DIFFERENT
-    # month set or shard count, plus a stale /vol/sf/data.tsv. Any of those would
-    # silently contaminate training, so delete every /vol/sf/samples-*.tsv that is
-    # NOT one of this run's expected shards. Scoped to /vol/sf/ — the top-level WDL
-    # shards (/vol/samples-*-*.tsv) are never globbed or touched.
-    expected = {f"/vol/{n}" for n in shard_names}
-    for stale in glob.glob("/vol/sf/samples-*.tsv"):
-        if stale not in expected:
-            pathlib.Path(stale).unlink(missing_ok=True)
-    stale_data = pathlib.Path("/vol/sf/data.tsv")
-    if stale_data.exists():
-        stale_data.unlink()
-    # Train on exactly the expected shards; a missing one means a labeler didn't
-    # produce it, so fail loudly rather than train on a partial corpus.
-    shard_paths = sorted(expected)
-    for shard_path in shard_paths:
-        assert pathlib.Path(shard_path).exists(), f"expected shard missing: {shard_path}"
-    data_path = "/vol/sf/data.tsv"
+    labels_volume.reload()
+    # Glob every shard across the requested datasets and concatenate them onto the
+    # ephemeral container disk (NOT the store) — the store stays append-only.
+    shard_paths = sorted(
+        p for d in datasets for p in glob.glob(f"/store/sf/{d}/samples-*.tsv")
+    )
+    assert shard_paths, f"no shards found for datasets {datasets}"
+    data_path = "/tmp/data.tsv"  # ephemeral container disk, NOT the store
     with open(data_path, "w", encoding="utf-8") as out:
         for shard_path in shard_paths:
             with open(shard_path, "r", encoding="utf-8") as handle:
                 for line in handle:
                     out.write(line)
-    # Write the RFNN to the canonical /vol/net.rfnn (same as train_wdl_run) so a
-    # post-hoc `gate_net` can re-gate the latest net; the primary gate flows
-    # in-memory via the returned bytes.
-    out_path = "/vol/net.rfnn"
     model = train_nnue.train(
         data_path, hidden, epochs, batch_size=1024, lr=1e-3, device="cuda", wdl_target=False
     )
+    os.makedirs("/store/nets", exist_ok=True)
+    out_path = "/store/nets/latest.rfnn"
     train_nnue.quantize_and_write(model, hidden, out_path)
+    labels_volume.commit()
     with open(out_path, "rb") as handle:
         return handle.read()
 
@@ -703,11 +686,11 @@ def train_sf(
                                gate_shard_size, move_time_ms))
 
 
-@app.function(image=rust_image, volumes={"/vol": wdl_volume})
+@app.function(volumes={"/store": labels_volume})
 def read_net() -> bytes:
-    """Read the last-trained /vol/net.rfnn back off the volume."""
-    wdl_volume.reload()
-    with open("/vol/net.rfnn", "rb") as handle:
+    """Read the last store-trained net (/store/nets/latest.rfnn) back off the store."""
+    labels_volume.reload()
+    with open("/store/nets/latest.rfnn", "rb") as handle:
         return handle.read()
 
 
@@ -719,12 +702,12 @@ def gate_net(
     gate_shard_size: int = 16,
     move_time_ms: int = 50,
 ):
-    """Gate the LAST-trained net (/vol/net.rfnn) vs the hand-crafted baseline.
+    """Gate the store-trained net (/store/nets/latest.rfnn) vs the hand-crafted baseline.
 
-    Re-gates an already-trained net without re-labeling or re-training — use
-    after a `train_wdl` run whose gate timed out or to re-measure a saved net.
-    Smaller default gate_shard_size (16) keeps each movetime shard well under the
-    per-container timeout for a slower hidden-512 net.
+    Re-gates the already-trained store net without re-labeling or re-training — use
+    to re-measure a saved net or after a gate that timed out. Smaller default
+    gate_shard_size (16) keeps each movetime shard well under the per-container
+    timeout for a slower hidden-512 net.
 
         modal run modal/app.py::gate_net
         modal run modal/app.py::gate_net --gate-openings 2048 --move-time-ms 50
