@@ -222,3 +222,5 @@ def results():
 ## Out of scope
 
 Auto-adopting a sweep winner; cold-start (#4); sweeping the SF-teacher/data axes (they change the labels — go through `ensure_sf_labels`); cross-dataset dedup; any training/gating/RFNN/label-format change.
+
+**Known caveat (not fixed here):** every parallel experiment writes `/store/nets/latest.rfnn` (pre-existing `train_from_store` behavior), so after a sweep that file is whichever training finished last — an arbitrary sweep member. This does NOT affect sweep correctness (each `run_experiment` gates the `net_bytes` returned to it, never the store path), but a standalone `gate_net`/`gate_ladder` run *after* a sweep would re-gate an arbitrary net, not a chosen one. Adopting a specific sweep winner is the manual bundle-and-ship flow, which re-trains/loads the intended net explicitly.
