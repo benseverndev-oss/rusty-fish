@@ -857,6 +857,28 @@ impl UciProcess {
         }
     }
 
+    /// Fixed-node Stockfish evaluation of `fen`, side-to-move-relative
+    /// centipawns. Sends `ucinewgame` first to clear the transposition table so
+    /// a fixed node budget is reproducible regardless of the scan order, then
+    /// keeps the last `score` reported before `bestmove`.
+    fn score_position(&mut self, fen: &str, nodes: u64) -> Result<i32, String> {
+        self.send("ucinewgame")?;
+        self.send("isready")?;
+        self.wait_for("readyok")?;
+        self.send(&format!("position fen {fen}"))?;
+        self.send(&format!("go nodes {nodes}"))?;
+        let mut last = None;
+        loop {
+            let line = self.next_line()?;
+            if let Some(cp) = parse_uci_score_cp(&line) {
+                last = Some(cp);
+            }
+            if line.starts_with("bestmove") {
+                return last.ok_or_else(|| format!("no score for fen {fen}"));
+            }
+        }
+    }
+
     fn send(&mut self, command: &str) -> Result<(), String> {
         writeln!(self.stdin, "{command}")
             .map_err(|error| format!("failed to send UCI command `{command}`: {error}"))?;
@@ -886,6 +908,44 @@ impl Drop for UciProcess {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Centipawn magnitude a `score mate N` line collapses to. Well past the
+/// trainer's eval clamp / sigmoid saturation, so a forced mate reads as a
+/// decisive-but-finite label rather than an infinity the trainer can't fit.
+pub const MATE_CP: i32 = 30000;
+
+/// Extracts the side-to-move centipawn score from a single UCI `info` line.
+///
+/// Returns `Some(N)` for `score cp N`, `Some(MATE_CP * sign(N))` for
+/// `score mate N` (a strictly positive mate distance -> `+MATE_CP`; `mate 0`
+/// means the side to move is already mated, so it maps to `-MATE_CP`), and `None` for
+/// any line without a `score cp`/`score mate` pair (the caller keeps the last
+/// score it saw). A trailing `lowerbound`/`upperbound` qualifier sits after the
+/// value, so scanning the token right after `cp`/`mate` naturally ignores it.
+fn parse_uci_score_cp(line: &str) -> Option<i32> {
+    let mut tokens = line.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token != "score" {
+            continue;
+        }
+        match tokens.next() {
+            Some("cp") => {
+                if let Some(value) = tokens.next().and_then(|value| value.parse::<i32>().ok()) {
+                    return Some(value);
+                }
+            }
+            Some("mate") => {
+                if let Some(value) = tokens.next().and_then(|value| value.parse::<i32>().ok()) {
+                    // `score mate 0` means the side to move is already mated (a
+                    // loss), so only a strictly positive mate distance is a win.
+                    return Some(if value > 0 { MATE_CP } else { -MATE_CP });
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Classifies the token following `bestmove `. Returns `None` when the engine
@@ -1422,7 +1482,7 @@ fn opposite(color: Color) -> Color {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct WdlSampleConfig {
     /// Skip the opening: only positions at or past this ply are eligible.
     pub min_ply: u32,
@@ -1632,6 +1692,224 @@ pub fn gen_wdl_data_samples_from_reader<R: std::io::Read>(
     Ok(builder.out)
 }
 
+/// One sampled position for the Stockfish-eval teacher: the same middlegame
+/// position `gen-wdl-data` would emit, but carrying the board `fen` (so a UCI
+/// engine can re-evaluate it) instead of the game-outcome target. The
+/// side-to-move-relative feature indices (`own`/`opp`) and `ply` correspond 1:1
+/// to the matching `WdlSample` for the same config.
+#[derive(Clone)]
+pub struct EvalPositionSample {
+    pub fen: String,
+    pub own: Vec<usize>,
+    pub opp: Vec<usize>,
+    pub ply: u32,
+}
+
+struct EvalPositionGame {
+    chess: Chess,
+    board: Board,
+    /// `(features_own, features_opp, fen, ply)` for every eligible ply.
+    positions: Vec<(Vec<usize>, Vec<usize>, String, u32)>,
+    ply: u32,
+    valid: bool,
+    result: String,
+}
+
+struct EvalPositionBuilder {
+    config: WdlSampleConfig,
+    stream_index: usize,
+    out: Vec<EvalPositionSample>,
+}
+
+impl Visitor for EvalPositionBuilder {
+    type Tags = WdlTags;
+    type Movetext = EvalPositionGame;
+    type Output = ();
+
+    fn begin_tags(&mut self) -> ControlFlow<Self::Output, Self::Tags> {
+        ControlFlow::Continue(WdlTags::default())
+    }
+
+    fn tag(
+        &mut self,
+        tags: &mut WdlTags,
+        name: &[u8],
+        value: RawTag<'_>,
+    ) -> ControlFlow<Self::Output> {
+        let value = std::str::from_utf8(value.as_bytes()).unwrap_or_default();
+        match name {
+            b"Event" => tags.event = value.to_string(),
+            b"Variant" => tags.variant = value.to_string(),
+            b"WhiteElo" => tags.white_elo = value.parse().unwrap_or(0),
+            b"BlackElo" => tags.black_elo = value.parse().unwrap_or(0),
+            b"Result" => tags.result = value.to_string(),
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn begin_movetext(&mut self, tags: WdlTags) -> ControlFlow<Self::Output, Self::Movetext> {
+        let (i, n) = self.config.shard;
+        // Count every game in stream order and gate on the index *before* the
+        // rating filter, so `0/n, 1/n, ...` partition the games disjointly —
+        // exactly as `WdlBuilder` does, so the sampled game set matches.
+        let in_shard = n == 0 || self.stream_index % n == i;
+        self.stream_index += 1;
+        let valid = in_shard && WdlBuilder::accepts_tags(&tags);
+        ControlFlow::Continue(EvalPositionGame {
+            chess: Chess::default(),
+            board: Board::startpos(),
+            positions: Vec::new(),
+            ply: 0,
+            valid,
+            result: tags.result,
+        })
+    }
+
+    fn san(&mut self, game: &mut EvalPositionGame, san: SanPlus) -> ControlFlow<Self::Output> {
+        if !game.valid {
+            return ControlFlow::Continue(());
+        }
+        let Ok(mv) = san.san.to_move(&game.chess) else {
+            game.valid = false;
+            return ControlFlow::Continue(());
+        };
+        let stm = game.board.side_to_move;
+        // Capture the pre-move features *and the pre-move FEN* for the eligible
+        // plies; only commit them once the move has applied cleanly to `board`.
+        let eligible = game.ply >= self.config.min_ply;
+        let captured = eligible.then(|| {
+            (
+                active_features(&game.board, stm),
+                active_features(&game.board, opposite(stm)),
+                game.board.to_fen(),
+            )
+        });
+        let uci = UciMove::from_standard(mv.clone()).to_string();
+        match game
+            .board
+            .parse_uci_move(&uci)
+            .and_then(|parsed| game.board.make_move(parsed))
+        {
+            Ok(_) => {
+                if let Some((own, opp, fen)) = captured {
+                    game.positions.push((own, opp, fen, game.ply));
+                }
+                game.chess.play_unchecked(mv);
+                game.ply += 1;
+            }
+            Err(_) => game.valid = false,
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn end_game(&mut self, game: EvalPositionGame) -> Self::Output {
+        if !game.valid || !matches!(game.result.as_str(), "1-0" | "0-1" | "1/2-1/2") {
+            return;
+        }
+        // Trim the last `end_trim` plies (mechanical), then evenly subsample to
+        // `per_game` positions (deterministic — no RNG). Identical to
+        // `WdlBuilder::end_game` so the sampled positions match 1:1.
+        let last_ply = game.ply;
+        let eligible: Vec<_> = game
+            .positions
+            .into_iter()
+            .filter(|(_, _, _, ply)| *ply + self.config.end_trim < last_ply)
+            .collect();
+        let picked = evenly_spaced(&eligible, self.config.per_game);
+        for (own, opp, fen, ply) in picked {
+            self.out.push(EvalPositionSample {
+                fen,
+                own,
+                opp,
+                ply,
+            });
+        }
+    }
+}
+
+/// Parses a PGN (whole games) and returns the FEN-labelled middlegame positions
+/// — the same positions `gen_wdl_data_samples` samples, carrying the board FEN
+/// instead of the game-outcome target so a UCI engine can re-evaluate them.
+pub fn gen_eval_positions(pgn: &str, config: WdlSampleConfig) -> Vec<EvalPositionSample> {
+    gen_eval_positions_from_reader(pgn.as_bytes(), config)
+        .expect("reading an in-memory PGN cannot fail")
+}
+
+/// Streams a PGN from any `io::Read` (a file, or `zstdcat | -` on stdin) and
+/// returns the FEN-labelled middlegame positions. Mirrors
+/// `gen_wdl_data_samples_from_reader`; the returned `Vec` is bounded by
+/// `per_game * games`. Propagates any read error.
+pub fn gen_eval_positions_from_reader<R: std::io::Read>(
+    reader: R,
+    config: WdlSampleConfig,
+) -> Result<Vec<EvalPositionSample>, String> {
+    let mut builder = EvalPositionBuilder {
+        config,
+        stream_index: 0,
+        out: Vec::new(),
+    };
+    Reader::new(reader)
+        .visit_all_games(&mut builder)
+        .map_err(|error| format!("failed to read PGN: {error}"))?;
+    Ok(builder.out)
+}
+
+/// Drives one persistent Stockfish process to relabel `fen<TAB>own<TAB>opp`
+/// lines with a fixed-node cp eval, printing `cp<TAB>own<TAB>opp` (own/opp
+/// passed through verbatim) — the `target<TAB>own<TAB>opp` format the trainer
+/// reads. Streams line by line so a multi-GB shard never buffers.
+///
+/// Robustness matters here: a shard is tens of thousands of positions, so one
+/// malformed line or one Stockfish scoring error must not abort it. Bad lines
+/// are counted and skipped, and the skip total is reported on stderr at the
+/// end. Starts the engine with `start`, which spawns the process and completes
+/// the `uci`/`isready` handshake.
+pub fn run_label_sf<R: std::io::Read>(
+    reader: R,
+    nodes: u64,
+    engine_path: &str,
+) -> Result<(), String> {
+    let mut engine = UciProcess::start(engine_path, Duration::from_secs(60))?;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    let mut skipped: u64 = 0;
+    for line in BufReader::new(reader).lines() {
+        let line = line.map_err(|error| format!("failed to read positions: {error}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut fields = line.split('\t');
+        let (Some(fen), Some(own), Some(opp), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            skipped += 1;
+            continue;
+        };
+        match engine.score_position(fen, nodes) {
+            Ok(cp) => writeln!(out, "{cp}\t{own}\t{opp}")
+                .map_err(|error| format!("failed to write labelled position: {error}"))?,
+            Err(_) => {
+                // A per-position hiccup (timeout, or an aborted search left in an
+                // unknown state) must not poison or silently skip the rest of the
+                // shard. Drop and respawn the engine so the next position always
+                // starts from a known-clean state, rather than reusing a possibly
+                // hung process and timing out every subsequent line. If the
+                // respawn itself fails the engine is dead, so abort the shard
+                // loudly instead of looping forever on a corpse.
+                skipped += 1;
+                engine = UciProcess::start(engine_path, Duration::from_secs(60))?;
+            }
+        }
+    }
+    out.flush()
+        .map_err(|error| format!("failed to flush labelled positions: {error}"))?;
+    if skipped > 0 {
+        eprintln!("label-sf: skipped {skipped} positions (malformed or unscored)");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1646,6 +1924,8 @@ mod tests {
         random_opening_fens, run_eval_gate_fens, run_mobility_gate, run_nnue_gauntlet,
         run_nnue_gauntlet_with_move_time, sprt_tsv_report, summarize,
         gen_wdl_data_samples, gen_wdl_data_samples_from_reader, WdlSample, WdlSampleConfig,
+        gen_eval_positions, gen_eval_positions_from_reader, EvalPositionSample,
+        parse_uci_score_cp, MATE_CP,
     };
     use engine_search::{EvalParams, Nnue, SearchParams, TaperedScore};
     use std::{sync::Arc, time::Duration};
@@ -1660,6 +1940,22 @@ mod tests {
         assert_eq!(classify_bestmove_token("(none)"), None);
         assert_eq!(classify_bestmove_token("0000"), None);
         assert_eq!(classify_bestmove_token(""), None);
+    }
+
+    #[test]
+    fn parse_uci_score_reads_last_cp_and_clamps_mate() {
+        // cp from the last info line before bestmove
+        assert_eq!(parse_uci_score_cp("info depth 20 score cp 37 nodes 1 pv e2e4"), Some(37));
+        assert_eq!(parse_uci_score_cp("info depth 20 score cp -145 pv"), Some(-145));
+        // mate -> clamped +/- MATE_CP
+        assert_eq!(parse_uci_score_cp("info depth 30 score mate 3 pv"), Some(MATE_CP));
+        assert_eq!(parse_uci_score_cp("info depth 30 score mate -2 pv"), Some(-MATE_CP));
+        // mate 0 means the side to move is already mated -> a loss, not a win
+        assert_eq!(parse_uci_score_cp("info depth 30 score mate 0 pv"), Some(-MATE_CP));
+        // bound qualifier follows the value -> value kept, qualifier ignored
+        assert_eq!(parse_uci_score_cp("info depth 20 score cp 37 lowerbound nodes 1"), Some(37));
+        // non-score info line -> None (caller keeps the previous score)
+        assert_eq!(parse_uci_score_cp("info depth 1 nodes 20"), None);
     }
 
     #[test]
@@ -2351,6 +2647,173 @@ mod tests {
         let all_set: HashSet<&String> = all.iter().collect();
         assert_eq!(union, all_set);
         // And the shards partition the samples with no duplication.
+        assert_eq!(shard0.len() + shard1.len() + shard2.len(), all.len());
+    }
+
+    fn eval_line(sample: &EvalPositionSample) -> String {
+        let join = |indices: &[usize]| {
+            indices
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!("{}\t{}\t{}", sample.fen, join(&sample.own), join(&sample.opp))
+    }
+
+    #[test]
+    fn gen_eval_positions_emits_fen_and_valid_features() {
+        let samples = gen_eval_positions(
+            WDL_FIXTURE,
+            WdlSampleConfig {
+                min_ply: 8,
+                end_trim: 5,
+                per_game: 6,
+                shard: (0, 1),
+            },
+        );
+        assert!(!samples.is_empty());
+        for s in &samples {
+            // FEN parses back to a legal position.
+            assert!(engine_core::Board::from_fen(&s.fen).is_ok(), "fen parses: {}", s.fen);
+            assert!(!s.own.is_empty() && !s.opp.is_empty());
+            assert!(s.own.iter().all(|&i| i < 768) && s.opp.iter().all(|&i| i < 768));
+        }
+        // Same sampled positions as the WDL sampler for the same config (same games,
+        // same plies) — only the payload differs.
+        let wdl = gen_wdl_data_samples(
+            WDL_FIXTURE,
+            WdlSampleConfig {
+                min_ply: 8,
+                end_trim: 5,
+                per_game: 6,
+                shard: (0, 1),
+            },
+        );
+        assert_eq!(samples.len(), wdl.len());
+        assert!(samples
+            .iter()
+            .zip(&wdl)
+            .all(|(e, w)| e.own == w.own && e.opp == w.opp && e.ply == w.ply));
+    }
+
+    #[test]
+    fn gen_eval_positions_matches_wdl_sampling_across_configs() {
+        // The eval sampler must stay 1:1 with the WDL sampler at *every* config,
+        // not just the single (8/5/6) point the test above checks. Vary min_ply,
+        // end_trim, per_game, and shard so any future divergence between the two
+        // samplers (eligibility, trim, subsample, sharding) trips CI structurally.
+        let configs = [
+            WdlSampleConfig { min_ply: 4, end_trim: 2, per_game: 20, shard: (0, 1) },
+            WdlSampleConfig { min_ply: 12, end_trim: 8, per_game: 3, shard: (0, 1) },
+            WdlSampleConfig { min_ply: 8, end_trim: 5, per_game: 6, shard: (0, 2) },
+            WdlSampleConfig { min_ply: 8, end_trim: 5, per_game: 6, shard: (1, 2) },
+        ];
+        for cfg in configs {
+            let eval = gen_eval_positions(WDL_FIXTURE, cfg);
+            let wdl = gen_wdl_data_samples(WDL_FIXTURE, cfg);
+            assert_eq!(eval.len(), wdl.len(), "count mismatch at {cfg:?}");
+            assert!(
+                eval.iter().zip(&wdl).all(|(e, w)| e.own == w.own && e.opp == w.opp && e.ply == w.ply),
+                "sampled positions diverged at {cfg:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn gen_eval_positions_reader_matches_str_path() {
+        let config = WdlSampleConfig {
+            min_ply: 8,
+            end_trim: 5,
+            per_game: 6,
+            shard: (0, 1),
+        };
+        let via_str: Vec<String> = gen_eval_positions(WDL_MULTI_GAME_FIXTURE, config)
+            .iter()
+            .map(eval_line)
+            .collect();
+        let via_reader: Vec<String> =
+            gen_eval_positions_from_reader(WDL_MULTI_GAME_FIXTURE.as_bytes(), config)
+                .expect("reader path succeeds")
+                .iter()
+                .map(eval_line)
+                .collect();
+        assert!(!via_str.is_empty());
+        assert_eq!(via_str, via_reader);
+    }
+
+    #[test]
+    fn gen_eval_positions_is_deterministic() {
+        let config = WdlSampleConfig {
+            min_ply: 8,
+            end_trim: 5,
+            per_game: 6,
+            shard: (0, 1),
+        };
+        let first: Vec<String> = gen_eval_positions(WDL_MULTI_GAME_FIXTURE, config)
+            .iter()
+            .map(eval_line)
+            .collect();
+        let second: Vec<String> = gen_eval_positions(WDL_MULTI_GAME_FIXTURE, config)
+            .iter()
+            .map(eval_line)
+            .collect();
+        assert!(!first.is_empty());
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn gen_eval_positions_caps_positions_per_game() {
+        let per_game = 4;
+        let samples = gen_eval_positions(
+            WDL_FIXTURE,
+            WdlSampleConfig {
+                min_ply: 8,
+                end_trim: 5,
+                per_game,
+                shard: (0, 1),
+            },
+        );
+        assert!(!samples.is_empty());
+        assert!(samples.len() <= per_game);
+    }
+
+    #[test]
+    fn gen_eval_positions_shards_partition_disjointly() {
+        let config = |shard| WdlSampleConfig {
+            min_ply: 8,
+            end_trim: 5,
+            per_game: 6,
+            shard,
+        };
+        let lines = |shard| {
+            gen_eval_positions(WDL_MULTI_GAME_FIXTURE, config(shard))
+                .iter()
+                .map(eval_line)
+                .collect::<Vec<_>>()
+        };
+        let all = lines((0, 1));
+        let shard0 = lines((0, 3));
+        let shard1 = lines((1, 3));
+        let shard2 = lines((2, 3));
+
+        assert!(!all.is_empty());
+        assert!(!shard0.is_empty() && !shard1.is_empty() && !shard2.is_empty());
+
+        use std::collections::HashSet;
+        let set0: HashSet<&String> = shard0.iter().collect();
+        let set1: HashSet<&String> = shard1.iter().collect();
+        let set2: HashSet<&String> = shard2.iter().collect();
+        assert!(set0.is_disjoint(&set1));
+        assert!(set0.is_disjoint(&set2));
+        assert!(set1.is_disjoint(&set2));
+
+        let union: HashSet<&String> = set0.union(&set1).cloned().collect::<HashSet<_>>()
+            .union(&set2)
+            .cloned()
+            .collect();
+        let all_set: HashSet<&String> = all.iter().collect();
+        assert_eq!(union, all_set);
         assert_eq!(shard0.len() + shard1.len() + shard2.len(), all.len());
     }
 }

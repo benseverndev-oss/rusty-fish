@@ -10,9 +10,17 @@ use engine_bench::{
     run_spsa_campaign, run_tactical_suite,
     spsa_tsv_report, sprt, sprt_tsv_report, summarize, tactical_tsv_report, throughput_tsv_report,
     gen_wdl_data_samples_from_reader, WdlSampleConfig,
+    gen_eval_positions_from_reader, run_label_sf,
 };
 use engine_bench::train::{generate_training_samples, train_nnue, TrainConfig};
 use engine_search::{EvalParams, Nnue, SearchParams};
+
+/// Shared middlegame sampling window for both `gen-wdl-data` and
+/// `gen-eval-positions`. Single-sourced so the Stockfish teacher labels the
+/// exact same position distribution the WDL data trains on — tuning one
+/// without the other would silently drift the two apart.
+const SAMPLE_MIN_PLY: u32 = 8;
+const SAMPLE_END_TRIM: u32 = 5;
 
 const BENCHMARKS: &[(&str, u8)] = &[
     (
@@ -361,8 +369,8 @@ fn main() -> Result<(), String> {
         let source = source
             .ok_or_else(|| "usage: gen-wdl-data <pgn_or_-> [--shard i/n] [--per-game N]".to_string())?;
         let config = WdlSampleConfig {
-            min_ply: 8,
-            end_trim: 5,
+            min_ply: SAMPLE_MIN_PLY,
+            end_trim: SAMPLE_END_TRIM,
             per_game,
             shard,
         };
@@ -384,6 +392,134 @@ fn main() -> Result<(), String> {
                 join_usize(&sample.own),
                 join_usize(&sample.opp)
             );
+        }
+        return Ok(());
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("gen-eval-positions") {
+        // gen-eval-positions <pgn_or_-> [--shard i/n] [--per-game N]: sample the
+        // same middlegame positions as gen-wdl-data (path or `-` for stdin) but
+        // emit each as "fen\town_csv\topp_csv" — the input label-sf reads to
+        // re-evaluate each FEN with Stockfish.
+        let mut source: Option<String> = None;
+        let mut shard = (0usize, 1usize);
+        let mut per_game = 12usize;
+        let mut args = std::env::args().skip(2);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--shard" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "usage: gen-eval-positions <pgn_or_-> [--shard i/n] [--per-game N]".to_string())?;
+                    let (i, n) = value
+                        .split_once('/')
+                        .ok_or_else(|| format!("invalid --shard value (want i/n): {value}"))?;
+                    let i = i
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid --shard index: {i}"))?;
+                    let n = n
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid --shard count: {n}"))?;
+                    if n == 0 || i >= n {
+                        return Err(format!("invalid --shard {i}/{n}: need 0 <= i < n"));
+                    }
+                    shard = (i, n);
+                }
+                "--per-game" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "usage: gen-eval-positions <pgn_or_-> [--shard i/n] [--per-game N]".to_string())?;
+                    per_game = value
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid --per-game value: {value}"))?;
+                    if per_game == 0 {
+                        return Err("invalid --per-game 0: need N >= 1".to_string());
+                    }
+                }
+                _ => {
+                    if source.is_some() {
+                        return Err(format!("unexpected argument: {arg}"));
+                    }
+                    source = Some(arg);
+                }
+            }
+        }
+        let source = source
+            .ok_or_else(|| "usage: gen-eval-positions <pgn_or_-> [--shard i/n] [--per-game N]".to_string())?;
+        let config = WdlSampleConfig {
+            min_ply: SAMPLE_MIN_PLY,
+            end_trim: SAMPLE_END_TRIM,
+            per_game,
+            shard,
+        };
+        // Stream the PGN rather than buffering it (see gen-wdl-data): the real
+        // Lichess export is ~16 GB decompressed and is piped via
+        // `zstdcat ... | gen-eval-positions -`.
+        let samples = if source == "-" {
+            gen_eval_positions_from_reader(std::io::stdin().lock(), config)?
+        } else {
+            let file = std::fs::File::open(&source)
+                .map_err(|error| format!("failed to open PGN {source}: {error}"))?;
+            gen_eval_positions_from_reader(std::io::BufReader::new(file), config)?
+        };
+        for sample in samples {
+            println!(
+                "{}\t{}\t{}",
+                sample.fen,
+                join_usize(&sample.own),
+                join_usize(&sample.opp)
+            );
+        }
+        return Ok(());
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("label-sf") {
+        // label-sf <positions_or_-> <nodes> [--engine PATH]: drive one persistent
+        // Stockfish process (default /usr/games/stockfish, the Debian package
+        // location on Modal) to relabel `fen\town\topp` lines (path or `-` for
+        // stdin) with a fixed-node cp eval, printing `cp\town\topp` — the format
+        // the trainer reads. One malformed line or scoring error is skipped, not
+        // fatal, so a bad position can't kill a shard of tens of thousands.
+        let mut source: Option<String> = None;
+        let mut nodes: Option<u64> = None;
+        let mut engine_path = "/usr/games/stockfish".to_string();
+        let mut args = std::env::args().skip(2);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--engine" => {
+                    engine_path = args
+                        .next()
+                        .ok_or_else(|| "usage: label-sf <positions_or_-> <nodes> [--engine PATH]".to_string())?;
+                }
+                _ => {
+                    if source.is_none() {
+                        source = Some(arg);
+                    } else if nodes.is_none() {
+                        nodes = Some(
+                            arg.parse::<u64>()
+                                .map_err(|_| format!("invalid nodes value: {arg}"))?,
+                        );
+                    } else {
+                        return Err(format!("unexpected argument: {arg}"));
+                    }
+                }
+            }
+        }
+        let source = source
+            .ok_or_else(|| "usage: label-sf <positions_or_-> <nodes> [--engine PATH]".to_string())?;
+        let nodes = nodes
+            .ok_or_else(|| "usage: label-sf <positions_or_-> <nodes> [--engine PATH]".to_string())?;
+        if nodes == 0 {
+            return Err("invalid nodes 0: need nodes >= 1".to_string());
+        }
+        // Stream the positions rather than buffering (see gen-eval-positions):
+        // a shard is piped via `gen-eval-positions - | label-sf - <nodes>`.
+        if source == "-" {
+            run_label_sf(std::io::stdin().lock(), nodes, &engine_path)?;
+        } else {
+            let file = std::fs::File::open(&source)
+                .map_err(|error| format!("failed to open positions {source}: {error}"))?;
+            run_label_sf(std::io::BufReader::new(file), nodes, &engine_path)?;
         }
         return Ok(());
     }
