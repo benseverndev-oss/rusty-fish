@@ -593,6 +593,8 @@ def gate_ladder_run(
     while played < max_openings:
         chunk += 1
         openings = [l for l in make_openings.remote(chunk_openings, gate_plies, chunk).splitlines() if l]
+        if not openings:
+            break  # no openings (e.g. chunk_openings=0) — never advances `played`; avoid an infinite loop
         shard_texts = list(_chunks(openings, gate_shard_size))
         for w, d, l in gate_shard.starmap(
             [(net_bytes, gate_depth, text, move_time_ms, "champion") for text in shard_texts]
