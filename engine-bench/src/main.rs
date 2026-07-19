@@ -1,12 +1,12 @@
 use std::{sync::Arc, time::Duration};
 
 use engine_bench::{
-    DEFAULT_TACTICAL_SUITE, EvalSpsaConfig, ExternalMatchConfig, MatchConfig, MatchScore,
-    SpsaConfig, SprtConfig,
+    BaselineMode, DEFAULT_TACTICAL_SUITE, EvalSpsaConfig, ExternalMatchConfig, MatchConfig,
+    MatchScore, SpsaConfig, SprtConfig,
     eval_params_from_tsv, eval_params_to_tsv, external_tsv_report, measure_throughput,
     random_opening_fens, run_eval_gate_fens, run_eval_spsa_campaign, run_external_opponent_match,
     run_fixed_opponent_match, run_mobility_gate, run_mobility_gate_fens, run_nnue_gauntlet,
-    run_nnue_gauntlet_with_move_time,
+    run_nnue_gauntlet_with_move_time_and_baseline,
     run_spsa_campaign, run_tactical_suite,
     spsa_tsv_report, sprt, sprt_tsv_report, summarize, tactical_tsv_report, throughput_tsv_report,
     gen_wdl_data_samples_from_reader, WdlSampleConfig,
@@ -214,13 +214,15 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
     if std::env::args().nth(1).as_deref() == Some("gate-file") {
-        // gate-file <net> <depth> <openings_file> [move_time_ms]: play NNUE
-        // candidate vs hand-crafted baseline over the file's openings; emit
-        // "W\tD\tL". The deadline keeps one pathological search from stalling
-        // a full campaign shard.
+        // gate-file <net> <depth> <openings_file> [move_time_ms] [champion|handcrafted]:
+        // play the NNUE candidate over the file's openings; emit "W\tD\tL". The
+        // baseline defaults to the bundled champion net (net-vs-net); pass
+        // `handcrafted` to gate against the hand-crafted eval instead. The
+        // deadline keeps one pathological search from stalling a full campaign
+        // shard.
         let path = std::env::args()
             .nth(2)
-            .ok_or_else(|| "usage: gate-file <net> <depth> <openings_file> [move_time_ms]".to_string())?;
+            .ok_or_else(|| "usage: gate-file <net> <depth> <openings_file> [move_time_ms] [champion|handcrafted]".to_string())?;
         let depth = arg_u32(3).and_then(|d| u8::try_from(d).ok()).unwrap_or(4);
         let openings_path = std::env::args()
             .nth(4)
@@ -235,11 +237,17 @@ fn main() -> Result<(), String> {
             max_plies: 160,
         };
         let move_time = Duration::from_millis(arg_u64(5).unwrap_or(100));
-        let records = run_nnue_gauntlet_with_move_time(
+        let mode = if std::env::args().any(|a| a == "handcrafted") {
+            BaselineMode::Handcrafted
+        } else {
+            BaselineMode::Champion
+        };
+        let records = run_nnue_gauntlet_with_move_time_and_baseline(
             &fens,
             std::sync::Arc::new(net),
             config,
             move_time,
+            mode,
         )?;
         let score = summarize(&records);
         println!("{}\t{}\t{}", score.wins, score.draws, score.losses);

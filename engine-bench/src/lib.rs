@@ -346,15 +346,36 @@ pub fn run_fixed_opponent_match(
     Ok(records)
 }
 
-/// Plays the NNUE-equipped engine (candidate) against the hand-crafted-eval
-/// engine (baseline) over each position and both colours. This is the SPRT gate
-/// that decides whether a trained network actually beats the current engine.
+/// Which opponent the NNUE candidate is gated against. `Champion` (the default)
+/// plays the candidate net against the bundled champion net that
+/// `Searcher::default()` installs — a net-vs-net gate. `Handcrafted` disables
+/// NNUE on the baseline so the candidate plays the hand-crafted evaluation.
+#[derive(Clone, Copy)]
+pub enum BaselineMode {
+    Champion,
+    Handcrafted,
+}
+
+/// Builds the gauntlet baseline searcher for `mode`. `Searcher::default()`
+/// installs the bundled champion net; `Handcrafted` strips it back to the
+/// hand-crafted evaluation.
+fn baseline_searcher(mode: BaselineMode) -> Searcher {
+    let mut baseline = Searcher::default(); // Default installs the bundled champion net.
+    if matches!(mode, BaselineMode::Handcrafted) {
+        baseline.set_nnue(None);
+    }
+    baseline
+}
+
+/// Plays the NNUE-equipped engine (candidate) against the bundled champion net
+/// (baseline) over each position and both colours. This is the SPRT gate that
+/// decides whether a trained network actually beats the current engine.
 pub fn run_nnue_gauntlet(
     positions: &[&str],
     net: Arc<Nnue>,
     config: MatchConfig,
 ) -> Result<Vec<GameRecord>, String> {
-    run_nnue_gauntlet_with_optional_move_time(positions, net, config, None)
+    run_nnue_gauntlet_with_optional_move_time(positions, net, config, None, BaselineMode::Champion)
 }
 
 /// Plays a bounded NNUE gauntlet. Every search receives the same per-move
@@ -365,7 +386,26 @@ pub fn run_nnue_gauntlet_with_move_time(
     config: MatchConfig,
     move_time: Duration,
 ) -> Result<Vec<GameRecord>, String> {
-    run_nnue_gauntlet_with_optional_move_time(positions, net, config, Some(move_time))
+    run_nnue_gauntlet_with_optional_move_time(
+        positions,
+        net,
+        config,
+        Some(move_time),
+        BaselineMode::Champion,
+    )
+}
+
+/// Plays a bounded NNUE gauntlet against the chosen `BaselineMode` (champion net
+/// or hand-crafted eval). This is the entry `gate-file` calls so the gate can
+/// pick its baseline.
+pub fn run_nnue_gauntlet_with_move_time_and_baseline(
+    positions: &[&str],
+    net: Arc<Nnue>,
+    config: MatchConfig,
+    move_time: Duration,
+    mode: BaselineMode,
+) -> Result<Vec<GameRecord>, String> {
+    run_nnue_gauntlet_with_optional_move_time(positions, net, config, Some(move_time), mode)
 }
 
 fn run_nnue_gauntlet_with_optional_move_time(
@@ -373,11 +413,12 @@ fn run_nnue_gauntlet_with_optional_move_time(
     net: Arc<Nnue>,
     config: MatchConfig,
     move_time: Option<Duration>,
+    mode: BaselineMode,
 ) -> Result<Vec<GameRecord>, String> {
     let mut records = Vec::with_capacity(positions.len() * 2);
     for fen in positions {
         for candidate_color in [Color::White, Color::Black] {
-            records.push(play_nnue_game(fen, candidate_color, &net, config, move_time)?);
+            records.push(play_nnue_game(fen, candidate_color, &net, config, move_time, mode)?);
         }
     }
     Ok(records)
@@ -432,13 +473,12 @@ fn play_nnue_game(
     net: &Arc<Nnue>,
     config: MatchConfig,
     move_time: Option<Duration>,
+    mode: BaselineMode,
 ) -> Result<GameRecord, String> {
     let mut board = Board::from_fen(fen)?;
     let mut candidate = Searcher::default();
     candidate.set_nnue(Some(Arc::clone(net)));
-    let mut baseline = Searcher::default(); // hand-crafted evaluation
-    // Compare/label with the hand-crafted eval, not the now-default NNUE.
-    baseline.set_nnue(None);
+    let mut baseline = baseline_searcher(mode);
     for ply in 0..config.max_plies {
         let (depth, searcher) = if board.side_to_move == candidate_color {
             (config.candidate_depth, &mut candidate)
