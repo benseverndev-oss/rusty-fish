@@ -428,6 +428,74 @@ def train_from_store(datasets: list[str], hidden: int, epochs: int, lr: float = 
         return (handle.read(), val_loss)
 
 
+@app.function(timeout=60 * 60 * 3)
+def run_experiment(config: dict) -> dict:
+    """Train one net from the store, val-precheck it, gate it vs the champion, and
+    return a structured result. Catches its own errors so a bad config becomes an
+    `error` row rather than sinking the whole sweep."""
+    import math
+    import re
+
+    base = {
+        "dataset": config["dataset"], "hidden": config["hidden"],
+        "epochs": config["epochs"], "lr": config["lr"], "val_loss": "NA",
+        "wins": "NA", "draws": "NA", "losses": "NA", "games": "NA",
+        "elo": "NA", "decision": "error",
+    }
+    try:
+        net_bytes, val_loss = train_from_store.remote(
+            [config["dataset"]], config["hidden"], config["epochs"], config["lr"]
+        )
+        base["val_loss"] = val_loss
+        if math.isnan(val_loss) or val_loss > 0.1:
+            return {**base, "decision": "rejected"}
+        verdict = gate_ladder_run.remote(
+            net_bytes, config["gate_depth"], config["gate_plies"], config["move_time_ms"],
+            config["gate_shard_size"], config["chunk_openings"], config["max_openings"],
+        )
+        m = re.search(r"gate ladder: (\d+)W (\d+)D (\d+)L over (\d+) games .* decision (\w+)", verdict)
+        if not m:
+            return base  # decision stays "error"
+        w, d, l, games = int(m[1]), int(m[2]), int(m[3]), int(m[4])
+        total = w + d + l
+        if total == 0:
+            elo = "NA"
+        else:
+            score = (w + 0.5 * d) / total
+            elo = -800.0 if score <= 0 else 800.0 if score >= 1 else round(-400 * math.log10(1 / score - 1), 1)
+        return {**base, "wins": w, "draws": d, "losses": l, "games": games, "elo": elo, "decision": m[5]}
+    except Exception as error:  # noqa: BLE001 — any failure becomes one error row
+        return {**base, "decision": f"error: {error}"[:120]}
+
+
+@app.function(volumes={"/store": labels_volume}, timeout=60 * 10)
+def append_results(rows: list[str]) -> None:
+    import os
+    labels_volume.reload()
+    os.makedirs("/store/experiments", exist_ok=True)
+    path = "/store/experiments/results.tsv"
+    header = ("sweep_id\ttimestamp\tdataset\thidden\tepochs\tlr\tval_loss\t"
+              "wins\tdraws\tlosses\tgames\telo\tdecision")
+    exists = os.path.exists(path)
+    with open(path, "a", encoding="utf-8") as handle:
+        if not exists:
+            handle.write(header + "\n")
+        for row in rows:
+            handle.write(row + "\n")
+    labels_volume.commit()
+
+
+@app.function(volumes={"/store": labels_volume})
+def read_results() -> str:
+    import os
+    labels_volume.reload()
+    path = "/store/experiments/results.tsv"
+    if not os.path.exists(path):
+        return ""
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.read()
+
+
 def _chunks(lines, size):
     for start in range(0, len(lines), size):
         yield "\n".join(lines[start:start + size])
