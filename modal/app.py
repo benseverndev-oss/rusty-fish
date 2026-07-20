@@ -306,7 +306,13 @@ def mark_sf_month_complete(dataset: str, month: str) -> None:
     labels_volume.commit()
 
 
-@app.function(image=rust_image, volumes={"/vol": wdl_volume, "/store": labels_volume}, timeout=60 * 90)
+# 3h timeout: a single shard streams a whole month's export through fixed-node
+# Stockfish, and the later (bigger) Lichess months are ~2x the size of the
+# original six. At 16 shards/month the fat months blew the old 90-min cap, and a
+# single shard timeout raises through label_sf_run's list(starmap(...)) and kills
+# the entire multi-month orchestration. Pair this headroom with more shards/month
+# (label_sf --shards-per-month) so each shard stays well under it.
+@app.function(image=rust_image, volumes={"/vol": wdl_volume, "/store": labels_volume}, timeout=60 * 60 * 3)
 def label_sf_shard(dataset: str, name: str, i: int, n: int, per_game: int, nodes: int) -> int:
     """One Stockfish-eval labeling shard: sample FEN positions, then replace each
     with its fixed-node Stockfish cp eval.
