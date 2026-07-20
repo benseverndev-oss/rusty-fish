@@ -351,6 +351,62 @@ def ensure_sf_labels(corpus, per_game, nodes, shards_per_month) -> None:
         mark_sf_month_complete.remote(dataset, month)
 
 
+@app.function(timeout=60 * 60 * 20)
+def label_sf_run(corpus: list, per_game: int, nodes: int, shards_per_month: int) -> str:
+    """Server-side labeling orchestrator: download + verify every month's export,
+    then label only the store-missing months into the `n{nodes}-pg{per_game}` dataset.
+
+    Same work as `ensure_sf_labels`, but runs server-side so a long multi-month run
+    survives client disconnect under `--detach` — a client-side loop stops advancing
+    the moment the CLI is killed, whereas this holds one cheap CPU container that
+    keeps firing the heavy shard functions. Fully idempotent/resumable via the
+    per-month `.complete` markers and the per-export final-path check: re-running
+    skips finished months and already-downloaded exports."""
+    # Download + verify every export first (idempotent; skips ones already present).
+    list(prepare_export.starmap([(m["name"], m["url"], m["sha256"]) for m in corpus]))
+    dataset = _sf_dataset(nodes, per_game)
+    names = [m["name"] for m in corpus]
+    missing = missing_sf_months.remote(dataset, names)
+    print(f"SF store {dataset}: {len(names) - len(missing)} cached, labeling {missing}", flush=True)
+    labeled = []
+    for month in missing:
+        wipe_sf_month.remote(dataset, month)  # once, before the shards
+        counts = list(label_sf_shard.starmap(
+            [(dataset, month, i, shards_per_month, per_game, nodes) for i in range(shards_per_month)]
+        ))
+        mark_sf_month_complete.remote(dataset, month)
+        n = sum(counts)
+        labeled.append((month, n))
+        print(f"LABEL_SF_MONTH {dataset} {month} positions={n}", flush=True)
+    total = sum(n for _, n in labeled)
+    print(f"LABEL_SF_DONE dataset={dataset} months={len(labeled)} "
+          f"new_positions={total} detail={labeled}", flush=True)
+    return f"{dataset}: labeled {len(labeled)} months, {total} new positions"
+
+
+@app.local_entrypoint()
+def label_sf(shards_per_month: int = 16, per_game: int = 4, nodes: int = 100000,
+             months: str = ""):
+    """Label the SF-eval corpus into the persistent store WITHOUT training — the
+    long, amortized, one-time step of a data-scale expansion. Deferred training then
+    reads the bigger store via `sweep` / `train_sf` (a fully-cached corpus does zero
+    labeling). Run detached so the multi-hour orchestration survives a client kill.
+
+        modal run --detach modal/app.py::label_sf
+        modal run --detach modal/app.py::label_sf --months 2017-07,2017-08
+    """
+    corpus = _load_wdl_corpus()
+    if months:
+        wanted = set(months.split(","))
+        corpus = [m for m in corpus if m["name"] in wanted]
+        missing = wanted - {m["name"] for m in corpus}
+        assert not missing, f"unknown months: {sorted(missing)}"
+        assert corpus, "no months selected"
+    for m in corpus:
+        assert m.get("sha256"), f"month {m['name']} has no pinned sha256 — run sha_probe first"
+    print(label_sf_run.remote(corpus, per_game, nodes, shards_per_month))
+
+
 @app.function(
     image=torch_image, gpu="A10G", timeout=60 * 60 * 3, memory=32768, volumes={"/vol": wdl_volume}
 )
