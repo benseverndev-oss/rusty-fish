@@ -34,3 +34,98 @@ sha256 = "c4b2e39a382fb8a9dc5e766bbae0201d123c5c0ccc27f6e852d9a69e6661ab2f"
 name = "2017-06"
 url = "https://database.lichess.org/standard/lichess_db_standard_rated_2017-06.pgn.zst"
 sha256 = "f11fef4ff2b605c041f88b12846f11d7fc609988ff2185222c083c09cf13a29b"
+
+# Data-scale expansion (2017-07 .. 2018-12) — 18 additional months labelled into
+# the same n100000-pg4 store dataset. SHAs are Lichess's official published sums
+# (database.lichess.org/standard/sha256sums.txt), re-verified on download in the
+# Modal pipeline before use.
+
+[[month]]
+name = "2017-07"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2017-07.pgn.zst"
+sha256 = "98d1adb38c71375b6c81ab3e8efda1b4e1ff4f5e8dc47ee55621de3b5c93f54a"
+
+[[month]]
+name = "2017-08"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2017-08.pgn.zst"
+sha256 = "408d7cb1020df95d10a242a1e39e16031fdfeeb77a39b6b2b98afa0ed3b99279"
+
+[[month]]
+name = "2017-09"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2017-09.pgn.zst"
+sha256 = "9073272695e7f3495d0e8c4ccc80d8b416256640d344b8e53c53bd1019ed3ac8"
+
+[[month]]
+name = "2017-10"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2017-10.pgn.zst"
+sha256 = "565ca5876e0b6163eae5717638e1fef1775531f22882587fdf37ca21d093a758"
+
+[[month]]
+name = "2017-11"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2017-11.pgn.zst"
+sha256 = "e9c9c2baf70d9908d895564d0c7018105574c59a32fb2299177b06eaabe8aadb"
+
+[[month]]
+name = "2017-12"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2017-12.pgn.zst"
+sha256 = "802c46de4ab66b6ad43d70a34f518c0e1134b6dca7d45abd1a1b8b0094945930"
+
+[[month]]
+name = "2018-01"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2018-01.pgn.zst"
+sha256 = "8ac6ff9d722a4bba1c1d72c700523408dff2e09cc52cbfe4e454289ca60e8d6b"
+
+[[month]]
+name = "2018-02"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2018-02.pgn.zst"
+sha256 = "f859cd9a6628ea00e8f0148130a3b466198599624c6f808bfbb9d6b6a1d2a71f"
+
+[[month]]
+name = "2018-03"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2018-03.pgn.zst"
+sha256 = "458f0f3ad8e1abdb15f4711cf0b6eb27540f84e038b2e844aeb0d984e6937594"
+
+[[month]]
+name = "2018-04"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2018-04.pgn.zst"
+sha256 = "8ef16cf7936e92a37449aaa72513cfc5af5ab8d752646e3f9f757339ac3b471a"
+
+[[month]]
+name = "2018-05"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2018-05.pgn.zst"
+sha256 = "3b522ebe20bd745b763298efcb0043abfa80a8e3b55a1c9bf4a4f4f8236289e8"
+
+[[month]]
+name = "2018-06"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2018-06.pgn.zst"
+sha256 = "506bd6bdd918f3b24b8c8a4034b1bc1ac3bb0aa61f3d3a3aa8aa70a75e1e8f60"
+
+[[month]]
+name = "2018-07"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2018-07.pgn.zst"
+sha256 = "be104908d223f4bdd1154806d76404b50637c51456c1de61ccc677c4ab6e1256"
+
+[[month]]
+name = "2018-08"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2018-08.pgn.zst"
+sha256 = "a24ebfe45e37382a2c05bb7903e0d66a5f16b7a5e9a3d4140c4c35f4eb32f0ab"
+
+[[month]]
+name = "2018-09"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2018-09.pgn.zst"
+sha256 = "27e7a9af8d34176ed825aef2ec330e320db5ae897b4ea2bfa29b53cf2c9e07bf"
+
+[[month]]
+name = "2018-10"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2018-10.pgn.zst"
+sha256 = "e8476f488c4fa93d323b27d00a4099174ac98e4758af4ee17bc4d5bb52753aec"
+
+[[month]]
+name = "2018-11"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2018-11.pgn.zst"
+sha256 = "8425291d506d04c55ed08e71c5c9f4c0a1e156903738a0f83ad0e2b08b4d7371"
+
+[[month]]
+name = "2018-12"
+url = "https://database.lichess.org/standard/lichess_db_standard_rated_2018-12.pgn.zst"
+sha256 = "63ecd3be2d3d4d1635e495b0238b38a0f0bf88e08174ca037fdada0fab4bab10"
