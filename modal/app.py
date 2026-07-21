@@ -458,7 +458,7 @@ def train_wdl_run(shard_names: list[str], hidden: int, epochs: int) -> bytes:
 
 
 @app.function(
-    image=torch_image, gpu="A10G", timeout=60 * 60 * 3, memory=65536,
+    image=torch_image, gpu="A10G", timeout=60 * 60 * 3, memory=131072,
     volumes={"/store": labels_volume},
 )
 def train_from_store(datasets: list[str], hidden: int, epochs: int, lr: float = 1e-3) -> tuple[bytes, float]:
@@ -468,9 +468,10 @@ def train_from_store(datasets: list[str], hidden: int, epochs: int, lr: float = 
     Memory: the padded feature tensors are small (N x 32 int32, ~3 GB for the full
     24-month corpus), but `_load_samples`/`_pad_rows` build transient Python
     lists-of-lists over every position while ingesting. The 6-month (~3M-position)
-    champion trained fine at 32 GB; the 24-month corpus is ~4x that (~12M
-    positions) and the Python-object load peak scales with it, so the request is
-    64 GB to keep the data-scale sweep off the OOM line."""
+    champion trained fine at 32 GB; the actual 24-month corpus measured out to
+    ~19M positions (not the ~12M first estimated — the 2018 months are ~2x the
+    2017 ones), and the Python-object load peak scales with it, so the request is
+    128 GB to keep the data-scale sweep well off the OOM line."""
     import os, train_nnue
 
     labels_volume.reload()
