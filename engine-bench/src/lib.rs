@@ -1958,6 +1958,103 @@ pub fn run_label_sf<R: std::io::Read>(
     Ok(())
 }
 
+/// Comma-joins feature indices — the `own`/`opp` CSV the trainer reads.
+fn join_indices(values: &[usize]) -> String {
+    values
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Parses a public dataset's eval field into centipawns *in the file's own sign
+/// convention* (the caller applies any side-to-move flip). Accepts:
+/// - plain integer centipawns (`"24"`, `"-135"`),
+/// - mate scores (`"#3"`, `"#-2"`, `"mate 4"`) -> `+/- MATE_CP` by sign, matching
+///   how `label-sf`'s UCI parser maps mates, and
+/// - decimal pawn units (`"0.24"`, `"-1.35"`) -> centipawns.
+fn parse_public_eval_cp(field: &str) -> Option<i32> {
+    let field = field.trim();
+    let mate = field
+        .strip_prefix('#')
+        .or_else(|| field.strip_prefix("mate "))
+        .map(str::trim);
+    if let Some(distance) = mate {
+        let n: i32 = distance.parse().ok()?;
+        return Some(if n >= 0 { MATE_CP } else { -MATE_CP });
+    }
+    if field.contains('.') {
+        let pawns: f64 = field.parse().ok()?;
+        return Some((pawns * 100.0).round() as i32);
+    }
+    field.parse::<i32>().ok()
+}
+
+/// Splits a `FEN<sep>eval` row: the eval is the final tab- or comma-delimited
+/// field, and the FEN (which contains spaces but no tab/comma) is everything
+/// before it. Tab wins over comma so a stray comma inside a header can't confuse
+/// a tab-separated row.
+fn split_fen_eval(line: &str) -> Option<(&str, &str)> {
+    let (fen, eval) = line
+        .rsplit_once('\t')
+        .or_else(|| line.rsplit_once(','))?;
+    Some((fen.trim(), eval.trim()))
+}
+
+/// Converts one public `FEN<sep>eval` row into a `(cp, own, opp)` training row —
+/// the exact tuple `label-sf` produces, but with the centipawn label taken from
+/// the file instead of a Stockfish pass. Returns `None` for a malformed FEN or
+/// eval (header rows, blanks) so the streaming caller can skip and count them.
+///
+/// Feature extraction reuses [`active_features`], so the emitted own/opp indices
+/// are byte-identical to what the network sees at inference — the invariant a
+/// Python reimplementation of the 768-feature layout would silently risk.
+///
+/// `white_relative` handles sign convention: most public dumps report eval from
+/// White's point of view, but the trainer's labels are side-to-move-relative
+/// (`own` == side to move), so the sign is flipped for black-to-move positions.
+/// Pass `white_relative = false` when the source is already side-to-move POV.
+pub fn label_fen_row(line: &str, white_relative: bool) -> Option<(i32, Vec<usize>, Vec<usize>)> {
+    let (fen, eval) = split_fen_eval(line.trim())?;
+    let board = Board::from_fen(fen).ok()?;
+    let raw = parse_public_eval_cp(eval)?;
+    let stm = board.side_to_move;
+    let cp = match (white_relative, stm) {
+        (true, Color::Black) => -raw,
+        _ => raw,
+    };
+    Some((cp, active_features(&board, stm), active_features(&board, opposite(stm))))
+}
+
+/// Streams public `FEN<sep>eval` rows (tab- or comma-separated) and prints
+/// `cp<TAB>own<TAB>opp` — the same format `label-sf` emits — taking the label
+/// from the file rather than evaluating with Stockfish. This lets a pre-scored
+/// public dataset (Kaggle/HF FEN+eval dumps) feed the trainer directly, skipping
+/// the whole `gen-eval-positions | label-sf` self-play + fixed-node fan-out.
+/// Malformed rows are counted and skipped, reported on stderr at the end.
+pub fn run_label_fens<R: std::io::Read>(reader: R, white_relative: bool) -> Result<(), String> {
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    let mut skipped: u64 = 0;
+    for line in BufReader::new(reader).lines() {
+        let line = line.map_err(|error| format!("failed to read positions: {error}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match label_fen_row(&line, white_relative) {
+            Some((cp, own, opp)) => writeln!(out, "{cp}\t{}\t{}", join_indices(&own), join_indices(&opp))
+                .map_err(|error| format!("failed to write labelled position: {error}"))?,
+            None => skipped += 1,
+        }
+    }
+    out.flush()
+        .map_err(|error| format!("failed to flush labelled positions: {error}"))?;
+    if skipped > 0 {
+        eprintln!("label-fens: skipped {skipped} lines (malformed FEN or eval)");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2870,5 +2967,47 @@ mod tests {
         let all_set: HashSet<&String> = all.iter().collect();
         assert_eq!(union, all_set);
         assert_eq!(shard0.len() + shard1.len() + shard2.len(), all.len());
+    }
+
+    #[test]
+    fn label_fen_row_features_match_active_features_and_pass_through_stm_eval() {
+        // White to move: a white-relative eval passes through unchanged, and the
+        // features must equal active_features() for the parsed board — the exact
+        // indices label-sf/gen-eval-positions would emit for the same position.
+        let fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+        let board = engine_core::Board::from_fen(fen).unwrap();
+        let (cp, own, opp) = super::label_fen_row(&format!("{fen},20"), true).unwrap();
+        assert_eq!(cp, 20);
+        assert_eq!(own, engine_search::active_features(&board, engine_core::Color::White));
+        assert_eq!(opp, engine_search::active_features(&board, engine_core::Color::Black));
+    }
+
+    #[test]
+    fn label_fen_row_flips_sign_for_black_to_move_when_white_relative() {
+        // Black to move with a +50 White-relative eval means -50 for the side to
+        // move; with --stm-relative (white_relative = false) it passes through.
+        let fen = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1";
+        let (cp_wr, _, _) = super::label_fen_row(&format!("{fen}\t50"), true).unwrap();
+        assert_eq!(cp_wr, -50, "white-relative eval must flip for black to move");
+        let (cp_stm, _, _) = super::label_fen_row(&format!("{fen}\t50"), false).unwrap();
+        assert_eq!(cp_stm, 50, "stm-relative eval must pass through");
+    }
+
+    #[test]
+    fn parse_public_eval_cp_handles_int_mate_and_pawns() {
+        assert_eq!(super::parse_public_eval_cp("135"), Some(135));
+        assert_eq!(super::parse_public_eval_cp("-42"), Some(-42));
+        assert_eq!(super::parse_public_eval_cp("#3"), Some(MATE_CP));
+        assert_eq!(super::parse_public_eval_cp("#-2"), Some(-MATE_CP));
+        assert_eq!(super::parse_public_eval_cp("mate 5"), Some(MATE_CP));
+        assert_eq!(super::parse_public_eval_cp("0.24"), Some(24));
+        assert_eq!(super::parse_public_eval_cp("-1.35"), Some(-135));
+        assert_eq!(super::parse_public_eval_cp("garbage"), None);
+    }
+
+    #[test]
+    fn label_fen_row_skips_malformed() {
+        assert!(super::label_fen_row("not a position line", true).is_none());
+        assert!(super::label_fen_row("fen,eval", true).is_none()); // header row
     }
 }

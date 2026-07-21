@@ -10,7 +10,7 @@ use engine_bench::{
     run_spsa_campaign, run_tactical_suite,
     spsa_tsv_report, sprt, sprt_tsv_report, summarize, tactical_tsv_report, throughput_tsv_report,
     gen_wdl_data_samples_from_reader, WdlSampleConfig,
-    gen_eval_positions_from_reader, run_label_sf,
+    gen_eval_positions_from_reader, run_label_sf, run_label_fens,
 };
 use engine_bench::train::{generate_training_samples, train_nnue, TrainConfig};
 use engine_search::{EvalParams, Nnue, SearchParams};
@@ -528,6 +528,42 @@ fn main() -> Result<(), String> {
             let file = std::fs::File::open(&source)
                 .map_err(|error| format!("failed to open positions {source}: {error}"))?;
             run_label_sf(std::io::BufReader::new(file), nodes, &engine_path)?;
+        }
+        return Ok(());
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("label-fens") {
+        // label-fens <fen_eval_or_-> [--stm-relative]: convert a pre-evaluated
+        // public dataset — `FEN<sep>eval` rows, tab- or comma-separated (path or
+        // `-` for stdin) — into `cp\town\topp` training rows, taking the cp label
+        // from the file instead of a Stockfish pass. This replaces the whole
+        // `gen-eval-positions | label-sf` self-play + fixed-node fan-out for data
+        // that is already scored. Evals are treated as White-relative (the common
+        // public convention) and flipped to side-to-move POV; pass --stm-relative
+        // when the source is already side-to-move. Malformed rows are skipped.
+        let mut source: Option<String> = None;
+        let mut white_relative = true;
+        let mut args = std::env::args().skip(2);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--stm-relative" => white_relative = false,
+                "--white-relative" => white_relative = true,
+                _ => {
+                    if source.is_some() {
+                        return Err(format!("unexpected argument: {arg}"));
+                    }
+                    source = Some(arg);
+                }
+            }
+        }
+        let source = source
+            .ok_or_else(|| "usage: label-fens <fen_eval_or_-> [--stm-relative]".to_string())?;
+        if source == "-" {
+            run_label_fens(std::io::stdin().lock(), white_relative)?;
+        } else {
+            let file = std::fs::File::open(&source)
+                .map_err(|error| format!("failed to open positions {source}: {error}"))?;
+            run_label_fens(std::io::BufReader::new(file), white_relative)?;
         }
         return Ok(());
     }
