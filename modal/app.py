@@ -44,7 +44,7 @@ def _load_wdl_corpus() -> list[dict]:
 # Image A: builds the engine-bench release binary from the repo source.
 rust_image = (
     modal.Image.debian_slim()
-    .apt_install("curl", "build-essential", "pkg-config", "zstd", "stockfish")
+    .apt_install("curl", "build-essential", "pkg-config", "zstd", "stockfish", "jq")
     .run_commands(
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs "
         "| sh -s -- -y --default-toolchain stable"
@@ -564,6 +564,58 @@ def read_results() -> str:
         return ""
     with open(path, "r", encoding="utf-8") as handle:
         return handle.read()
+
+
+@app.function(image=rust_image, volumes={"/store": labels_volume}, timeout=60 * 60 * 4)
+def label_public_run(url: str, max_positions: int, dataset: str) -> int:
+    """Ingest a pre-evaluated public eval dataset (the lichess eval database, or any
+    JSONL.zst with the same shape) into the store WITHOUT a Stockfish pass, using the
+    `label-fens` subcommand. This is the public-data counterpart to `label_sf_run`:
+    it produces the identical `cp<TAB>own<TAB>opp` store format, so `train_from_store`
+    reads it unchanged.
+
+    Streams `curl | zstd -dc | jq | label-fens` in one pass (zstd isn't seekable, so
+    no byte-range sharding), capped at `max_positions`. jq extracts the deepest eval's
+    best-pv centipawns (mates -> `#N`) and pads the 4-field lichess FEN to 6 fields;
+    `label-fens --white-relative` flips the White-relative eval to side-to-move POV
+    (the same convention the trainer's SF labels use)."""
+    import subprocess, os
+    out_dir = f"/store/sf/{dataset}"
+    os.makedirs(out_dir, exist_ok=True)
+    out = f"{out_dir}/samples-public-0.tsv"
+    jq_filter = (
+        r'(.evals | max_by(.depth)) as $e | $e.pvs[0] as $p | '
+        r'if ($p | has("cp")) then "\(.fen) 0 1,\($p.cp)" '
+        r'elif ($p | has("mate")) then "\(.fen) 0 1,#\($p.mate)" else empty end'
+    )
+    # No `pipefail`: `head` closing the pipe SIGPIPEs curl/zstd/jq by design once
+    # max_positions rows are through; the meaningful exit is label-fens' (last stage).
+    cmd = (
+        f'curl -sS --max-time 14400 "{url}" '
+        f'| zstd -dc --long=31 '
+        f"| jq -rc '{jq_filter}' "
+        f'| head -n {max_positions} '
+        f'| {BIN} label-fens - --white-relative > {out}'
+    )
+    subprocess.run(["bash", "-c", cmd], check=True)
+    labels_volume.commit()
+    with open(out, "r", encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())
+
+
+@app.local_entrypoint()
+def label_public(
+    url: str = "https://database.lichess.org/lichess_db_eval.jsonl.zst",
+    max_positions: int = 3_000_000,
+    dataset: str = "public-lichess",
+):
+    """Ingest a public FEN+eval dataset into the store via `label-fens`, then train
+    on it with `sweep --dataset <dataset>` and gate vs the champion — the head-to-head
+    against the self-labeled corpus.
+
+        modal run --detach modal/app.py::label_public --max-positions 3000000
+    """
+    print(label_public_run.remote(url, max_positions, dataset))
 
 
 def _chunks(lines, size):
