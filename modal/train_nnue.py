@@ -100,6 +100,23 @@ def train(
     if not owns:
         raise SystemExit(f"no training samples in {data_path}")
 
+    # Drop the rare pathological sample whose active-feature count exceeds
+    # MAX_FEATURES. A legal position never does (<=16 pieces/perspective), but a
+    # public dataset can carry a malformed FEN that parses into an illegal
+    # >32-piece board; those are junk, not worth aborting a multi-hour run over.
+    # Filter by index across owns/opps/targets so the three stay aligned.
+    kept = [
+        i for i in range(len(owns))
+        if len(owns[i]) <= MAX_FEATURES and len(opps[i]) <= MAX_FEATURES
+    ]
+    if len(kept) < len(owns):
+        dropped = len(owns) - len(kept)
+        print(f"dropped {dropped} samples over MAX_FEATURES "
+              f"({100 * dropped / len(owns):.4f}%)", flush=True)
+        owns = [owns[i] for i in kept]
+        opps = [opps[i] for i in kept]
+        targets = [targets[i] for i in kept]
+
     own_t = _pad_rows(owns).to(device)             # [N, 32] int32
     opp_t = _pad_rows(opps).to(device)
     target = torch.tensor(targets, dtype=torch.float32, device=device)
