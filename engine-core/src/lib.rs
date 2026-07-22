@@ -39,6 +39,29 @@ const KING_DELTAS: [(i8, i8); 8] = [
 ];
 const KNIGHT_ATTACK_TABLE: [Bitboard; 64] = build_step_attack_table(&KNIGHT_DELTAS);
 const KING_ATTACK_TABLE: [Bitboard; 64] = build_step_attack_table(&KING_DELTAS);
+// Squares a pawn of the given colour attacks from each origin square. Used to
+// answer "is this square attacked by a pawn" by looking up the reverse table.
+const WHITE_PAWN_ATTACK_TABLE: [Bitboard; 64] = build_step_attack_table(&[(-1, 1), (1, 1)]);
+const BLACK_PAWN_ATTACK_TABLE: [Bitboard; 64] = build_step_attack_table(&[(-1, -1), (1, -1)]);
+
+// Numeric square indices (rank * 8 + file) for the squares that castling logic
+// touches, so the hot make/unmake paths never allocate strings to identify them.
+const SQ_A1: u8 = 0;
+const SQ_B1: u8 = 1;
+const SQ_C1: u8 = 2;
+const SQ_D1: u8 = 3;
+const SQ_E1: u8 = 4;
+const SQ_F1: u8 = 5;
+const SQ_G1: u8 = 6;
+const SQ_H1: u8 = 7;
+const SQ_A8: u8 = 56;
+const SQ_B8: u8 = 57;
+const SQ_C8: u8 = 58;
+const SQ_D8: u8 = 59;
+const SQ_E8: u8 = 60;
+const SQ_F8: u8 = 61;
+const SQ_G8: u8 = 62;
+const SQ_H8: u8 = 63;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Color {
@@ -287,6 +310,9 @@ pub struct UndoState {
 pub struct Board {
     squares: [Option<Piece>; 64],
     bitboards: [Bitboard; 12],
+    /// Per-colour occupancy, maintained incrementally alongside `bitboards` so
+    /// hot paths never re-fold the six per-piece boards. `[white, black]`.
+    occupancy: [Bitboard; 2],
     pub side_to_move: Color,
     castling_rights: u8,
     en_passant: Option<Square>,
@@ -387,6 +413,7 @@ impl Board {
         let mut board = Self {
             squares,
             bitboards: [0; 12],
+            occupancy: [0; 2],
             side_to_move,
             castling_rights,
             en_passant,
@@ -494,13 +521,12 @@ impl Board {
     }
 
     pub fn occupancy(&self, color: Color) -> Bitboard {
-        let offset = match color {
-            Color::White => 0,
-            Color::Black => 6,
-        };
-        self.bitboards[offset..offset + 6]
-            .iter()
-            .fold(0, |occupancy, pieces| occupancy | pieces)
+        self.occupancy[color as usize]
+    }
+
+    /// All occupied squares of both colours.
+    fn all_occupancy(&self) -> Bitboard {
+        self.occupancy[0] | self.occupancy[1]
     }
 
     /// The pseudo-legal squares `piece` attacks from `square`, given the current
@@ -521,14 +547,17 @@ impl Board {
     }
 
     pub fn set_piece_at(&mut self, square: Square, piece: Option<Piece>) {
+        let bit = 1_u64 << square.0;
         if let Some(previous) = self.squares[square.0 as usize] {
             self.position_hash ^= piece_hash(previous, square);
-            self.bitboards[piece_index(previous)] ^= 1_u64 << square.0;
+            self.bitboards[piece_index(previous)] ^= bit;
+            self.occupancy[previous.color as usize] ^= bit;
         }
         self.squares[square.0 as usize] = piece;
         if let Some(piece) = piece {
             self.position_hash ^= piece_hash(piece, square);
-            self.bitboards[piece_index(piece)] ^= 1_u64 << square.0;
+            self.bitboards[piece_index(piece)] ^= bit;
+            self.occupancy[piece.color as usize] ^= bit;
         }
     }
 
@@ -560,16 +589,12 @@ impl Board {
     }
 
     pub fn king_square(&self, color: Color) -> Option<Square> {
-        self.squares
-            .iter()
-            .enumerate()
-            .find_map(|(idx, piece)| match piece {
-                Some(Piece {
-                    color: piece_color,
-                    kind: PieceKind::King,
-                }) if *piece_color == color => Some(Square(idx as u8)),
-                _ => None,
-            })
+        let kings = self.pieces(color, PieceKind::King);
+        if kings == 0 {
+            None
+        } else {
+            Some(Square(kings.trailing_zeros() as u8))
+        }
     }
 
     pub fn in_check(&self, color: Color) -> bool {
@@ -578,95 +603,34 @@ impl Board {
     }
 
     pub fn is_square_attacked(&self, square: Square, by: Color) -> bool {
-        let pawn_rank_delta = match by {
-            Color::White => -1,
-            Color::Black => 1,
+        let sq = square.0 as usize;
+
+        // Pawns: the squares a `by` pawn would attack `square` from are exactly
+        // the squares the opposite-colour pawn attack table lists for `square`.
+        let pawn_sources = match by {
+            Color::White => BLACK_PAWN_ATTACK_TABLE[sq],
+            Color::Black => WHITE_PAWN_ATTACK_TABLE[sq],
         };
-        for df in [-1, 1] {
-            if let Some(src) = square.offset(df, pawn_rank_delta)
-                && self.piece_at(src)
-                    == Some(Piece {
-                        color: by,
-                        kind: PieceKind::Pawn,
-                    })
-            {
-                return true;
-            }
+        if pawn_sources & self.pieces(by, PieceKind::Pawn) != 0 {
+            return true;
         }
 
-        for (df, dr) in [
-            (-2, -1),
-            (-2, 1),
-            (-1, -2),
-            (-1, 2),
-            (1, -2),
-            (1, 2),
-            (2, -1),
-            (2, 1),
-        ] {
-            if let Some(src) = square.offset(df, dr)
-                && self.piece_at(src)
-                    == Some(Piece {
-                        color: by,
-                        kind: PieceKind::Knight,
-                    })
-            {
-                return true;
-            }
+        if KNIGHT_ATTACK_TABLE[sq] & self.pieces(by, PieceKind::Knight) != 0 {
+            return true;
+        }
+        if KING_ATTACK_TABLE[sq] & self.pieces(by, PieceKind::King) != 0 {
+            return true;
         }
 
-        for (df, dr) in [
-            (-1, -1),
-            (-1, 0),
-            (-1, 1),
-            (0, -1),
-            (0, 1),
-            (1, -1),
-            (1, 0),
-            (1, 1),
-        ] {
-            if let Some(src) = square.offset(df, dr)
-                && self.piece_at(src)
-                    == Some(Piece {
-                        color: by,
-                        kind: PieceKind::King,
-                    })
-            {
-                return true;
-            }
+        let occupied = self.all_occupancy();
+        let bishops_queens =
+            self.pieces(by, PieceKind::Bishop) | self.pieces(by, PieceKind::Queen);
+        if bishop_attacks(square, occupied) & bishops_queens != 0 {
+            return true;
         }
-
-        self.slider_attack(
-            square,
-            by,
-            &[(-1, -1), (-1, 1), (1, -1), (1, 1)],
-            &[PieceKind::Bishop, PieceKind::Queen],
-        ) || self.slider_attack(
-            square,
-            by,
-            &[(-1, 0), (1, 0), (0, -1), (0, 1)],
-            &[PieceKind::Rook, PieceKind::Queen],
-        )
-    }
-
-    fn slider_attack(
-        &self,
-        square: Square,
-        by: Color,
-        directions: &[(i8, i8)],
-        kinds: &[PieceKind],
-    ) -> bool {
-        for &(df, dr) in directions {
-            let mut current = square;
-            while let Some(next) = current.offset(df, dr) {
-                current = next;
-                if let Some(piece) = self.piece_at(current) {
-                    if piece.color == by && kinds.contains(&piece.kind) {
-                        return true;
-                    }
-                    break;
-                }
-            }
+        let rooks_queens = self.pieces(by, PieceKind::Rook) | self.pieces(by, PieceKind::Queen);
+        if rook_attacks(square, occupied) & rooks_queens != 0 {
+            return true;
         }
         false
     }
@@ -842,84 +806,40 @@ impl Board {
         match color {
             Color::White => {
                 if self.castling_rights & WHITE_KINGSIDE != 0
-                    && self
-                        .piece_at(Square::from_str("f1").expect("valid"))
-                        .is_none()
-                    && self
-                        .piece_at(Square::from_str("g1").expect("valid"))
-                        .is_none()
-                    && !self
-                        .is_square_attacked(Square::from_str("f1").expect("valid"), Color::Black)
-                    && !self
-                        .is_square_attacked(Square::from_str("g1").expect("valid"), Color::Black)
+                    && self.piece_at(Square(SQ_F1)).is_none()
+                    && self.piece_at(Square(SQ_G1)).is_none()
+                    && !self.is_square_attacked(Square(SQ_F1), Color::Black)
+                    && !self.is_square_attacked(Square(SQ_G1), Color::Black)
                 {
-                    moves.push(ChessMove::new(
-                        from,
-                        Square::from_str("g1").expect("valid"),
-                        None,
-                    ));
+                    moves.push(ChessMove::new(from, Square(SQ_G1), None));
                 }
                 if self.castling_rights & WHITE_QUEENSIDE != 0
-                    && self
-                        .piece_at(Square::from_str("b1").expect("valid"))
-                        .is_none()
-                    && self
-                        .piece_at(Square::from_str("c1").expect("valid"))
-                        .is_none()
-                    && self
-                        .piece_at(Square::from_str("d1").expect("valid"))
-                        .is_none()
-                    && !self
-                        .is_square_attacked(Square::from_str("c1").expect("valid"), Color::Black)
-                    && !self
-                        .is_square_attacked(Square::from_str("d1").expect("valid"), Color::Black)
+                    && self.piece_at(Square(SQ_B1)).is_none()
+                    && self.piece_at(Square(SQ_C1)).is_none()
+                    && self.piece_at(Square(SQ_D1)).is_none()
+                    && !self.is_square_attacked(Square(SQ_C1), Color::Black)
+                    && !self.is_square_attacked(Square(SQ_D1), Color::Black)
                 {
-                    moves.push(ChessMove::new(
-                        from,
-                        Square::from_str("c1").expect("valid"),
-                        None,
-                    ));
+                    moves.push(ChessMove::new(from, Square(SQ_C1), None));
                 }
             }
             Color::Black => {
                 if self.castling_rights & BLACK_KINGSIDE != 0
-                    && self
-                        .piece_at(Square::from_str("f8").expect("valid"))
-                        .is_none()
-                    && self
-                        .piece_at(Square::from_str("g8").expect("valid"))
-                        .is_none()
-                    && !self
-                        .is_square_attacked(Square::from_str("f8").expect("valid"), Color::White)
-                    && !self
-                        .is_square_attacked(Square::from_str("g8").expect("valid"), Color::White)
+                    && self.piece_at(Square(SQ_F8)).is_none()
+                    && self.piece_at(Square(SQ_G8)).is_none()
+                    && !self.is_square_attacked(Square(SQ_F8), Color::White)
+                    && !self.is_square_attacked(Square(SQ_G8), Color::White)
                 {
-                    moves.push(ChessMove::new(
-                        from,
-                        Square::from_str("g8").expect("valid"),
-                        None,
-                    ));
+                    moves.push(ChessMove::new(from, Square(SQ_G8), None));
                 }
                 if self.castling_rights & BLACK_QUEENSIDE != 0
-                    && self
-                        .piece_at(Square::from_str("b8").expect("valid"))
-                        .is_none()
-                    && self
-                        .piece_at(Square::from_str("c8").expect("valid"))
-                        .is_none()
-                    && self
-                        .piece_at(Square::from_str("d8").expect("valid"))
-                        .is_none()
-                    && !self
-                        .is_square_attacked(Square::from_str("c8").expect("valid"), Color::White)
-                    && !self
-                        .is_square_attacked(Square::from_str("d8").expect("valid"), Color::White)
+                    && self.piece_at(Square(SQ_B8)).is_none()
+                    && self.piece_at(Square(SQ_C8)).is_none()
+                    && self.piece_at(Square(SQ_D8)).is_none()
+                    && !self.is_square_attacked(Square(SQ_C8), Color::White)
+                    && !self.is_square_attacked(Square(SQ_D8), Color::White)
                 {
-                    moves.push(ChessMove::new(
-                        from,
-                        Square::from_str("c8").expect("valid"),
-                        None,
-                    ));
+                    moves.push(ChessMove::new(from, Square(SQ_C8), None));
                 }
             }
         }
@@ -995,41 +915,41 @@ impl Board {
                 ),
             }
 
-            match (mv.from.to_coord().as_str(), mv.to.to_coord().as_str()) {
-                ("e1", "g1") => {
-                    self.set_piece_at(Square::from_str("h1").expect("valid"), None);
+            match (mv.from.0, mv.to.0) {
+                (SQ_E1, SQ_G1) => {
+                    self.set_piece_at(Square(SQ_H1), None);
                     self.set_piece_at(
-                        Square::from_str("f1").expect("valid"),
+                        Square(SQ_F1),
                         Some(Piece {
                             color: Color::White,
                             kind: PieceKind::Rook,
                         }),
                     );
                 }
-                ("e1", "c1") => {
-                    self.set_piece_at(Square::from_str("a1").expect("valid"), None);
+                (SQ_E1, SQ_C1) => {
+                    self.set_piece_at(Square(SQ_A1), None);
                     self.set_piece_at(
-                        Square::from_str("d1").expect("valid"),
+                        Square(SQ_D1),
                         Some(Piece {
                             color: Color::White,
                             kind: PieceKind::Rook,
                         }),
                     );
                 }
-                ("e8", "g8") => {
-                    self.set_piece_at(Square::from_str("h8").expect("valid"), None);
+                (SQ_E8, SQ_G8) => {
+                    self.set_piece_at(Square(SQ_H8), None);
                     self.set_piece_at(
-                        Square::from_str("f8").expect("valid"),
+                        Square(SQ_F8),
                         Some(Piece {
                             color: Color::Black,
                             kind: PieceKind::Rook,
                         }),
                     );
                 }
-                ("e8", "c8") => {
-                    self.set_piece_at(Square::from_str("a8").expect("valid"), None);
+                (SQ_E8, SQ_C8) => {
+                    self.set_piece_at(Square(SQ_A8), None);
                     self.set_piece_at(
-                        Square::from_str("d8").expect("valid"),
+                        Square(SQ_D8),
                         Some(Piece {
                             color: Color::Black,
                             kind: PieceKind::Rook,
@@ -1041,21 +961,21 @@ impl Board {
         }
 
         if moved_piece.kind == PieceKind::Rook {
-            match mv.from.to_coord().as_str() {
-                "a1" => self.set_castling_rights(self.castling_rights & !WHITE_QUEENSIDE),
-                "h1" => self.set_castling_rights(self.castling_rights & !WHITE_KINGSIDE),
-                "a8" => self.set_castling_rights(self.castling_rights & !BLACK_QUEENSIDE),
-                "h8" => self.set_castling_rights(self.castling_rights & !BLACK_KINGSIDE),
+            match mv.from.0 {
+                SQ_A1 => self.set_castling_rights(self.castling_rights & !WHITE_QUEENSIDE),
+                SQ_H1 => self.set_castling_rights(self.castling_rights & !WHITE_KINGSIDE),
+                SQ_A8 => self.set_castling_rights(self.castling_rights & !BLACK_QUEENSIDE),
+                SQ_H8 => self.set_castling_rights(self.castling_rights & !BLACK_KINGSIDE),
                 _ => {}
             }
         }
 
         if let Some((captured_square, _captured)) = captured_piece {
-            match captured_square.to_coord().as_str() {
-                "a1" => self.set_castling_rights(self.castling_rights & !WHITE_QUEENSIDE),
-                "h1" => self.set_castling_rights(self.castling_rights & !WHITE_KINGSIDE),
-                "a8" => self.set_castling_rights(self.castling_rights & !BLACK_QUEENSIDE),
-                "h8" => self.set_castling_rights(self.castling_rights & !BLACK_KINGSIDE),
+            match captured_square.0 {
+                SQ_A1 => self.set_castling_rights(self.castling_rights & !WHITE_QUEENSIDE),
+                SQ_H1 => self.set_castling_rights(self.castling_rights & !WHITE_KINGSIDE),
+                SQ_A8 => self.set_castling_rights(self.castling_rights & !BLACK_QUEENSIDE),
+                SQ_H8 => self.set_castling_rights(self.castling_rights & !BLACK_KINGSIDE),
                 _ => {}
             }
         }
@@ -1094,46 +1014,46 @@ impl Board {
         self.set_piece_at(mv.to, None);
 
         if undo.moved_piece.kind == PieceKind::King {
-            match (mv.from.to_coord().as_str(), mv.to.to_coord().as_str()) {
-                ("e1", "g1") => {
+            match (mv.from.0, mv.to.0) {
+                (SQ_E1, SQ_G1) => {
                     self.set_piece_at(
-                        Square::from_str("h1").expect("valid"),
+                        Square(SQ_H1),
                         Some(Piece {
                             color: Color::White,
                             kind: PieceKind::Rook,
                         }),
                     );
-                    self.set_piece_at(Square::from_str("f1").expect("valid"), None);
+                    self.set_piece_at(Square(SQ_F1), None);
                 }
-                ("e1", "c1") => {
+                (SQ_E1, SQ_C1) => {
                     self.set_piece_at(
-                        Square::from_str("a1").expect("valid"),
+                        Square(SQ_A1),
                         Some(Piece {
                             color: Color::White,
                             kind: PieceKind::Rook,
                         }),
                     );
-                    self.set_piece_at(Square::from_str("d1").expect("valid"), None);
+                    self.set_piece_at(Square(SQ_D1), None);
                 }
-                ("e8", "g8") => {
+                (SQ_E8, SQ_G8) => {
                     self.set_piece_at(
-                        Square::from_str("h8").expect("valid"),
+                        Square(SQ_H8),
                         Some(Piece {
                             color: Color::Black,
                             kind: PieceKind::Rook,
                         }),
                     );
-                    self.set_piece_at(Square::from_str("f8").expect("valid"), None);
+                    self.set_piece_at(Square(SQ_F8), None);
                 }
-                ("e8", "c8") => {
+                (SQ_E8, SQ_C8) => {
                     self.set_piece_at(
-                        Square::from_str("a8").expect("valid"),
+                        Square(SQ_A8),
                         Some(Piece {
                             color: Color::Black,
                             kind: PieceKind::Rook,
                         }),
                     );
-                    self.set_piece_at(Square::from_str("d8").expect("valid"), None);
+                    self.set_piece_at(Square(SQ_D8), None);
                 }
                 _ => {}
             }
@@ -1179,9 +1099,12 @@ impl Board {
 
     fn rebuild_bitboards(&mut self) {
         self.bitboards = [0; 12];
+        self.occupancy = [0; 2];
         for (index, piece) in self.squares.iter().enumerate() {
             if let Some(piece) = piece {
-                self.bitboards[piece_index(*piece)] |= 1_u64 << index;
+                let bit = 1_u64 << index;
+                self.bitboards[piece_index(*piece)] |= bit;
+                self.occupancy[piece.color as usize] |= bit;
             }
         }
     }
