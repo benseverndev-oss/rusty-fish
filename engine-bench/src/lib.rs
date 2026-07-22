@@ -611,13 +611,15 @@ pub fn play_parameter_game(
 ) -> Result<GameRecord, String> {
     let mut board = Board::from_fen(fen)?;
     let mut candidate = Searcher::default();
-    // Compare/label with the hand-crafted eval, not the now-default NNUE.
-    candidate.set_nnue(None);
+    if !spsa_keep_nnue() {
+        candidate.set_nnue(None);
+    }
     candidate.set_search_params(candidate_params);
     candidate.set_eval_params(candidate_eval);
     let mut baseline = Searcher::default();
-    // Compare/label with the hand-crafted eval, not the now-default NNUE.
-    baseline.set_nnue(None);
+    if !spsa_keep_nnue() {
+        baseline.set_nnue(None);
+    }
     baseline.set_search_params(baseline_params);
     baseline.set_eval_params(baseline_eval);
     for ply in 0..config.max_plies {
@@ -654,10 +656,19 @@ pub fn play_parameter_game(
 /// A gate searcher: the given params plus a trimmed move overhead so a small
 /// `movetime` budget is actually spent searching rather than swallowed by the
 /// default 25 ms overhead (there is no GUI latency to reserve for here).
+/// The search-param SPSA and its gate compare with the hand-crafted eval by
+/// default (fast, deterministic). But once an NNUE is the shipped default, the
+/// search params should be tuned against the eval the engine actually uses:
+/// setting `RUSTY_FISH_SPSA_NNUE=1` keeps the bundled net on for these matches.
+fn spsa_keep_nnue() -> bool {
+    std::env::var("RUSTY_FISH_SPSA_NNUE").is_ok_and(|value| !value.is_empty() && value != "0")
+}
+
 fn gate_searcher(params: SearchParams, eval: EvalParams) -> Searcher {
     let mut searcher = Searcher::default();
-    // Compare/label with the hand-crafted eval, not the now-default NNUE.
-    searcher.set_nnue(None);
+    if !spsa_keep_nnue() {
+        searcher.set_nnue(None);
+    }
     searcher.set_search_params(params);
     searcher.set_eval_params(eval);
     let mut options = searcher.options().clone();
@@ -791,6 +802,36 @@ pub fn run_eval_gate_fens<S: AsRef<str>>(
                 baseline,
                 move_time,
                 max_plies,
+            )?);
+        }
+    }
+    Ok(records)
+}
+
+/// Plays `candidate` search params vs `baseline` over `fens` (both colours) at a
+/// fixed depth — the out-of-sample validation for a SPSA-tuned SearchParams (the
+/// campaign optimises in-sample over a small opening set; this re-checks on fresh
+/// openings before the params are shipped). Honours `RUSTY_FISH_SPSA_NNUE` via
+/// [`play_parameter_game`], so it can validate against the shipped NNUE eval.
+pub fn run_search_gate_fens<S: AsRef<str>>(
+    fens: &[S],
+    candidate: SearchParams,
+    baseline: SearchParams,
+    depth: u8,
+    max_plies: u32,
+) -> Result<Vec<GameRecord>, String> {
+    let config = MatchConfig { candidate_depth: depth, baseline_depth: depth, max_plies };
+    let mut records = Vec::with_capacity(fens.len() * 2);
+    for fen in fens {
+        for candidate_color in [Color::White, Color::Black] {
+            records.push(play_parameter_game(
+                fen.as_ref(),
+                candidate_color,
+                candidate,
+                EvalParams::default(),
+                baseline,
+                EvalParams::default(),
+                config,
             )?);
         }
     }
@@ -1208,6 +1249,28 @@ pub fn to_eval_array(v: &[f64]) -> [f64; EVAL_DIMENSIONS] {
 /// Serializes an [`EvalParams`] to the one-line TSV the `eval-gate-file` /
 /// `spsa-eval` commands interchange: the 18 vector values, tab-separated, in the
 /// [`EVAL_SPSA_SPECS`] order.
+/// Parses `SPSA_DIMENSIONS` whitespace-separated numbers (the tuned search-param
+/// vector — e.g. the last row of `spsa`'s report) back into a [`SearchParams`].
+/// `mobility_scale` is not part of the SPSA vector; it comes back as the
+/// [`vector_to_search_params`] default (irrelevant under NNUE, which ignores it).
+pub fn search_params_from_tsv(contents: &str) -> Result<SearchParams, String> {
+    let values: Vec<f64> = contents
+        .split_whitespace()
+        .map(|token| {
+            token
+                .parse::<f64>()
+                .map_err(|error| format!("invalid search-param TSV value `{token}`: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.len() != SPSA_DIMENSIONS {
+        return Err(format!(
+            "search-param TSV must have {SPSA_DIMENSIONS} values, found {}",
+            values.len()
+        ));
+    }
+    Ok(vector_to_search_params(&to_array(&values)))
+}
+
 pub fn eval_params_to_tsv(params: &EvalParams) -> String {
     eval_params_to_vector(params)
         .iter()

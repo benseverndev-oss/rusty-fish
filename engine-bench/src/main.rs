@@ -11,6 +11,7 @@ use engine_bench::{
     spsa_tsv_report, sprt, sprt_tsv_report, summarize, tactical_tsv_report, throughput_tsv_report,
     gen_wdl_data_samples_from_reader, WdlSampleConfig,
     gen_eval_positions_from_reader, run_label_sf, run_label_fens,
+    search_params_from_tsv, run_search_gate_fens,
 };
 use engine_bench::train::{generate_training_samples, train_nnue, TrainConfig};
 use engine_search::{EvalParams, Nnue, SearchParams};
@@ -106,6 +107,26 @@ fn main() -> Result<(), String> {
         let positions: Vec<&str> = owned.iter().map(String::as_str).collect();
         let records = run_external_opponent_match(&positions, &config)?;
         eprint!("{}", external_tsv_report(&records, &config));
+        print!("{}", sprt_tsv_report(summarize(&records), SprtConfig::default()));
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("search-gate") {
+        // search-gate <tuned_tsv_file> [openings] [depth]: out-of-sample validation
+        // for a SPSA-tuned SearchParams — play the tuned params vs the default over
+        // freshly generated openings (both colours) and emit an SPRT verdict. The
+        // tuned TSV is the 8-value search-param vector (the last row of `spsa`).
+        // Honours RUSTY_FISH_SPSA_NNUE (tune/validate against the shipped NNUE eval).
+        let tuned_path = std::env::args()
+            .nth(2)
+            .ok_or_else(|| "usage: search-gate <tuned_tsv_file> [openings] [depth]".to_string())?;
+        let openings = std::env::args().nth(3).and_then(|arg| arg.parse::<usize>().ok()).unwrap_or(64);
+        let depth = std::env::args().nth(4).and_then(|arg| arg.parse::<u8>().ok()).unwrap_or(6);
+        let tuned_tsv = std::fs::read_to_string(&tuned_path)
+            .map_err(|error| format!("failed to read tuned params {tuned_path}: {error}"))?;
+        let candidate = search_params_from_tsv(&tuned_tsv)?;
+        // Fresh openings (distinct seed from the SPSA training set) => out of sample.
+        let fens = random_opening_fens(openings, 8, 0xA11CE_5EED_C0DE);
+        let records = run_search_gate_fens(&fens, candidate, SearchParams::default(), depth, 160)?;
         print!("{}", sprt_tsv_report(summarize(&records), SprtConfig::default()));
         return Ok(());
     }
