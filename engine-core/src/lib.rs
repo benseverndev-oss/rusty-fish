@@ -525,8 +525,43 @@ impl Board {
     }
 
     /// All occupied squares of both colours.
-    fn all_occupancy(&self) -> Bitboard {
+    pub fn all_occupancy(&self) -> Bitboard {
         self.occupancy[0] | self.occupancy[1]
+    }
+
+    /// Every piece of either colour that attacks `square` given the supplied
+    /// occupancy. Sliders are resolved against `occupied` (not the board's
+    /// current occupancy) so callers running a static-exchange swap loop can
+    /// pass a reduced occupancy to reveal x-ray attackers. Pawn/knight/king
+    /// attackers come from precomputed tables and ignore `occupied`.
+    pub fn attackers_to(&self, square: Square, occupied: Bitboard) -> Bitboard {
+        let sq = square.0 as usize;
+        let mut attackers = 0;
+
+        attackers |= BLACK_PAWN_ATTACK_TABLE[sq] & self.pieces(Color::White, PieceKind::Pawn);
+        attackers |= WHITE_PAWN_ATTACK_TABLE[sq] & self.pieces(Color::Black, PieceKind::Pawn);
+
+        let knights = self.pieces(Color::White, PieceKind::Knight)
+            | self.pieces(Color::Black, PieceKind::Knight);
+        attackers |= KNIGHT_ATTACK_TABLE[sq] & knights;
+
+        let kings =
+            self.pieces(Color::White, PieceKind::King) | self.pieces(Color::Black, PieceKind::King);
+        attackers |= KING_ATTACK_TABLE[sq] & kings;
+
+        let bishops_queens = self.pieces(Color::White, PieceKind::Bishop)
+            | self.pieces(Color::Black, PieceKind::Bishop)
+            | self.pieces(Color::White, PieceKind::Queen)
+            | self.pieces(Color::Black, PieceKind::Queen);
+        attackers |= bishop_attacks(square, occupied) & bishops_queens;
+
+        let rooks_queens = self.pieces(Color::White, PieceKind::Rook)
+            | self.pieces(Color::Black, PieceKind::Rook)
+            | self.pieces(Color::White, PieceKind::Queen)
+            | self.pieces(Color::Black, PieceKind::Queen);
+        attackers |= rook_attacks(square, occupied) & rooks_queens;
+
+        attackers
     }
 
     /// The pseudo-legal squares `piece` attacks from `square`, given the current
@@ -1227,11 +1262,15 @@ fn king_attacks(square: Square) -> Bitboard {
     KING_ATTACK_TABLE[square.0 as usize]
 }
 
-fn bishop_attacks(square: Square, occupied: Bitboard) -> Bitboard {
+/// Bishop attack set from `square` given the all-piece `occupied` bitboard,
+/// stopping at (and including) the first blocker along each diagonal.
+pub fn bishop_attacks(square: Square, occupied: Bitboard) -> Bitboard {
     sliding_attack_mask(square, occupied, &[(-1, -1), (-1, 1), (1, -1), (1, 1)])
 }
 
-fn rook_attacks(square: Square, occupied: Bitboard) -> Bitboard {
+/// Rook attack set from `square` given the all-piece `occupied` bitboard,
+/// stopping at (and including) the first blocker along each rank/file.
+pub fn rook_attacks(square: Square, occupied: Bitboard) -> Bitboard {
     sliding_attack_mask(square, occupied, &[(-1, 0), (1, 0), (0, -1), (0, 1)])
 }
 

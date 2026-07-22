@@ -1798,43 +1798,112 @@ fn root_tablebase_search_result(root: SyzygyRootProbe) -> SearchResult {
     }
 }
 
+/// Static exchange evaluation via the standard iterative swap-off algorithm on
+/// attacker bitboards — no board clone, no move generation, no recursion. Returns
+/// the centipawn material swing of playing the capture `mv`, assuming each side
+/// always recaptures with its least valuable attacker (revealing x-ray sliders as
+/// pieces leave). Non-captures return 0. Runs in O(number of attackers) using the
+/// core's precomputed attack tables.
 fn static_exchange_evaluation(board: &Board, mv: ChessMove) -> i32 {
-    let captured_value = board.piece_at(mv.to).map(piece_value).unwrap_or_else(|| {
-        if board.en_passant() == Some(mv.to) {
-            piece_kind_value(PieceKind::Pawn)
-        } else {
-            0
-        }
-    });
-    if captured_value == 0 {
+    const KINDS: [PieceKind; 6] = [
+        PieceKind::Pawn,
+        PieceKind::Knight,
+        PieceKind::Bishop,
+        PieceKind::Rook,
+        PieceKind::Queen,
+        PieceKind::King,
+    ];
+
+    let target = mv.to;
+    let Some(mover) = board.piece_at(mv.from) else {
         return 0;
+    };
+
+    let mut occupied = board.all_occupancy();
+    let captured_value = if let Some(victim) = board.piece_at(target) {
+        piece_value(victim)
+    } else if mover.kind == PieceKind::Pawn && board.en_passant() == Some(target) {
+        // En passant: the captured pawn sits beside the target, not on it.
+        if let Some(cap_sq) = Square::from_file_rank(target.file(), mv.from.rank()) {
+            occupied &= !(1u64 << cap_sq.0);
+        }
+        piece_kind_value(PieceKind::Pawn)
+    } else {
+        return 0; // not a capture — nothing to exchange
+    };
+
+    let diagonal_sliders = board.pieces(Color::White, PieceKind::Bishop)
+        | board.pieces(Color::Black, PieceKind::Bishop)
+        | board.pieces(Color::White, PieceKind::Queen)
+        | board.pieces(Color::Black, PieceKind::Queen);
+    let straight_sliders = board.pieces(Color::White, PieceKind::Rook)
+        | board.pieces(Color::Black, PieceKind::Rook)
+        | board.pieces(Color::White, PieceKind::Queen)
+        | board.pieces(Color::Black, PieceKind::Queen);
+
+    // The initial attacker vacates its origin square.
+    occupied &= !(1u64 << mv.from.0);
+    let mut attackers = board.attackers_to(target, occupied) & occupied;
+
+    let mut gain = [0i32; 32];
+    gain[0] = captured_value;
+    let mut on_target_value = piece_value(mover); // piece now standing on the target
+    let mut side = mover.color.opposite(); // side to recapture next
+    let mut depth = 0usize;
+
+    loop {
+        depth += 1;
+        gain[depth] = on_target_value - gain[depth - 1];
+
+        // Pick the least valuable attacker of the side to move.
+        let side_attackers = attackers & board.occupancy(side);
+        if side_attackers == 0 {
+            break;
+        }
+        let mut lva_bit = 0u64;
+        let mut lva_kind = PieceKind::King;
+        for kind in KINDS {
+            let set = side_attackers & board.pieces(side, kind);
+            if set != 0 {
+                lva_bit = set & set.wrapping_neg();
+                lva_kind = kind;
+                break;
+            }
+        }
+        // A king may only capture when the opponent has no attacker left, else it
+        // would move into check — that recapture is illegal, so the swap stops.
+        if lva_kind == PieceKind::King
+            && (attackers & board.occupancy(side.opposite())) & !lva_bit != 0
+        {
+            break;
+        }
+
+        on_target_value = piece_kind_value(lva_kind);
+        occupied &= !lva_bit;
+        if matches!(
+            lva_kind,
+            PieceKind::Pawn | PieceKind::Bishop | PieceKind::Queen
+        ) {
+            attackers |= engine_core::bishop_attacks(target, occupied) & diagonal_sliders;
+        }
+        if matches!(lva_kind, PieceKind::Rook | PieceKind::Queen) {
+            attackers |= engine_core::rook_attacks(target, occupied) & straight_sliders;
+        }
+        attackers &= occupied;
+
+        if depth + 1 >= gain.len() {
+            break;
+        }
+        side = side.opposite();
     }
 
-    let mut after_capture = board.clone();
-    if after_capture.make_move(mv).is_err() {
-        return -MATE_SCORE;
+    // Resolve the swap stack back to the root: each side stops capturing once the
+    // exchange stops being favourable.
+    while depth > 1 {
+        depth -= 1;
+        gain[depth - 1] = -(-gain[depth - 1]).max(gain[depth]);
     }
-    captured_value - best_exchange_gain(&mut after_capture, mv.to)
-}
-
-fn best_exchange_gain(board: &mut Board, target: engine_core::Square) -> i32 {
-    let mut best_gain = 0;
-    let recaptures = board
-        .generate_capture_moves()
-        .into_iter()
-        .filter(|mv| mv.to == target)
-        .collect::<Vec<_>>();
-
-    for recapture in recaptures {
-        let captured_value = board.piece_at(target).map(piece_value).unwrap_or_default();
-        let undo = board
-            .make_move(recapture)
-            .expect("generated capture must be legal");
-        let gain = captured_value - best_exchange_gain(board, target);
-        board.unmake_move(recapture, undo);
-        best_gain = best_gain.max(gain);
-    }
-    best_gain
+    gain[0]
 }
 
 fn piece_kind_value(kind: PieceKind) -> i32 {
