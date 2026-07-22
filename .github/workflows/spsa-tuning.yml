@@ -30,7 +30,9 @@ permissions:
 jobs:
   spsa:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # Generous budget: spsa self-play in NNUE mode is slow, and the 192-game gate
+    # needs headroom after it. 90 min was too tight (campaign alone ate ~70 min).
+    timeout-minutes: 180
     env:
       RUSTY_FISH_SPSA_NNUE: ${{ inputs.use_nnue }}
     steps:
@@ -42,17 +44,28 @@ jobs:
         run: |
           mkdir -p artifacts
           ./target/release/engine-bench spsa "${{ inputs.iterations }}" > artifacts/spsa-tuning.tsv
+          # Extract the tuned params here so they survive even if a later step is
+          # cut off: the tuned SearchParams are the last row's 8 param cols (7..14).
+          tail -1 artifacts/spsa-tuning.tsv | cut -f7-14 > artifacts/tuned.tsv
           {
             echo "## SPSA campaign (NNUE mode = $RUSTY_FISH_SPSA_NNUE, ${{ inputs.iterations }} iterations)"
             echo '```'
             head -1 artifacts/spsa-tuning.tsv
             tail -3 artifacts/spsa-tuning.tsv
+            echo "tuned (aspiration razor_b razor_s rfp_b rfp_s lmp_b lmp_s null): $(cat artifacts/tuned.tsv)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload campaign params (pre-gate, always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spsa-campaign
+          path: |
+            artifacts/spsa-tuning.tsv
+            artifacts/tuned.tsv
+          if-no-files-found: ignore
       - name: Out-of-sample gate (tuned vs default)
         run: |
-          # The tuned SearchParams are the last row's 8 param columns (7..14).
-          tail -1 artifacts/spsa-tuning.tsv | cut -f7-14 > artifacts/tuned.tsv
           echo "TUNED_PARAMS=$(cat artifacts/tuned.tsv)"
           ./target/release/engine-bench search-gate artifacts/tuned.tsv \
             "${{ inputs.gate_openings }}" "${{ inputs.gate_depth }}" | tee artifacts/search-gate.tsv
@@ -65,7 +78,9 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: spsa-tuning
           path: artifacts/
+          if-no-files-found: ignore
