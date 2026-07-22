@@ -458,7 +458,7 @@ def train_wdl_run(shard_names: list[str], hidden: int, epochs: int) -> bytes:
 
 
 @app.function(
-    image=torch_image, gpu="A10G", timeout=60 * 60 * 3, memory=131072,
+    image=torch_image, gpu="A10G", timeout=60 * 60 * 6, memory=131072,
     volumes={"/store": labels_volume},
 )
 def train_from_store(datasets: list[str], hidden: int, epochs: int, lr: float = 1e-3) -> tuple[bytes, float]:
@@ -498,7 +498,7 @@ def train_from_store(datasets: list[str], hidden: int, epochs: int, lr: float = 
         return (handle.read(), val_loss)
 
 
-@app.function(timeout=60 * 60 * 3)
+@app.function(timeout=60 * 60 * 8)
 def run_experiment(config: dict) -> dict:
     """Train one net from the store, val-precheck it, gate it vs the champion, and
     return a structured result. Catches its own errors so a bad config becomes an
@@ -990,7 +990,7 @@ def sha_probe():
         print(line)
 
 
-@app.function(timeout=60 * 60 * 6)
+@app.function(timeout=60 * 60 * 12)
 def run_sweep(
     hs: list[int], es: list[int], ls: list[float], dataset: str,
     gate_depth: int, gate_plies: int, move_time_ms: int, gate_shard_size: int,
