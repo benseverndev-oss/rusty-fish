@@ -1074,12 +1074,13 @@ def results():
         print(line)
 
 
-@app.function(image=rust_image, timeout=60 * 60 * 2)
+@app.function(image=rust_image, timeout=60 * 60 * 2, volumes={"/store": labels_volume})
 def stockfish_bench_level(elo: int, openings: int, movetime_ms: int) -> tuple:
     """Play the bundled-net engine vs Stockfish weakened to ~`elo` via
     UCI_LimitStrength, over `openings` generated openings (both colours), at
     `movetime_ms` per move for each side. Returns (elo, W, D, L) from the engine's
-    perspective — the raw material for a strength-crossover estimate."""
+    perspective AND persists it to the store, so the result survives a client
+    disconnect (a plain `modal run` loses stdout if the local client dies)."""
     import os, subprocess
     cmd = (
         f"{BIN} external-sprt --opponent-elo {elo} "
@@ -1098,6 +1099,12 @@ def stockfish_bench_level(elo: int, openings: int, movetime_ms: int) -> tuple:
             wins += outcome == "Win"
             draws += outcome == "Draw"
             losses += outcome == "Loss"
+    # One file per Elo level (no cross-container write race) so the bracket
+    # survives client death; read them back via `modal volume get`.
+    os.makedirs("/store/experiments/sfbench", exist_ok=True)
+    with open(f"/store/experiments/sfbench/elo-{elo}.tsv", "w", encoding="utf-8") as handle:
+        handle.write(f"{elo}\t{wins}\t{draws}\t{losses}\t{openings}\t{movetime_ms}\n")
+    labels_volume.commit()
     return (elo, wins, draws, losses)
 
 
