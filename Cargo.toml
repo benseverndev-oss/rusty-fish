@@ -6,3 +6,10 @@ resolver = "2"
 edition = "2024"
 license = "MIT"
 version = "0.1.0"
+
+# The release profile is the engine's playing build: cross-crate inlining across
+# engine-core/engine-search matters for the hot search loop, so trade build time
+# for fat LTO and a single codegen unit.
+[profile.release]
+lto = "fat"
+codegen-units = 1
