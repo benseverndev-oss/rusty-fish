@@ -69,8 +69,42 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
     if std::env::args().nth(1).as_deref() == Some("external-sprt") {
-        let config = ExternalMatchConfig::default();
-        let records = run_external_opponent_match(EXTERNAL_SPRT_POSITIONS, &config)?;
+        // external-sprt [--opponent-elo N] [--openings N] [--movetime MS]:
+        // play the bundled-net engine vs the external UCI opponent
+        // (RUSTY_FISH_EXTERNAL_UCI), both colours per opening. --opponent-elo
+        // weakens the opponent via UCI_LimitStrength to find the strength
+        // crossover; --openings N uses N generated openings instead of the fixed
+        // suite (more games = tighter estimate); --movetime sets both sides' budget.
+        let mut config = ExternalMatchConfig::default();
+        let mut openings: Option<usize> = None;
+        let mut args = std::env::args().skip(2);
+        while let Some(arg) = args.next() {
+            let mut value = || {
+                args.next()
+                    .ok_or_else(|| format!("{arg} needs a value"))
+            };
+            match arg.as_str() {
+                "--opponent-elo" => {
+                    config.opponent_elo = Some(value()?.parse::<u32>().map_err(|_| "invalid --opponent-elo".to_string())?);
+                }
+                "--openings" => {
+                    openings = Some(value()?.parse::<usize>().map_err(|_| "invalid --openings".to_string())?);
+                }
+                "--movetime" => {
+                    let ms = value()?.parse::<u64>().map_err(|_| "invalid --movetime".to_string())?;
+                    config.candidate_movetime = std::time::Duration::from_millis(ms);
+                    config.opponent_movetime = std::time::Duration::from_millis(ms);
+                }
+                other => return Err(format!("unexpected argument: {other}")),
+            }
+        }
+        // Own the FENs (generated or the fixed suite) so `&[&str]` refs stay valid.
+        let owned: Vec<String> = match openings {
+            Some(count) => random_opening_fens(count, 8, 0x5EED),
+            None => EXTERNAL_SPRT_POSITIONS.iter().map(|s| s.to_string()).collect(),
+        };
+        let positions: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let records = run_external_opponent_match(&positions, &config)?;
         eprint!("{}", external_tsv_report(&records, &config));
         print!("{}", sprt_tsv_report(summarize(&records), SprtConfig::default()));
         return Ok(());

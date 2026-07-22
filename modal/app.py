@@ -1072,3 +1072,67 @@ def results():
     print(header)
     for line in sorted(rows, key=elo_key, reverse=True):
         print(line)
+
+
+@app.function(image=rust_image, timeout=60 * 60 * 2)
+def stockfish_bench_level(elo: int, openings: int, movetime_ms: int) -> tuple:
+    """Play the bundled-net engine vs Stockfish weakened to ~`elo` via
+    UCI_LimitStrength, over `openings` generated openings (both colours), at
+    `movetime_ms` per move for each side. Returns (elo, W, D, L) from the engine's
+    perspective — the raw material for a strength-crossover estimate."""
+    import os, subprocess
+    cmd = (
+        f"{BIN} external-sprt --opponent-elo {elo} "
+        f"--openings {openings} --movetime {movetime_ms}"
+    )
+    proc = subprocess.run(
+        ["bash", "-c", cmd],
+        capture_output=True, text=True,
+        env={**os.environ, "RUSTY_FISH_EXTERNAL_UCI": "/usr/games/stockfish"},
+    )
+    wins = draws = losses = 0
+    for line in (proc.stderr + "\n" + proc.stdout).splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 9 and parts[-2] in ("Win", "Draw", "Loss"):
+            outcome = parts[-2]
+            wins += outcome == "Win"
+            draws += outcome == "Draw"
+            losses += outcome == "Loss"
+    return (elo, wins, draws, losses)
+
+
+@app.local_entrypoint()
+def stockfish_bench(
+    elos: str = "1320,1600,1900,2200,2500",
+    openings: int = 48,
+    movetime_ms: int = 100,
+):
+    """Benchmark the bundled-net engine vs Stockfish across a bracket of UCI_Elo
+    levels (both colours, `openings` generated openings each). The ~50% score
+    crossover estimates the engine's Elo at this movetime. Each level -> its own
+    container in parallel.
+
+        modal run modal/app.py::stockfish_bench --elos 1320,1600,1900,2200,2500 --openings 48 --movetime 100
+    """
+    import math
+    levels = [int(x) for x in elos.split(",") if x.strip()]
+    results = list(stockfish_bench_level.starmap([(e, openings, movetime_ms) for e in levels]))
+    print("STOCKFISH_BENCH_BEGIN", flush=True)
+    estimates = []
+    for elo, w, d, l in sorted(results):
+        games = w + d + l
+        if games == 0:
+            print(f"BENCH sf_elo={elo} NO GAMES (error?)")
+            continue
+        score = (w + 0.5 * d) / games
+        if 0 < score < 1:
+            est = elo + 400 * math.log10(score / (1 - score))  # engine Elo implied by this level
+            estimates.append(est)
+            tag = f"engine~{est:.0f}"
+        else:
+            tag = "engine>>sf" if score >= 1 else "engine<<sf"
+        print(f"BENCH sf_elo={elo} W={w} D={d} L={l} games={games} score={score:.3f} {tag}")
+    if estimates:
+        print(f"BENCH_ESTIMATE engine_elo~{sum(estimates)/len(estimates):.0f} "
+              f"(mean over {len(estimates)} bracketing levels, movetime {movetime_ms}ms)")
+    print("STOCKFISH_BENCH_END", flush=True)

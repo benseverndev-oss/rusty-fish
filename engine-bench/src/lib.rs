@@ -280,6 +280,11 @@ pub struct ExternalMatchConfig {
     pub opponent_movetime: Duration,
     pub max_plies: u32,
     pub response_timeout: Duration,
+    /// When set, the opponent is weakened to approximately this Elo via
+    /// `UCI_LimitStrength` / `UCI_Elo` (e.g. to benchmark the candidate against a
+    /// deliberately weakened Stockfish and find the strength crossover). `None`
+    /// plays the opponent at full strength.
+    pub opponent_elo: Option<u32>,
 }
 
 impl Default for ExternalMatchConfig {
@@ -291,6 +296,7 @@ impl Default for ExternalMatchConfig {
             opponent_movetime: Duration::from_millis(100),
             max_plies: 160,
             response_timeout: Duration::from_secs(10),
+            opponent_elo: None,
         }
     }
 }
@@ -809,6 +815,9 @@ fn play_external_game(
     candidate_options.move_overhead = config.candidate_move_overhead;
     candidate.set_options(candidate_options);
     let mut opponent = UciProcess::start(opponent_path, config.response_timeout)?;
+    if let Some(elo) = config.opponent_elo {
+        opponent.set_uci_elo(elo)?;
+    }
     for ply in 0..config.max_plies {
         let mv = if board.side_to_move == candidate_color {
             candidate
@@ -933,6 +942,16 @@ impl UciProcess {
         self.stdin
             .flush()
             .map_err(|error| format!("failed to flush UCI command `{command}`: {error}"))
+    }
+
+    /// Weaken the engine to approximately `elo` via `UCI_LimitStrength` + `UCI_Elo`
+    /// (both supported by Stockfish; the engine clamps to its own min/max Elo).
+    /// Waits for `readyok` so the options are applied before the game starts.
+    pub fn set_uci_elo(&mut self, elo: u32) -> Result<(), String> {
+        self.send("setoption name UCI_LimitStrength value true")?;
+        self.send(&format!("setoption name UCI_Elo value {elo}"))?;
+        self.send("isready")?;
+        self.wait_for("readyok")
     }
 
     fn wait_for(&mut self, expected: &str) -> Result<(), String> {
