@@ -10,7 +10,7 @@ use engine_bench::{
     run_spsa_campaign, run_tactical_suite,
     spsa_tsv_report, sprt, sprt_tsv_report, summarize, tactical_tsv_report, throughput_tsv_report,
     gen_wdl_data_samples_from_reader, WdlSampleConfig,
-    gen_eval_positions_from_reader, run_label_sf, run_label_fens,
+    gen_eval_positions_from_reader, run_gen_search_telemetry, run_label_sf, run_label_fens,
     search_params_from_tsv, run_search_gate_fens,
 };
 use engine_bench::bench_harness::{
@@ -681,6 +681,34 @@ fn main() -> Result<(), String> {
         config.max_plies = max_plies;
         let report = run_bench_report(&fens, &candidate, &baseline, config)?;
         print!("{}", bench_full_report_text(&report));
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("gen-search-telemetry") {
+        // gen-search-telemetry <positions_or_-> <depth>: read FENs one per line
+        // (path or `-` for stdin), run a fixed-depth search over each with
+        // per-move-decision telemetry enabled, and print every MoveDecision as a
+        // TSV row prefixed with a 0-based `pos_id`. The header is printed once.
+        //
+        // TSV schema v1 (one row per move considered in a node's move loop):
+        //   pos_id depth ply move_index is_quiet is_priority pv_node gives_check
+        //   static_eval extension reduction lmp_pruned raised_alpha caused_cutoff
+        //   needed_lmr_research needed_pvs_research subtree_nodes
+        // Booleans are 0/1; scores and counts are ints. An lmp_pruned row is a
+        // move skipped by late-move pruning (not searched); its outcome columns
+        // are 0. Malformed FENs are counted and skipped (reported on stderr).
+        let source = std::env::args()
+            .nth(2)
+            .ok_or_else(|| "usage: gen-search-telemetry <positions_or_-> <depth>".to_string())?;
+        let depth = arg_u32(3)
+            .and_then(|depth| u8::try_from(depth).ok())
+            .ok_or_else(|| "usage: gen-search-telemetry <positions_or_-> <depth>".to_string())?;
+        if source == "-" {
+            run_gen_search_telemetry(std::io::stdin().lock(), depth)?;
+        } else {
+            let file = std::fs::File::open(&source)
+                .map_err(|error| format!("failed to open positions {source}: {error}"))?;
+            run_gen_search_telemetry(std::io::BufReader::new(file), depth)?;
+        }
         return Ok(());
     }
 

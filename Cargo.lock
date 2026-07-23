@@ -931,6 +931,7 @@ version = "0.1.0"
 dependencies = [
  "engine-core",
  "engine-search",
+ "pgn-reader",
 ]
 
 [[package]]
