@@ -1071,15 +1071,24 @@ impl Searcher {
             if self.stopped {
                 return (score, pv);
             }
+            // A fully open window can't fail, so its result is final. Accepting it
+            // here guarantees termination when a pathological eval keeps failing
+            // the aspiration window (and avoids the widening arithmetic below ever
+            // needing to grow past the mate range). Normal searches never widen
+            // this far, so their behaviour is unchanged. `saturating_*` keeps the
+            // doubling from overflowing i32 on the way there.
+            if alpha <= -MATE_SCORE && beta >= MATE_SCORE {
+                return (score, pv);
+            }
             if score <= alpha {
-                window *= 2;
+                window = window.saturating_mul(2);
                 alpha = (previous_score - window).max(-MATE_SCORE);
-                beta = (alpha + window * 2).min(MATE_SCORE);
+                beta = alpha.saturating_add(window.saturating_mul(2)).min(MATE_SCORE);
                 continue;
             }
             if score >= beta {
-                window *= 2;
-                alpha = (beta - window * 2).max(-MATE_SCORE);
+                window = window.saturating_mul(2);
+                alpha = beta.saturating_sub(window.saturating_mul(2)).max(-MATE_SCORE);
                 beta = (previous_score + window).min(MATE_SCORE);
                 continue;
             }
