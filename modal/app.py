@@ -607,7 +607,11 @@ def label_public_run(url: str, max_positions: int, dataset: str) -> int:
     subprocess.run(["bash", "-c", cmd], check=True)
     labels_volume.commit()
     with open(out, "r", encoding="utf-8") as handle:
-        return sum(1 for line in handle if line.strip())
+        count = sum(1 for line in handle if line.strip())
+    # Print server-side so a spawned (fire-and-forget) run's row count is retrievable
+    # from `modal app logs` even though the launching client never sees the return.
+    print(f"LABEL_PUBLIC_DONE dataset={dataset} rows={count}", flush=True)
+    return count
 
 
 @app.local_entrypoint()
@@ -622,7 +626,13 @@ def label_public(
 
         modal run --detach modal/app.py::label_public --max-positions 3000000
     """
-    print(label_public_run.remote(url, max_positions, dataset))
+    # spawn (not remote): the client exits immediately instead of blocking on a long
+    # single-container stream (a 60M+ pull is ~tens of minutes to hours). A killed
+    # long-lived client cancels even a --detach run; spawn removes that. The row count
+    # prints server-side (LABEL_PUBLIC_DONE) — retrieve via `modal app logs`.
+    call = label_public_run.spawn(url, max_positions, dataset)
+    print(f"label_public dispatched server-side (call {call.object_id}); it survives "
+          f"client exit. Row count prints as LABEL_PUBLIC_DONE in `modal app logs`.")
 
 
 def _chunks(lines, size):
@@ -1115,9 +1125,17 @@ def sweep(
     es = [int(x) for x in epochs_list.split(",") if x.strip()]
     ls = [float(x) for x in lrs.split(",") if x.strip()]
     assert hs and es and ls, "each of --hiddens/--epochs-list/--lrs needs >=1 value"
-    print(run_sweep.remote(hs, es, ls, dataset, gate_depth, gate_plies,
+    # spawn (not remote): fire-and-forget so the launching client exits in seconds
+    # instead of blocking ~90 min on the result. A long-lived client that gets killed
+    # (teleport, backgrounded-task reaper) sends a cancellation that kills even a
+    # --detach run mid-training; spawn removes that exposure. run_sweep writes the
+    # ledger and prints SWEEP_RESULT server-side, so nothing is lost by not awaiting.
+    call = run_sweep.spawn(hs, es, ls, dataset, gate_depth, gate_plies,
                            move_time_ms, gate_shard_size, chunk_openings, max_openings,
-                           gpu, prescreen_openings, prescreen_floor))
+                           gpu, prescreen_openings, prescreen_floor)
+    print(f"sweep dispatched server-side (call {call.object_id}); it survives client "
+          f"exit. Results append to the ledger; retrieve via "
+          f"`modal run modal/app.py::results` or SWEEP_RESULT in `modal app logs`.")
 
 
 @app.local_entrypoint()
