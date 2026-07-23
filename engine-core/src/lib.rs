@@ -1262,36 +1262,87 @@ fn king_attacks(square: Square) -> Bitboard {
     KING_ATTACK_TABLE[square.0 as usize]
 }
 
+// Precomputed rays from every square along each of the eight directions (origin
+// excluded, running to the board edge). A slider's attack set in one direction is
+// its full ray minus the ray beyond the first blocker, located with a single
+// bit-scan — O(1) per direction instead of walking square by square.
+const RAY_NORTH: [Bitboard; 64] = build_ray_table(0, 1);
+const RAY_SOUTH: [Bitboard; 64] = build_ray_table(0, -1);
+const RAY_EAST: [Bitboard; 64] = build_ray_table(1, 0);
+const RAY_WEST: [Bitboard; 64] = build_ray_table(-1, 0);
+const RAY_NORTH_EAST: [Bitboard; 64] = build_ray_table(1, 1);
+const RAY_NORTH_WEST: [Bitboard; 64] = build_ray_table(-1, 1);
+const RAY_SOUTH_EAST: [Bitboard; 64] = build_ray_table(1, -1);
+const RAY_SOUTH_WEST: [Bitboard; 64] = build_ray_table(-1, -1);
+
+const fn build_ray_table(file_delta: i8, rank_delta: i8) -> [Bitboard; 64] {
+    let mut table = [0; 64];
+    let mut square = 0usize;
+    while square < 64 {
+        let mut file = (square % 8) as i8 + file_delta;
+        let mut rank = (square / 8) as i8 + rank_delta;
+        let mut ray = 0;
+        while file >= 0 && file < 8 && rank >= 0 && rank < 8 {
+            ray |= 1_u64 << (rank as usize * 8 + file as usize);
+            file += file_delta;
+            rank += rank_delta;
+        }
+        table[square] = ray;
+        square += 1;
+    }
+    table
+}
+
+/// Attack set along a ray running toward higher square indices: the nearest
+/// blocker is the lowest set bit of `ray & occupied`.
+#[inline]
+fn positive_ray_attacks(square: usize, occupied: Bitboard, ray_table: &[Bitboard; 64]) -> Bitboard {
+    let ray = ray_table[square];
+    let blockers = ray & occupied;
+    if blockers == 0 {
+        ray
+    } else {
+        ray ^ ray_table[blockers.trailing_zeros() as usize]
+    }
+}
+
+/// Attack set along a ray running toward lower square indices: the nearest
+/// blocker is the highest set bit of `ray & occupied`.
+#[inline]
+fn negative_ray_attacks(square: usize, occupied: Bitboard, ray_table: &[Bitboard; 64]) -> Bitboard {
+    let ray = ray_table[square];
+    let blockers = ray & occupied;
+    if blockers == 0 {
+        ray
+    } else {
+        ray ^ ray_table[63 - blockers.leading_zeros() as usize]
+    }
+}
+
 /// Bishop attack set from `square` given the all-piece `occupied` bitboard,
 /// stopping at (and including) the first blocker along each diagonal.
+#[inline]
 pub fn bishop_attacks(square: Square, occupied: Bitboard) -> Bitboard {
-    sliding_attack_mask(square, occupied, &[(-1, -1), (-1, 1), (1, -1), (1, 1)])
+    let sq = square.0 as usize;
+    positive_ray_attacks(sq, occupied, &RAY_NORTH_EAST)
+        | positive_ray_attacks(sq, occupied, &RAY_NORTH_WEST)
+        | negative_ray_attacks(sq, occupied, &RAY_SOUTH_EAST)
+        | negative_ray_attacks(sq, occupied, &RAY_SOUTH_WEST)
 }
 
 /// Rook attack set from `square` given the all-piece `occupied` bitboard,
 /// stopping at (and including) the first blocker along each rank/file.
+#[inline]
 pub fn rook_attacks(square: Square, occupied: Bitboard) -> Bitboard {
-    sliding_attack_mask(square, occupied, &[(-1, 0), (1, 0), (0, -1), (0, 1)])
+    let sq = square.0 as usize;
+    positive_ray_attacks(sq, occupied, &RAY_NORTH)
+        | positive_ray_attacks(sq, occupied, &RAY_EAST)
+        | negative_ray_attacks(sq, occupied, &RAY_SOUTH)
+        | negative_ray_attacks(sq, occupied, &RAY_WEST)
 }
 
 fn queen_attacks(square: Square, occupied: Bitboard) -> Bitboard {
     bishop_attacks(square, occupied) | rook_attacks(square, occupied)
-}
-
-fn sliding_attack_mask(square: Square, occupied: Bitboard, directions: &[(i8, i8)]) -> Bitboard {
-    let mut attacks = 0;
-    for &(file_delta, rank_delta) in directions {
-        let mut current = square;
-        while let Some(target) = current.offset(file_delta, rank_delta) {
-            let target_bit = 1_u64 << target.0;
-            attacks |= target_bit;
-            if occupied & target_bit != 0 {
-                break;
-            }
-            current = target;
-        }
-    }
-    attacks
 }
 
 const fn build_step_attack_table(deltas: &[(i8, i8)]) -> [Bitboard; 64] {
