@@ -368,9 +368,15 @@ fn apply_feature_deltas(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
+        // SAFETY: the detected feature is available; feature indices address full
+        // `hidden`-length columns within `weights`, matched to the accumulator.
+        if is_x86_feature_detected!("avx512f") {
+            unsafe {
+                apply_feature_deltas_avx512(weights, hidden, accumulator, adds, subs);
+            }
+            return;
+        }
         if is_x86_feature_detected!("avx2") {
-            // SAFETY: avx2 is available; feature indices index full `hidden`-length
-            // columns within `weights`, matched to the accumulator length.
             unsafe {
                 apply_feature_deltas_avx2(weights, hidden, accumulator, adds, subs);
             }
@@ -393,6 +399,7 @@ fn apply_feature_deltas(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn apply_feature_deltas_avx2(
     weights: &[i16],
     hidden: usize,
@@ -429,6 +436,72 @@ unsafe fn apply_feature_deltas_avx2(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn apply_feature_deltas_avx512(
+    weights: &[i16],
+    hidden: usize,
+    accumulator: &mut [i32],
+    adds: &[usize],
+    subs: &[usize],
+) {
+    use core::arch::x86_64::*;
+    let chunks = hidden / 16;
+    let acc_ptr = accumulator.as_mut_ptr();
+    let weight_ptr = weights.as_ptr();
+    for chunk in 0..chunks {
+        let offset = chunk * 16;
+        let mut value = _mm512_loadu_si512(acc_ptr.add(offset) as *const __m512i);
+        for &feature in adds {
+            let column = _mm256_loadu_si256(weight_ptr.add(feature * hidden + offset) as *const __m256i);
+            value = _mm512_add_epi32(value, _mm512_cvtepi16_epi32(column));
+        }
+        for &feature in subs {
+            let column = _mm256_loadu_si256(weight_ptr.add(feature * hidden + offset) as *const __m256i);
+            value = _mm512_sub_epi32(value, _mm512_cvtepi16_epi32(column));
+        }
+        _mm512_storeu_si512(acc_ptr.add(offset) as *mut __m512i, value);
+    }
+    for index in (chunks * 16)..hidden {
+        let mut value = *accumulator.get_unchecked(index);
+        for &feature in adds {
+            value += i32::from(*weights.get_unchecked(feature * hidden + index));
+        }
+        for &feature in subs {
+            value -= i32::from(*weights.get_unchecked(feature * hidden + index));
+        }
+        *accumulator.get_unchecked_mut(index) = value;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn crelu_dot_avx512(activations: &[i32], weights: &[i16]) -> i32 {
+    use core::arch::x86_64::*;
+    let len = activations.len();
+    let chunks = len / 16;
+    let act_ptr = activations.as_ptr();
+    let weight_ptr = weights.as_ptr();
+    let zero = _mm512_setzero_si512();
+    let clip = _mm512_set1_epi32(ACTIVATION_CLIP);
+    let mut acc = _mm512_setzero_si512();
+    for chunk in 0..chunks {
+        let offset = chunk * 16;
+        let activation = _mm512_loadu_si512(act_ptr.add(offset) as *const __m512i);
+        let clipped = _mm512_min_epi32(_mm512_max_epi32(activation, zero), clip);
+        let widened =
+            _mm512_cvtepi16_epi32(_mm256_loadu_si256(weight_ptr.add(offset) as *const __m256i));
+        acc = _mm512_add_epi32(acc, _mm512_mullo_epi32(clipped, widened));
+    }
+    let mut sum = _mm512_reduce_add_epi32(acc);
+    for index in (chunks * 16)..len {
+        sum += clipped_relu(*activations.get_unchecked(index)) * i32::from(*weights.get_unchecked(index));
+    }
+    sum
+}
+
 fn accumulate_scalar(accumulator: &mut [i32], weights: &[i16], add: bool) {
     if add {
         for (value, weight) in accumulator.iter_mut().zip(weights) {
@@ -448,8 +521,11 @@ fn crelu_dot(activations: &[i32], weights: &[i16]) -> i32 {
     debug_assert_eq!(activations.len(), weights.len());
     #[cfg(target_arch = "x86_64")]
     {
+        // SAFETY: the detected feature is available and the slices share a length.
+        if is_x86_feature_detected!("avx512f") {
+            return unsafe { crelu_dot_avx512(activations, weights) };
+        }
         if is_x86_feature_detected!("avx2") {
-            // SAFETY: avx2 is available on this CPU and the slices share a length.
             return unsafe { crelu_dot_avx2(activations, weights) };
         }
     }
@@ -466,6 +542,7 @@ fn crelu_dot_scalar(activations: &[i32], weights: &[i16]) -> i32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn accumulate_avx2(accumulator: &mut [i32], weights: &[i16], add: bool) {
     use core::arch::x86_64::*;
     let len = accumulator.len();
@@ -497,6 +574,7 @@ unsafe fn accumulate_avx2(accumulator: &mut [i32], weights: &[i16], add: bool) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn crelu_dot_avx2(activations: &[i32], weights: &[i16]) -> i32 {
     use core::arch::x86_64::*;
     let len = activations.len();
