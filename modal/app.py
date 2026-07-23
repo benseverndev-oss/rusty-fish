@@ -500,10 +500,15 @@ def train_from_store(datasets: list[str], hidden: int, epochs: int, lr: float = 
 
 
 @app.function(timeout=60 * 60 * 8)
-def run_experiment(config: dict) -> dict:
+def run_experiment(config: dict, openings_pool: "list | None" = None) -> dict:
     """Train one net from the store, val-precheck it, gate it vs the champion, and
     return a structured result. Catches its own errors so a bad config becomes an
-    `error` row rather than sinking the whole sweep."""
+    `error` row rather than sinking the whole sweep.
+
+    `config["gpu"]` picks the trainer GPU tier at call time via `with_options`
+    (lever 4) — the sweep can run the whole cross-product on A100/H100 without a
+    second function definition. `openings_pool` is the sweep's shared opening set
+    (lever 1); when None the gate generates its own openings."""
     import math
     import re
 
@@ -514,7 +519,7 @@ def run_experiment(config: dict) -> dict:
         "elo": "NA", "decision": "error",
     }
     try:
-        net_bytes, val_loss = train_from_store.remote(
+        net_bytes, val_loss = train_from_store.with_options(gpu=config["gpu"]).remote(
             [config["dataset"]], config["hidden"], config["epochs"], config["lr"]
         )
         base["val_loss"] = val_loss
@@ -523,6 +528,7 @@ def run_experiment(config: dict) -> dict:
         verdict = gate_ladder_run.remote(
             net_bytes, config["gate_depth"], config["gate_plies"], config["move_time_ms"],
             config["gate_shard_size"], config["chunk_openings"], config["max_openings"],
+            openings_pool, config["prescreen_openings"], config["prescreen_floor"],
         )
         m = re.search(r"gate ladder: (\d+)W (\d+)D (\d+)L over (\d+) games .* decision (\w+)", verdict)
         if not m:
@@ -773,28 +779,61 @@ def nnue_gate_run(
 @app.function(image=rust_image, timeout=60 * 60)
 def gate_ladder_run(
     net_bytes: bytes, gate_depth: int, gate_plies: int, move_time_ms: int,
-    gate_shard_size: int, chunk_openings: int = 256, max_openings: int = 8192,
+    gate_shard_size: int, chunk_openings: int = 256, max_openings: int = 4096,
+    openings_pool: "list | None" = None, prescreen_openings: int = 512,
+    prescreen_floor: float = 0.45,
 ) -> str:
     """Sequential SPRT of a candidate net vs the bundled champion: play openings in
-    chunks, check the SPRT on the cumulative W/D/L after each, stop on a decision."""
+    chunks, check the SPRT on the cumulative W/D/L after each, stop on a decision.
+
+    Cost controls:
+    - `openings_pool` (lever 1): a pre-generated opening list to slice chunks from
+      instead of calling `make_openings` per chunk. A sweep generates one pool and
+      passes it to every config, so N configs no longer each spin N*chunks of
+      identical opening-gen containers — and, because every config is judged on the
+      SAME openings, their Elos become directly comparable. When None (a one-off
+      re-gate), openings are generated per chunk as before (seeded by chunk index).
+    - `prescreen_openings` / `prescreen_floor` (lever 2): once the prescreen budget
+      has been played, hard-reject a net whose score is below the floor before
+      spending the rest of the ladder on it. SPRT can dawdle near the H0 boundary;
+      a genuinely competitive net clears 0.45 with negligible false-reject risk at
+      >=512 games (a break-even net is ~0.50 +/- 0.022 there). Set floor <= 0 to
+      disable the prescreen.
+    - `max_openings` (lever 3): hard cap on openings played. The real waste is the
+      borderline net that sits between the SPRT's H0/H1 and so never decides; the
+      cap bounds that tail (now 4096 openings = 8192 games, down from 8192/16384)."""
     wins = draws = losses = 0
     played = 0
     decision = "Continue"
     chunk = 0
     while played < max_openings:
         chunk += 1
-        openings = [l for l in make_openings.remote(chunk_openings, gate_plies, chunk).splitlines() if l]
+        if openings_pool is not None:
+            # Slice the next sequential window from the shared pool (deterministic,
+            # identical across sweep configs). An empty window means the pool is
+            # exhausted before max_openings — stop cleanly.
+            openings = [l for l in openings_pool[played:played + chunk_openings] if l]
+        else:
+            openings = [l for l in make_openings.remote(chunk_openings, gate_plies, chunk).splitlines() if l]
         if not openings:
-            break  # no openings (e.g. chunk_openings=0) — never advances `played`; avoid an infinite loop
+            break  # no openings (empty pool / chunk_openings=0) — never advances `played`; avoid an infinite loop
         shard_texts = list(_chunks(openings, gate_shard_size))
         for w, d, l in gate_shard.starmap(
             [(net_bytes, gate_depth, text, move_time_ms, "champion") for text in shard_texts]
         ):
             wins += w; draws += d; losses += l
         played += len(openings)
+        total = wins + draws + losses
+        score = (wins + 0.5 * draws) / total if total else 0.0
+        # Stage 1 — cheap prescreen: fast-fail a clearly-below-champion net once the
+        # prescreen budget is in, so the full ladder is spent only on live candidates.
+        if prescreen_floor > 0 and played >= prescreen_openings and score < prescreen_floor:
+            decision = "PrescreenReject"
+            break
+        # Stage 2 — sequential SPRT vs champion. Defensively find the TSV values line:
+        # the last line whose final tab-field is a decision token (avoids off-by-one
+        # if stderr is empty).
         verdict = sprt_verdict.remote(wins, draws, losses)
-        # Defensively find the TSV values line: the last line whose final
-        # tab-field is a decision token (avoids off-by-one if stderr is empty).
         tokens = {"AcceptH0", "AcceptH1", "Continue"}
         decision = next(
             (ln.split("\t")[-1] for ln in reversed(verdict.splitlines())
@@ -873,12 +912,15 @@ def train_sf(
     hidden: int = 512,
     epochs: int = 60,
     chunk_openings: int = 256,
-    max_openings: int = 8192,
+    max_openings: int = 4096,
     gate_plies: int = 8,
     gate_depth: int = 64,        # high; movetime binds first
     gate_shard_size: int = 16,
     move_time_ms: int = 50,
     months: str = "",            # comma-sep subset (e.g. "2017-01,2017-02") for short runs; empty = all
+    gpu: str = "A10G",           # trainer tier (lever 4): pass A100-80GB / H100 for faster iteration
+    prescreen_openings: int = 512,
+    prescreen_floor: float = 0.45,
 ):
     """Train an NNUE on fixed-node Stockfish cp labels across many months, then
     gate it movetime-bounded via a sequential SPRT ladder.
@@ -912,14 +954,18 @@ def train_sf(
     # them), then train read-only over the whole dataset. A fully-labeled corpus
     # goes straight to training with zero Stockfish cost.
     ensure_sf_labels(corpus, per_game, nodes, shards_per_month)
-    net_bytes, val_loss = train_from_store.remote([_sf_dataset(nodes, per_game)], hidden, epochs)
+    net_bytes, val_loss = train_from_store.with_options(gpu=gpu).remote(
+        [_sf_dataset(nodes, per_game)], hidden, epochs)
     print(f"trained network: {len(net_bytes)} bytes, val_loss {val_loss:.6f}")
     import math
     if math.isnan(val_loss) or val_loss > 0.1:
         print(f"NNUE_LADDER_RESULT_BEGIN\nrejected: val_loss {val_loss} failed the pre-check\nNNUE_LADDER_RESULT_END")
     else:
+        # Single config, so no shared pool (None -> gate generates its own openings);
+        # the prescreen + tail cap still apply.
         print(gate_ladder_run.remote(net_bytes, gate_depth, gate_plies, move_time_ms,
-                                     gate_shard_size, chunk_openings, max_openings))
+                                     gate_shard_size, chunk_openings, max_openings,
+                                     None, prescreen_openings, prescreen_floor))
 
 
 @app.function(volumes={"/store": labels_volume})
@@ -956,7 +1002,7 @@ def gate_net(
 
 @app.local_entrypoint()
 def gate_ladder(gate_depth: int = 64, gate_plies: int = 8, move_time_ms: int = 50,
-                gate_shard_size: int = 16, chunk_openings: int = 256, max_openings: int = 8192):
+                gate_shard_size: int = 16, chunk_openings: int = 256, max_openings: int = 4096):
     """Re-run the sequential SPRT gate ladder on the stored net vs the bundled
     champion, without retraining.
 
@@ -995,23 +1041,33 @@ def sha_probe():
 def run_sweep(
     hs: list[int], es: list[int], ls: list[float], dataset: str,
     gate_depth: int, gate_plies: int, move_time_ms: int, gate_shard_size: int,
-    chunk_openings: int, max_openings: int,
+    chunk_openings: int, max_openings: int, gpu: str = "A10G",
+    prescreen_openings: int = 512, prescreen_floor: float = 0.45,
 ) -> str:
     """Server-side sweep orchestration: build the cross-product, run every experiment
     in parallel, append the ledger, return a sorted summary. Runs REMOTELY so a
     `--detach`ed sweep survives the client disconnecting (the client-side entrypoint
-    can die mid-run without losing the gather + ledger write)."""
+    can die mid-run without losing the gather + ledger write).
+
+    `gpu` sets the trainer tier for every config (lever 4). The opening pool is
+    generated ONCE here and shared across all configs (lever 1): it removes the
+    per-config opening-gen duplication and makes every config's gate use the same
+    openings, so their Elos are directly comparable."""
     import datetime
     import itertools
 
     configs = [
-        {"dataset": dataset, "hidden": h, "epochs": e, "lr": l,
+        {"dataset": dataset, "hidden": h, "epochs": e, "lr": l, "gpu": gpu,
          "gate_depth": gate_depth, "gate_plies": gate_plies, "move_time_ms": move_time_ms,
-         "gate_shard_size": gate_shard_size, "chunk_openings": chunk_openings, "max_openings": max_openings}
+         "gate_shard_size": gate_shard_size, "chunk_openings": chunk_openings, "max_openings": max_openings,
+         "prescreen_openings": prescreen_openings, "prescreen_floor": prescreen_floor}
         for h, e, l in itertools.product(hs, es, ls)
     ]
-    print(f"sweep: {len(configs)} experiments", flush=True)
-    results = list(run_experiment.starmap([(c,) for c in configs]))
+    # Lever 1: one opening pool for the whole sweep, sized to the gate's cap. Every
+    # config slices its chunks from this identical set instead of regenerating them.
+    openings_pool = [l for l in make_openings.remote(max_openings, gate_plies, 1).splitlines() if l]
+    print(f"sweep: {len(configs)} experiments on {gpu}, {len(openings_pool)} shared openings", flush=True)
+    results = list(run_experiment.starmap([(c, openings_pool) for c in configs]))
 
     sweep_id = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%S")
     ts = datetime.datetime.utcnow().isoformat()
@@ -1038,7 +1094,8 @@ def sweep(
     hiddens: str = "512", epochs_list: str = "60", lrs: str = "1e-3",
     dataset: str = "n100000-pg4", gate_depth: int = 64, gate_plies: int = 8,
     move_time_ms: int = 50, gate_shard_size: int = 16,
-    chunk_openings: int = 256, max_openings: int = 8192,
+    chunk_openings: int = 256, max_openings: int = 4096, gpu: str = "A10G",
+    prescreen_openings: int = 512, prescreen_floor: float = 0.45,
 ):
     """Sweep a cross-product of (hidden, epochs, lr) — train each from the store and
     gate it vs the champion, in parallel — appending the results to the ledger. The
@@ -1046,13 +1103,21 @@ def sweep(
     and retrieve the `SWEEP_RESULT` from `modal app logs` (or `::results`).
 
         modal run --detach modal/app.py::sweep --hiddens 256,512,1024 --epochs-list 40,80 --lrs 1e-3,5e-4
+
+    Gate-cost controls: `--gpu A100-80GB` (or `H100`) trains every config on a faster
+    tier (lever 4; the trainer is memory-bandwidth-bound, so a bigger GPU lifts the
+    ceiling for ~flat cost/run — benchmark one run to confirm before making it the
+    default). The gate shares one opening pool (lever 1), fast-fails clear losers at
+    `--prescreen-openings`/`--prescreen-floor` (lever 2), and caps the never-decide
+    tail at `--max-openings` (lever 3, default 4096 = 8192 games, was 8192/16384).
     """
     hs = [int(x) for x in hiddens.split(",") if x.strip()]
     es = [int(x) for x in epochs_list.split(",") if x.strip()]
     ls = [float(x) for x in lrs.split(",") if x.strip()]
     assert hs and es and ls, "each of --hiddens/--epochs-list/--lrs needs >=1 value"
     print(run_sweep.remote(hs, es, ls, dataset, gate_depth, gate_plies,
-                           move_time_ms, gate_shard_size, chunk_openings, max_openings))
+                           move_time_ms, gate_shard_size, chunk_openings, max_openings,
+                           gpu, prescreen_openings, prescreen_floor))
 
 
 @app.local_entrypoint()
