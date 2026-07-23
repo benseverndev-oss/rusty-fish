@@ -56,7 +56,7 @@ rust_image = (
 # Image B: GPU training image with PyTorch and the trainer script.
 torch_image = (
     modal.Image.debian_slim()
-    .pip_install("torch")
+    .pip_install("torch", "numpy")  # numpy: the store loader parses straight into np arrays
     .add_local_file(str(pathlib.Path(__file__).parent / "train_nnue.py"), "/root/train_nnue.py")
 )
 
@@ -573,7 +573,7 @@ def read_results() -> str:
         return handle.read()
 
 
-@app.function(image=rust_image, volumes={"/store": labels_volume}, timeout=60 * 60 * 4)
+@app.function(image=rust_image, volumes={"/store": labels_volume}, timeout=60 * 60 * 8)
 def label_public_run(url: str, max_positions: int, dataset: str) -> int:
     """Ingest a pre-evaluated public eval dataset (the lichess eval database, or any
     JSONL.zst with the same shape) into the store WITHOUT a Stockfish pass, using the
