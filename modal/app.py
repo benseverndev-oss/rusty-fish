@@ -481,14 +481,16 @@ def train_from_store(datasets: list[str], hidden: int, epochs: int, lr: float = 
         p for d in datasets for p in glob.glob(f"/store/sf/{d}/samples-*.tsv")
     )
     assert shard_paths, f"no shards found for datasets {datasets}"
-    data_path = "/tmp/data.tsv"  # ephemeral container disk, NOT the store
-    with open(data_path, "w", encoding="utf-8") as out:
-        for shard_path in shard_paths:
-            with open(shard_path, "r", encoding="utf-8") as handle:
-                for line in handle:
-                    out.write(line)
-    model, val_loss = train_nnue.train(
-        data_path, hidden, epochs, batch_size=1024, lr=lr, device="cuda", wdl_target=False
+    # Parse the shards straight into padded arrays, memoized on the store volume so
+    # every sweep config after the first skips the multi-minute reparse (and the
+    # multi-GB concat it used to do). The cache is keyed on the shard manifest and
+    # rebuilt whenever it changes; a stale/corrupt cache falls back to a fresh
+    # parse, so it can never feed the trainer the wrong corpus.
+    cache_dir = f"/store/sf/_cache/{'+'.join(sorted(datasets))}"
+    own_np, opp_np, target_np = train_nnue.load_corpus(shard_paths, cache_dir=cache_dir)
+    model, val_loss = train_nnue.train_arrays(
+        own_np, opp_np, target_np, hidden, epochs, batch_size=1024, lr=lr,
+        device="cuda", wdl_target=False,
     )
     os.makedirs("/store/nets", exist_ok=True)
     out_path = "/store/nets/latest.rfnn"

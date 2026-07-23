@@ -108,8 +108,152 @@ def _load_padded(path: str):
     return own[:write], opp[:write], targets[:write]
 
 
+def _load_padded_shards(shard_paths):
+    """Parse several gen-data TSV shards into one set of padded arrays.
+
+    Same preallocated in-place scatter as `_load_padded`, but over a list of shard
+    files, so the caller never has to concatenate them into one multi-GB temp file
+    first. Rows are kept in shard order (shards processed in the given order)."""
+    import numpy as np
+
+    total = 0
+    for path in shard_paths:
+        with open(path, "rb") as handle:
+            total += sum(1 for line in handle if line.strip())
+
+    own = np.full((total, MAX_FEATURES), PAD_INDEX, dtype=np.int32)
+    opp = np.full((total, MAX_FEATURES), PAD_INDEX, dtype=np.int32)
+    targets = np.empty(total, dtype=np.float32)
+
+    write = 0
+    for path in shard_paths:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                target_str, own_str, opp_str = line.split("\t")
+                own_feat = np.fromstring(own_str, dtype=np.int32, sep=",")
+                opp_feat = np.fromstring(opp_str, dtype=np.int32, sep=",")
+                if own_feat.size > MAX_FEATURES or opp_feat.size > MAX_FEATURES:
+                    continue
+                own[write, : own_feat.size] = own_feat
+                opp[write, : opp_feat.size] = opp_feat
+                targets[write] = float(target_str)
+                write += 1
+
+    if write < total:
+        dropped = total - write
+        print(
+            f"dropped {dropped} samples over MAX_FEATURES "
+            f"({100 * dropped / total:.4f}%)",
+            flush=True,
+        )
+    return own[:write], opp[:write], targets[:write]
+
+
+def _shard_manifest(shard_paths):
+    """A cache key identifying exactly these shard contents.
+
+    The store is append-only (shards are added, never rewritten in place), so a
+    shard's (full path, byte size) pins its content: if any shard is added, removed,
+    or changed, the manifest changes and the cache is rebuilt. The full path (not
+    the basename) keeps same-named shards in different datasets distinct."""
+    import os
+
+    return sorted(
+        (p, os.path.getsize(p)) for p in shard_paths
+    )
+
+
+def load_corpus(shard_paths, cache_dir=None):
+    """Parse `shard_paths` into padded arrays, memoized under `cache_dir`.
+
+    A sweep spins a fresh container per config, each re-parsing the same store
+    corpus from scratch. When `cache_dir` is given, the parsed arrays and the shard
+    manifest are written there on the first run; later runs whose manifest matches
+    load the arrays back (seconds) instead of re-parsing (minutes).
+
+    Safe by construction: the cache is used ONLY when its stored manifest exactly
+    matches the current shards, and ANY problem — missing files, manifest mismatch,
+    a read error — silently falls through to a fresh parse. A stale or corrupt cache
+    can never feed the trainer the wrong data; the worst case is re-parsing."""
+    import json
+    import os
+
+    import numpy as np
+
+    manifest = _shard_manifest(shard_paths)
+    own_path = opp_path = tgt_path = man_path = None
+    if cache_dir is not None:
+        own_path = os.path.join(cache_dir, "own.npy")
+        opp_path = os.path.join(cache_dir, "opp.npy")
+        tgt_path = os.path.join(cache_dir, "targets.npy")
+        man_path = os.path.join(cache_dir, "manifest.json")
+        # manifest.json is written LAST as a commit marker, so its presence with a
+        # matching payload means the three .npy files are complete and current.
+        if os.path.exists(man_path):
+            try:
+                with open(man_path, "r", encoding="utf-8") as handle:
+                    cached = [tuple(entry) for entry in json.load(handle)]
+                if cached == manifest:
+                    own = np.load(own_path, allow_pickle=False)
+                    opp = np.load(opp_path, allow_pickle=False)
+                    targets = np.load(tgt_path, allow_pickle=False)
+                    print(f"loaded parsed corpus from cache {cache_dir}", flush=True)
+                    return own, opp, targets
+            except Exception as error:  # noqa: BLE001 - cache is best-effort
+                print(f"cache miss ({error}); reparsing", flush=True)
+
+    own, opp, targets = _load_padded_shards(shard_paths)
+
+    if cache_dir is not None:
+        # Write each artifact to a private temp path and os.replace it into place:
+        # replace is atomic on one filesystem, so a reader (or a sibling sweep
+        # container writing the same deterministic bytes) never sees a torn file.
+        def atomic_save(path, arr):
+            tmp = f"{path}.tmp.{os.getpid()}"
+            with open(tmp, "wb") as handle:
+                np.save(handle, arr)
+            os.replace(tmp, path)
+
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            atomic_save(own_path, own)
+            atomic_save(opp_path, opp)
+            atomic_save(tgt_path, targets)
+            tmp_man = f"{man_path}.tmp.{os.getpid()}"
+            with open(tmp_man, "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            os.replace(tmp_man, man_path)  # commit marker, replaced last
+            print(f"wrote parsed corpus cache to {cache_dir}", flush=True)
+        except Exception as error:  # noqa: BLE001 - caching is an optimization only
+            print(f"could not write corpus cache ({error}); continuing", flush=True)
+
+    return own, opp, targets
+
+
 def train(
     data_path: str,
+    hidden: int,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    device: str,
+    wdl_target: bool = False,
+):
+    # Parse the TSV straight into preallocated padded matrices — over-MAX_FEATURES
+    # rows (a malformed FEN parsing into a >32-piece board) are dropped in place.
+    own_np, opp_np, target_np = _load_padded(data_path)
+    return train_arrays(
+        own_np, opp_np, target_np, hidden, epochs, batch_size, lr, device, wdl_target
+    )
+
+
+def train_arrays(
+    own_np,
+    opp_np,
+    target_np,
     hidden: int,
     epochs: int,
     batch_size: int,
@@ -120,11 +264,8 @@ def train(
     import torch
     from torch import nn
 
-    # Parse the TSV straight into preallocated padded matrices — over-MAX_FEATURES
-    # rows (a malformed FEN parsing into a >32-piece board) are dropped in place.
-    own_np, opp_np, target_np = _load_padded(data_path)
     if own_np.shape[0] == 0:
-        raise SystemExit(f"no training samples in {data_path}")
+        raise SystemExit("no training samples")
 
     own_t = torch.from_numpy(own_np).to(device)    # [N, 32] int32
     opp_t = torch.from_numpy(opp_np).to(device)
