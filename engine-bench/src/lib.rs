@@ -13,6 +13,7 @@ use engine_search::{
 use pgn_reader::shakmaty::{Chess, Position, uci::UciMove};
 use pgn_reader::{RawTag, Reader, SanPlus, Visitor};
 
+pub mod bench_harness;
 pub mod train;
 
 #[derive(Clone, Debug)]
