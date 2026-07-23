@@ -13,6 +13,11 @@ use engine_bench::{
     gen_eval_positions_from_reader, run_label_sf, run_label_fens,
     search_params_from_tsv, run_search_gate_fens,
 };
+use engine_bench::bench_harness::{
+    BenchCompareConfig, BenchReportConfig, BudgetMode, EngineConfig, bench_compare_tsv_report,
+    bench_full_report_text, bench_sweep_tsv_report, compare_openings, run_bench_compare,
+    run_bench_report, run_bench_sweep,
+};
 use engine_bench::train::{generate_training_samples, train_nnue, TrainConfig};
 use engine_search::{EvalParams, Nnue, SearchParams};
 
@@ -622,6 +627,62 @@ fn main() -> Result<(), String> {
         }
         return Ok(());
     }
+    // --- Rigorous A/B compare harness (equal-nodes, multi-TC, unified report) ---
+    // Each subcommand pits two `EngineConfig`s over color-swapped openings under a
+    // selectable budget. For now both configs are the default hand-crafted engine
+    // (a baseline-vs-baseline sanity check that must report ~0 Elo); a future
+    // learned-search toggle slots in as just another `EngineConfig`.
+    if std::env::args().nth(1).as_deref() == Some("bench-compare") {
+        // bench-compare <nodes|movetime|depth> <value> [openings] [max_plies]
+        let mode = parse_budget_mode(2, 3)?;
+        let openings = arg_u32(4).unwrap_or(16) as usize;
+        let max_plies = arg_u32(5).unwrap_or(120);
+        let candidate = EngineConfig::handcrafted("candidate");
+        let baseline = EngineConfig::handcrafted("baseline");
+        let fens = compare_openings(openings, BENCH_COMPARE_SEED);
+        let report = run_bench_compare(
+            &fens,
+            &candidate,
+            &baseline,
+            BenchCompareConfig { mode, max_plies, sprt: SprtConfig::default() },
+        )?;
+        print!("{}", bench_compare_tsv_report(&report));
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("bench-sweep") {
+        // bench-sweep [openings] [max_plies]: run the compare across several
+        // budgets so a change can be checked for time-control dependence.
+        let openings = arg_u32(2).unwrap_or(16) as usize;
+        let max_plies = arg_u32(3).unwrap_or(120);
+        let candidate = EngineConfig::handcrafted("candidate");
+        let baseline = EngineConfig::handcrafted("baseline");
+        let fens = compare_openings(openings, BENCH_COMPARE_SEED);
+        let modes = [
+            BudgetMode::Nodes(10_000),
+            BudgetMode::Nodes(50_000),
+            BudgetMode::Movetime(Duration::from_millis(20)),
+            BudgetMode::Movetime(Duration::from_millis(50)),
+        ];
+        let reports =
+            run_bench_sweep(&fens, &candidate, &baseline, &modes, max_plies, SprtConfig::default())?;
+        print!("{}", bench_sweep_tsv_report(&reports));
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("bench-report") {
+        // bench-report [openings] [max_plies]: the "evaluate under all axes" entry
+        // point — equal-nodes + equal-movetime matches, the multi-TC sweep, the
+        // tactical suite, and a throughput measurement, in one consolidated block.
+        let openings = arg_u32(2).unwrap_or(16) as usize;
+        let max_plies = arg_u32(3).unwrap_or(120);
+        let candidate = EngineConfig::handcrafted("candidate");
+        let baseline = EngineConfig::handcrafted("baseline");
+        let fens = compare_openings(openings, BENCH_COMPARE_SEED);
+        let mut config = BenchReportConfig::default();
+        config.max_plies = max_plies;
+        let report = run_bench_report(&fens, &candidate, &baseline, config)?;
+        print!("{}", bench_full_report_text(&report));
+        return Ok(());
+    }
 
     let samples = BENCHMARKS
         .iter()
@@ -629,6 +690,39 @@ fn main() -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()?;
     print!("{}", throughput_tsv_report(&samples));
     Ok(())
+}
+
+/// Fixed seed for the compare openings so a `bench-compare`/`-sweep`/`-report`
+/// run reproduces the same match given the same opening count.
+const BENCH_COMPARE_SEED: u64 = 0xB0BA_CAFE;
+
+/// Parses a `<nodes|movetime|depth> <value>` pair from the given argument
+/// indices into a [`BudgetMode`].
+fn parse_budget_mode(mode_index: usize, value_index: usize) -> Result<BudgetMode, String> {
+    let kind = std::env::args().nth(mode_index).ok_or_else(|| {
+        "usage: bench-compare <nodes|movetime|depth> <value> [openings] [max_plies]".to_string()
+    })?;
+    match kind.as_str() {
+        "nodes" => {
+            let value = arg_u64(value_index)
+                .ok_or_else(|| "bench-compare nodes <N>: missing node budget".to_string())?;
+            Ok(BudgetMode::Nodes(value))
+        }
+        "movetime" => {
+            let value = arg_u64(value_index)
+                .ok_or_else(|| "bench-compare movetime <MS>: missing movetime".to_string())?;
+            Ok(BudgetMode::Movetime(Duration::from_millis(value)))
+        }
+        "depth" => {
+            let value = arg_u32(value_index)
+                .and_then(|d| u8::try_from(d).ok())
+                .ok_or_else(|| "bench-compare depth <D>: missing/invalid depth".to_string())?;
+            Ok(BudgetMode::Depth(value))
+        }
+        other => Err(format!(
+            "unknown budget mode `{other}` (want nodes|movetime|depth)"
+        )),
+    }
 }
 
 fn arg_u32(index: usize) -> Option<u32> {
