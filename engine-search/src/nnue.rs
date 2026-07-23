@@ -92,9 +92,7 @@ impl Accumulator {
         let feature = feature_index(perspective, piece, square);
         let hidden = net.hidden;
         let column = &net.feature_weights[feature * hidden..feature * hidden + hidden];
-        for (value, weight) in self.perspective_mut(perspective).iter_mut().zip(column) {
-            *value += i32::from(*weight);
-        }
+        accumulate(self.perspective_mut(perspective), column, true);
     }
 
     /// Removes a piece's contribution from one perspective's accumulator. The
@@ -104,8 +102,44 @@ impl Accumulator {
         let feature = feature_index(perspective, piece, square);
         let hidden = net.hidden;
         let column = &net.feature_weights[feature * hidden..feature * hidden + hidden];
-        for (value, weight) in self.perspective_mut(perspective).iter_mut().zip(column) {
-            *value -= i32::from(*weight);
+        accumulate(self.perspective_mut(perspective), column, false);
+    }
+
+    /// Applies a batch of square changes to both perspectives in a single fused
+    /// pass each: every accumulator lane is read and written once no matter how
+    /// many features the move touched. Each change is `(square, removed, added)`
+    /// — the piece leaving the square (subtracted) and the piece arriving (added).
+    /// The search drives make with `(square, old, new)` and unmake with the pair
+    /// swapped. Bit-exact with repeated [`Accumulator::add_feature`]/
+    /// [`Accumulator::remove_feature`] calls.
+    pub fn apply_changes(
+        &mut self,
+        net: &Nnue,
+        changes: &[(Square, Option<Piece>, Option<Piece>)],
+    ) {
+        let hidden = net.hidden;
+        for perspective in [Color::White, Color::Black] {
+            let mut adds = [0usize; 4];
+            let mut add_count = 0;
+            let mut subs = [0usize; 4];
+            let mut sub_count = 0;
+            for &(square, removed, added) in changes {
+                if let Some(piece) = removed {
+                    subs[sub_count] = feature_index(perspective, piece, square);
+                    sub_count += 1;
+                }
+                if let Some(piece) = added {
+                    adds[add_count] = feature_index(perspective, piece, square);
+                    add_count += 1;
+                }
+            }
+            apply_feature_deltas(
+                &net.feature_weights,
+                hidden,
+                self.perspective_mut(perspective),
+                &adds[..add_count],
+                &subs[..sub_count],
+            );
         }
     }
 
@@ -158,12 +192,8 @@ impl Nnue {
             Color::Black => (&accumulator.black, &accumulator.white),
         };
         let mut output = self.output_bias;
-        for (activation, weight) in own.iter().zip(&self.output_weights[..self.hidden]) {
-            output += clipped_relu(*activation) * i32::from(*weight);
-        }
-        for (activation, weight) in opponent.iter().zip(&self.output_weights[self.hidden..]) {
-            output += clipped_relu(*activation) * i32::from(*weight);
-        }
+        output += crelu_dot(own, &self.output_weights[..self.hidden]);
+        output += crelu_dot(opponent, &self.output_weights[self.hidden..]);
         (output / OUTPUT_SCALE).clamp(-EVAL_CLAMP, EVAL_CLAMP)
     }
 
@@ -294,6 +324,285 @@ pub fn bundled_network() -> Arc<Nnue> {
 
 fn clipped_relu(value: i32) -> i32 {
     value.clamp(0, ACTIVATION_CLIP)
+}
+
+// --- Vectorised inner loops -------------------------------------------------
+//
+// The feature-transformer update and the output dot product are the hot per-node
+// cost of NNUE evaluation. Both fold i16 weights into i32 sums, and because each
+// term cannot overflow i32 (a clipped activation is at most 127 and a weight fits
+// i16), the running sum is order-independent modulo 2^32. That makes the AVX2
+// paths *bit-exact* to the scalar ones — the incremental-vs-refresh and
+// forward-determinism tests hold them to it. AVX2 is chosen at runtime; every
+// other target (and any non-AVX2 x86) uses the scalar fallback.
+
+/// Adds (`add`) or subtracts the i16 `weights` column into the i32 `accumulator`,
+/// lane for lane. `accumulator` and `weights` must have equal length.
+#[inline]
+fn accumulate(accumulator: &mut [i32], weights: &[i16], add: bool) {
+    debug_assert_eq!(accumulator.len(), weights.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 is available on this CPU and the slices share a length.
+            unsafe {
+                accumulate_avx2(accumulator, weights, add);
+            }
+            return;
+        }
+    }
+    accumulate_scalar(accumulator, weights, add);
+}
+
+/// Applies several feature columns to one accumulator in a single fused pass:
+/// `add` columns are summed in, `sub` columns subtracted. Fusing keeps the
+/// accumulator resident (one load + one store per lane) instead of re-streaming
+/// it once per feature. `adds`/`subs` hold feature indices into `weights`.
+#[inline]
+fn apply_feature_deltas(
+    weights: &[i16],
+    hidden: usize,
+    accumulator: &mut [i32],
+    adds: &[usize],
+    subs: &[usize],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: the detected feature is available; feature indices address full
+        // `hidden`-length columns within `weights`, matched to the accumulator.
+        if is_x86_feature_detected!("avx512f") {
+            unsafe {
+                apply_feature_deltas_avx512(weights, hidden, accumulator, adds, subs);
+            }
+            return;
+        }
+        if is_x86_feature_detected!("avx2") {
+            unsafe {
+                apply_feature_deltas_avx2(weights, hidden, accumulator, adds, subs);
+            }
+            return;
+        }
+    }
+    for &feature in adds {
+        let column = &weights[feature * hidden..feature * hidden + hidden];
+        for (value, weight) in accumulator.iter_mut().zip(column) {
+            *value += i32::from(*weight);
+        }
+    }
+    for &feature in subs {
+        let column = &weights[feature * hidden..feature * hidden + hidden];
+        for (value, weight) in accumulator.iter_mut().zip(column) {
+            *value -= i32::from(*weight);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn apply_feature_deltas_avx2(
+    weights: &[i16],
+    hidden: usize,
+    accumulator: &mut [i32],
+    adds: &[usize],
+    subs: &[usize],
+) {
+    use core::arch::x86_64::*;
+    let chunks = hidden / 8;
+    let acc_ptr = accumulator.as_mut_ptr();
+    let weight_ptr = weights.as_ptr();
+    for chunk in 0..chunks {
+        let offset = chunk * 8;
+        let mut value = _mm256_loadu_si256(acc_ptr.add(offset) as *const __m256i);
+        for &feature in adds {
+            let column = _mm_loadu_si128(weight_ptr.add(feature * hidden + offset) as *const __m128i);
+            value = _mm256_add_epi32(value, _mm256_cvtepi16_epi32(column));
+        }
+        for &feature in subs {
+            let column = _mm_loadu_si128(weight_ptr.add(feature * hidden + offset) as *const __m128i);
+            value = _mm256_sub_epi32(value, _mm256_cvtepi16_epi32(column));
+        }
+        _mm256_storeu_si256(acc_ptr.add(offset) as *mut __m256i, value);
+    }
+    for index in (chunks * 8)..hidden {
+        let mut value = *accumulator.get_unchecked(index);
+        for &feature in adds {
+            value += i32::from(*weights.get_unchecked(feature * hidden + index));
+        }
+        for &feature in subs {
+            value -= i32::from(*weights.get_unchecked(feature * hidden + index));
+        }
+        *accumulator.get_unchecked_mut(index) = value;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn apply_feature_deltas_avx512(
+    weights: &[i16],
+    hidden: usize,
+    accumulator: &mut [i32],
+    adds: &[usize],
+    subs: &[usize],
+) {
+    use core::arch::x86_64::*;
+    let chunks = hidden / 16;
+    let acc_ptr = accumulator.as_mut_ptr();
+    let weight_ptr = weights.as_ptr();
+    for chunk in 0..chunks {
+        let offset = chunk * 16;
+        let mut value = _mm512_loadu_si512(acc_ptr.add(offset) as *const __m512i);
+        for &feature in adds {
+            let column = _mm256_loadu_si256(weight_ptr.add(feature * hidden + offset) as *const __m256i);
+            value = _mm512_add_epi32(value, _mm512_cvtepi16_epi32(column));
+        }
+        for &feature in subs {
+            let column = _mm256_loadu_si256(weight_ptr.add(feature * hidden + offset) as *const __m256i);
+            value = _mm512_sub_epi32(value, _mm512_cvtepi16_epi32(column));
+        }
+        _mm512_storeu_si512(acc_ptr.add(offset) as *mut __m512i, value);
+    }
+    for index in (chunks * 16)..hidden {
+        let mut value = *accumulator.get_unchecked(index);
+        for &feature in adds {
+            value += i32::from(*weights.get_unchecked(feature * hidden + index));
+        }
+        for &feature in subs {
+            value -= i32::from(*weights.get_unchecked(feature * hidden + index));
+        }
+        *accumulator.get_unchecked_mut(index) = value;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn crelu_dot_avx512(activations: &[i32], weights: &[i16]) -> i32 {
+    use core::arch::x86_64::*;
+    let len = activations.len();
+    let chunks = len / 16;
+    let act_ptr = activations.as_ptr();
+    let weight_ptr = weights.as_ptr();
+    let zero = _mm512_setzero_si512();
+    let clip = _mm512_set1_epi32(ACTIVATION_CLIP);
+    let mut acc = _mm512_setzero_si512();
+    for chunk in 0..chunks {
+        let offset = chunk * 16;
+        let activation = _mm512_loadu_si512(act_ptr.add(offset) as *const __m512i);
+        let clipped = _mm512_min_epi32(_mm512_max_epi32(activation, zero), clip);
+        let widened =
+            _mm512_cvtepi16_epi32(_mm256_loadu_si256(weight_ptr.add(offset) as *const __m256i));
+        acc = _mm512_add_epi32(acc, _mm512_mullo_epi32(clipped, widened));
+    }
+    let mut sum = _mm512_reduce_add_epi32(acc);
+    for index in (chunks * 16)..len {
+        sum += clipped_relu(*activations.get_unchecked(index)) * i32::from(*weights.get_unchecked(index));
+    }
+    sum
+}
+
+fn accumulate_scalar(accumulator: &mut [i32], weights: &[i16], add: bool) {
+    if add {
+        for (value, weight) in accumulator.iter_mut().zip(weights) {
+            *value += i32::from(*weight);
+        }
+    } else {
+        for (value, weight) in accumulator.iter_mut().zip(weights) {
+            *value -= i32::from(*weight);
+        }
+    }
+}
+
+/// Clipped-ReLU dot product: `sum(clip(activation) * weight)` over equal-length
+/// slices, returning the i32 sum (wrapping, matching the scalar accumulation).
+#[inline]
+fn crelu_dot(activations: &[i32], weights: &[i16]) -> i32 {
+    debug_assert_eq!(activations.len(), weights.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: the detected feature is available and the slices share a length.
+        if is_x86_feature_detected!("avx512f") {
+            return unsafe { crelu_dot_avx512(activations, weights) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { crelu_dot_avx2(activations, weights) };
+        }
+    }
+    crelu_dot_scalar(activations, weights)
+}
+
+fn crelu_dot_scalar(activations: &[i32], weights: &[i16]) -> i32 {
+    let mut sum = 0i32;
+    for (activation, weight) in activations.iter().zip(weights) {
+        sum += clipped_relu(*activation) * i32::from(*weight);
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn accumulate_avx2(accumulator: &mut [i32], weights: &[i16], add: bool) {
+    use core::arch::x86_64::*;
+    let len = accumulator.len();
+    let chunks = len / 8;
+    let acc_ptr = accumulator.as_mut_ptr();
+    let weight_ptr = weights.as_ptr();
+    for chunk in 0..chunks {
+        let offset = chunk * 8;
+        let acc = _mm256_loadu_si256(acc_ptr.add(offset) as *const __m256i);
+        // Load 8 i16 weights and sign-extend them to 8 i32 lanes.
+        let widened = _mm256_cvtepi16_epi32(_mm_loadu_si128(weight_ptr.add(offset) as *const __m128i));
+        let updated = if add {
+            _mm256_add_epi32(acc, widened)
+        } else {
+            _mm256_sub_epi32(acc, widened)
+        };
+        _mm256_storeu_si256(acc_ptr.add(offset) as *mut __m256i, updated);
+    }
+    for index in (chunks * 8)..len {
+        let weight = i32::from(*weights.get_unchecked(index));
+        let value = accumulator.get_unchecked_mut(index);
+        if add {
+            *value += weight;
+        } else {
+            *value -= weight;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn crelu_dot_avx2(activations: &[i32], weights: &[i16]) -> i32 {
+    use core::arch::x86_64::*;
+    let len = activations.len();
+    let chunks = len / 8;
+    let act_ptr = activations.as_ptr();
+    let weight_ptr = weights.as_ptr();
+    let zero = _mm256_setzero_si256();
+    let clip = _mm256_set1_epi32(ACTIVATION_CLIP);
+    let mut acc = _mm256_setzero_si256();
+    for chunk in 0..chunks {
+        let offset = chunk * 8;
+        let activation = _mm256_loadu_si256(act_ptr.add(offset) as *const __m256i);
+        let clipped = _mm256_min_epi32(_mm256_max_epi32(activation, zero), clip);
+        let widened = _mm256_cvtepi16_epi32(_mm_loadu_si128(weight_ptr.add(offset) as *const __m128i));
+        let product = _mm256_mullo_epi32(clipped, widened);
+        acc = _mm256_add_epi32(acc, product);
+    }
+    // Horizontal sum of the eight i32 lanes.
+    let low = _mm256_castsi256_si128(acc);
+    let high = _mm256_extracti128_si256(acc, 1);
+    let mut summed = _mm_add_epi32(low, high);
+    summed = _mm_hadd_epi32(summed, summed);
+    summed = _mm_hadd_epi32(summed, summed);
+    let mut sum = _mm_cvtsi128_si32(summed);
+    for index in (chunks * 8)..len {
+        sum += clipped_relu(*activations.get_unchecked(index)) * i32::from(*weights.get_unchecked(index));
+    }
+    sum
 }
 
 /// Minimal cursor over a byte slice for the little-endian loader.

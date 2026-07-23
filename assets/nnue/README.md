@@ -6,23 +6,26 @@ A `768 → 1024 → 1` side-to-move-relative perspective network in the quantise
 `RFNN` format (magic / version / hidden / feature-weights i16 / feature-bias i16 /
 output-weights i16 / output-bias i32), 1,579,024 bytes, hidden 1024.
 
-**Training:** distilled from a Stockfish teacher. ~3M middlegame positions were
-sampled from six months of 2200+-rated Lichess games (2017-01 … 2017-06) and each
-was labelled with Stockfish's centipawn evaluation from a fixed 100,000-node
-search (the `train_sf` / label-store pipeline: `gen-eval-positions` → `label-sf` →
-cp-mode training), trained hidden 1024 for 240 epochs.
+**Training:** distilled from a Stockfish teacher. **~16M** middlegame positions
+were sampled from **~20 months** of 2200+-rated Lichess games (2017-01 … 2018-11
+plus partial later months) and each was labelled with Stockfish's centipawn
+evaluation from a fixed 100,000-node search (the `label_sf` / persistent
+label-store pipeline: `gen-eval-positions` → `label-sf` → cp-mode training),
+trained hidden 1024 for 160 epochs (converged; val-loss flat from ~epoch 145).
 
-**Strength:** found by an experiment-harness epoch sweep over the persistent SF
-labels and gated at **+~48–54 Elo, SPRT AcceptH1** (movetime-bounded self-play)
-against the previous champion — the hidden-1024 / 120-epoch net (itself +~50 vs the
-hidden-512 / 60-epoch net, which was +8.0 vs the tuned hand-crafted eval). The gain
-came from *training longer still* (120 → 240 epochs): the epoch-plateau sweep found
-240 is the sweet spot — 480 epochs has a lower val-loss but plays ~18 Elo weaker
-(overtraining, where val-loss and real play strength diverge, so the self-play gate,
-not the loss, is the acceptance test). Width is settled at 1024 (1536 is slower and
-gates worse under equal wall-clock). This net was re-trained cleanly at 1024/240 and
-confirmed with a decisive movetime gate (690W 367D 479L over 1536 games, AcceptH1).
-It is bundled
+**Strength:** the **data-scale** lever. Scaling the SF-label corpus ~5× (the ~3M
+six-month set → ~16M across ~20 months) and re-training 1024 produced a net gated
+at **+45.3 Elo, SPRT AcceptH1** (689W 357D 490L over 1536 games, movetime-bounded
+self-play) against the previous champion — the hidden-1024 / 240-epoch net on the
+~3M corpus (itself +~48–54 over the 120-epoch net, … +8.0 over the tuned
+hand-crafted eval). Width stays 1024 and epochs 160 (converged; the earlier
+epoch-plateau sweep settled 240 as the ceiling for the 3M set, and 160 reaches the
+same converged val-loss on the larger corpus). A head-to-head control confirmed the
+gain is real and *data-targeted*: a 5M-position net trained the same way on the
+public **lichess eval database** (deeper Stockfish evals, but an endgame/mate-heavy
+position mix) gated at **−159.7 Elo, AcceptH0** — position distribution, not eval
+depth, is what matters, and the self-labeled middlegame sampling is well-matched to
+gameplay. It is bundled
 into the binary (`include_bytes!`) and installed as the default eval; the
 hand-crafted evaluation remains reachable via `UseNNUE false` (UCI) or
 `set_nnue(None)` (library). The engine reads `hidden` from the RFNN header, so the

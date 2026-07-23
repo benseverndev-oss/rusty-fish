@@ -502,6 +502,9 @@ pub struct Searcher {
     nnue: Option<Arc<Nnue>>,
     nnue_accumulator: Option<nnue::Accumulator>,
     nnue_stack: Vec<NnueDelta>,
+    /// Reused scratch for move ordering: `(score, move)` pairs sorted per node,
+    /// kept across calls so ordering never heap-allocates in the hot loop.
+    move_order_scratch: Vec<(i32, ChessMove)>,
     opening_book: Option<OpeningBook>,
     syzygy: Option<SyzygyTablebases>,
 }
@@ -538,6 +541,7 @@ impl Default for Searcher {
             nnue: Some(bundled_network()),
             nnue_accumulator: None,
             nnue_stack: Vec::new(),
+            move_order_scratch: Vec::new(),
             opening_book: None,
             syzygy: None,
         }
@@ -822,6 +826,7 @@ impl Searcher {
             nnue,
             nnue_accumulator: None,
             nnue_stack: Vec::new(),
+            move_order_scratch: Vec::new(),
             opening_book: None,
             syzygy: None,
         }
@@ -1066,15 +1071,24 @@ impl Searcher {
             if self.stopped {
                 return (score, pv);
             }
+            // A fully open window can't fail, so its result is final. Accepting it
+            // here guarantees termination when a pathological eval keeps failing
+            // the aspiration window (and avoids the widening arithmetic below ever
+            // needing to grow past the mate range). Normal searches never widen
+            // this far, so their behaviour is unchanged. `saturating_*` keeps the
+            // doubling from overflowing i32 on the way there.
+            if alpha <= -MATE_SCORE && beta >= MATE_SCORE {
+                return (score, pv);
+            }
             if score <= alpha {
-                window *= 2;
+                window = window.saturating_mul(2);
                 alpha = (previous_score - window).max(-MATE_SCORE);
-                beta = (alpha + window * 2).min(MATE_SCORE);
+                beta = alpha.saturating_add(window.saturating_mul(2)).min(MATE_SCORE);
                 continue;
             }
             if score >= beta {
-                window *= 2;
-                alpha = (beta - window * 2).max(-MATE_SCORE);
+                window = window.saturating_mul(2);
+                alpha = beta.saturating_sub(window.saturating_mul(2)).max(-MATE_SCORE);
                 beta = (previous_score + window).min(MATE_SCORE);
                 continue;
             }
@@ -1490,17 +1504,11 @@ impl Searcher {
             if old == new {
                 continue;
             }
-            if let Some(piece) = old {
-                accumulator.remove_feature(&nnue, Color::White, piece, square);
-                accumulator.remove_feature(&nnue, Color::Black, piece, square);
-            }
-            if let Some(piece) = new {
-                accumulator.add_feature(&nnue, Color::White, piece, square);
-                accumulator.add_feature(&nnue, Color::Black, piece, square);
-            }
             delta.changes[delta.len] = (square, old, new);
             delta.len += 1;
         }
+        // One fused pass per perspective: remove the old piece, add the new one.
+        accumulator.apply_changes(&nnue, &delta.changes[..delta.len]);
         self.nnue_stack.push(delta);
         undo
     }
@@ -1518,31 +1526,39 @@ impl Searcher {
             .nnue_accumulator
             .as_mut()
             .expect("nnue accumulator is initialised while a network is loaded");
-        for &(square, old, new) in delta.changes.iter().take(delta.len) {
-            // Reverse of nnue_make: we removed `old` and added `new`, so now
-            // remove `new` and restore `old`.
-            if let Some(piece) = new {
-                accumulator.remove_feature(&nnue, Color::White, piece, square);
-                accumulator.remove_feature(&nnue, Color::Black, piece, square);
-            }
-            if let Some(piece) = old {
-                accumulator.add_feature(&nnue, Color::White, piece, square);
-                accumulator.add_feature(&nnue, Color::Black, piece, square);
-            }
+        // Reverse of nnue_make: swap each change so the added piece is removed
+        // and the old piece restored, then apply in one fused pass per perspective.
+        let mut reversed = [(Square(0), None, None); 4];
+        for (slot, &(square, old, new)) in reversed.iter_mut().zip(delta.changes.iter()).take(delta.len) {
+            *slot = (square, new, old);
         }
+        accumulator.apply_changes(&nnue, &reversed[..delta.len]);
     }
 
     fn order_moves(
-        &self,
+        &mut self,
         board: &Board,
         moves: &mut [ChessMove],
         ply: usize,
         tt_move: Option<ChessMove>,
         counter_move: Option<ChessMove>,
     ) {
-        moves.sort_by_cached_key(|mv| {
-            -self.move_order_score(board, *mv, ply, tt_move, counter_move)
-        });
+        // Score each move once into a reused buffer, then sort descending. A
+        // stable sort keyed on the negated score matches the previous
+        // `sort_by_cached_key` ordering exactly (equal scores keep move order),
+        // but reuses one heap allocation across the whole search instead of one
+        // per node.
+        let mut scratch = std::mem::take(&mut self.move_order_scratch);
+        scratch.clear();
+        for &mv in moves.iter() {
+            let score = self.move_order_score(board, mv, ply, tt_move, counter_move);
+            scratch.push((score, mv));
+        }
+        scratch.sort_by(|left, right| right.0.cmp(&left.0));
+        for (slot, entry) in moves.iter_mut().zip(scratch.iter()) {
+            *slot = entry.1;
+        }
+        self.move_order_scratch = scratch;
     }
 
     fn move_order_score(
@@ -1798,43 +1814,112 @@ fn root_tablebase_search_result(root: SyzygyRootProbe) -> SearchResult {
     }
 }
 
+/// Static exchange evaluation via the standard iterative swap-off algorithm on
+/// attacker bitboards — no board clone, no move generation, no recursion. Returns
+/// the centipawn material swing of playing the capture `mv`, assuming each side
+/// always recaptures with its least valuable attacker (revealing x-ray sliders as
+/// pieces leave). Non-captures return 0. Runs in O(number of attackers) using the
+/// core's precomputed attack tables.
 fn static_exchange_evaluation(board: &Board, mv: ChessMove) -> i32 {
-    let captured_value = board.piece_at(mv.to).map(piece_value).unwrap_or_else(|| {
-        if board.en_passant() == Some(mv.to) {
-            piece_kind_value(PieceKind::Pawn)
-        } else {
-            0
-        }
-    });
-    if captured_value == 0 {
+    const KINDS: [PieceKind; 6] = [
+        PieceKind::Pawn,
+        PieceKind::Knight,
+        PieceKind::Bishop,
+        PieceKind::Rook,
+        PieceKind::Queen,
+        PieceKind::King,
+    ];
+
+    let target = mv.to;
+    let Some(mover) = board.piece_at(mv.from) else {
         return 0;
+    };
+
+    let mut occupied = board.all_occupancy();
+    let captured_value = if let Some(victim) = board.piece_at(target) {
+        piece_value(victim)
+    } else if mover.kind == PieceKind::Pawn && board.en_passant() == Some(target) {
+        // En passant: the captured pawn sits beside the target, not on it.
+        if let Some(cap_sq) = Square::from_file_rank(target.file(), mv.from.rank()) {
+            occupied &= !(1u64 << cap_sq.0);
+        }
+        piece_kind_value(PieceKind::Pawn)
+    } else {
+        return 0; // not a capture — nothing to exchange
+    };
+
+    let diagonal_sliders = board.pieces(Color::White, PieceKind::Bishop)
+        | board.pieces(Color::Black, PieceKind::Bishop)
+        | board.pieces(Color::White, PieceKind::Queen)
+        | board.pieces(Color::Black, PieceKind::Queen);
+    let straight_sliders = board.pieces(Color::White, PieceKind::Rook)
+        | board.pieces(Color::Black, PieceKind::Rook)
+        | board.pieces(Color::White, PieceKind::Queen)
+        | board.pieces(Color::Black, PieceKind::Queen);
+
+    // The initial attacker vacates its origin square.
+    occupied &= !(1u64 << mv.from.0);
+    let mut attackers = board.attackers_to(target, occupied) & occupied;
+
+    let mut gain = [0i32; 32];
+    gain[0] = captured_value;
+    let mut on_target_value = piece_value(mover); // piece now standing on the target
+    let mut side = mover.color.opposite(); // side to recapture next
+    let mut depth = 0usize;
+
+    loop {
+        depth += 1;
+        gain[depth] = on_target_value - gain[depth - 1];
+
+        // Pick the least valuable attacker of the side to move.
+        let side_attackers = attackers & board.occupancy(side);
+        if side_attackers == 0 {
+            break;
+        }
+        let mut lva_bit = 0u64;
+        let mut lva_kind = PieceKind::King;
+        for kind in KINDS {
+            let set = side_attackers & board.pieces(side, kind);
+            if set != 0 {
+                lva_bit = set & set.wrapping_neg();
+                lva_kind = kind;
+                break;
+            }
+        }
+        // A king may only capture when the opponent has no attacker left, else it
+        // would move into check — that recapture is illegal, so the swap stops.
+        if lva_kind == PieceKind::King
+            && (attackers & board.occupancy(side.opposite())) & !lva_bit != 0
+        {
+            break;
+        }
+
+        on_target_value = piece_kind_value(lva_kind);
+        occupied &= !lva_bit;
+        if matches!(
+            lva_kind,
+            PieceKind::Pawn | PieceKind::Bishop | PieceKind::Queen
+        ) {
+            attackers |= engine_core::bishop_attacks(target, occupied) & diagonal_sliders;
+        }
+        if matches!(lva_kind, PieceKind::Rook | PieceKind::Queen) {
+            attackers |= engine_core::rook_attacks(target, occupied) & straight_sliders;
+        }
+        attackers &= occupied;
+
+        if depth + 1 >= gain.len() {
+            break;
+        }
+        side = side.opposite();
     }
 
-    let mut after_capture = board.clone();
-    if after_capture.make_move(mv).is_err() {
-        return -MATE_SCORE;
+    // Resolve the swap stack back to the root: each side stops capturing once the
+    // exchange stops being favourable.
+    while depth > 1 {
+        depth -= 1;
+        gain[depth - 1] = -(-gain[depth - 1]).max(gain[depth]);
     }
-    captured_value - best_exchange_gain(&mut after_capture, mv.to)
-}
-
-fn best_exchange_gain(board: &mut Board, target: engine_core::Square) -> i32 {
-    let mut best_gain = 0;
-    let recaptures = board
-        .generate_capture_moves()
-        .into_iter()
-        .filter(|mv| mv.to == target)
-        .collect::<Vec<_>>();
-
-    for recapture in recaptures {
-        let captured_value = board.piece_at(target).map(piece_value).unwrap_or_default();
-        let undo = board
-            .make_move(recapture)
-            .expect("generated capture must be legal");
-        let gain = captured_value - best_exchange_gain(board, target);
-        board.unmake_move(recapture, undo);
-        best_gain = best_gain.max(gain);
-    }
-    best_gain
+    gain[0]
 }
 
 fn piece_kind_value(kind: PieceKind) -> i32 {

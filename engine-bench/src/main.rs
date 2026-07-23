@@ -10,7 +10,8 @@ use engine_bench::{
     run_spsa_campaign, run_tactical_suite,
     spsa_tsv_report, sprt, sprt_tsv_report, summarize, tactical_tsv_report, throughput_tsv_report,
     gen_wdl_data_samples_from_reader, WdlSampleConfig,
-    gen_eval_positions_from_reader, run_label_sf,
+    gen_eval_positions_from_reader, run_label_sf, run_label_fens,
+    search_params_from_tsv, run_search_gate_fens,
 };
 use engine_bench::train::{generate_training_samples, train_nnue, TrainConfig};
 use engine_search::{EvalParams, Nnue, SearchParams};
@@ -69,9 +70,63 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
     if std::env::args().nth(1).as_deref() == Some("external-sprt") {
-        let config = ExternalMatchConfig::default();
-        let records = run_external_opponent_match(EXTERNAL_SPRT_POSITIONS, &config)?;
+        // external-sprt [--opponent-elo N] [--openings N] [--movetime MS]:
+        // play the bundled-net engine vs the external UCI opponent
+        // (RUSTY_FISH_EXTERNAL_UCI), both colours per opening. --opponent-elo
+        // weakens the opponent via UCI_LimitStrength to find the strength
+        // crossover; --openings N uses N generated openings instead of the fixed
+        // suite (more games = tighter estimate); --movetime sets both sides' budget.
+        let mut config = ExternalMatchConfig::default();
+        let mut openings: Option<usize> = None;
+        let mut args = std::env::args().skip(2);
+        while let Some(arg) = args.next() {
+            let mut value = || {
+                args.next()
+                    .ok_or_else(|| format!("{arg} needs a value"))
+            };
+            match arg.as_str() {
+                "--opponent-elo" => {
+                    config.opponent_elo = Some(value()?.parse::<u32>().map_err(|_| "invalid --opponent-elo".to_string())?);
+                }
+                "--openings" => {
+                    openings = Some(value()?.parse::<usize>().map_err(|_| "invalid --openings".to_string())?);
+                }
+                "--movetime" => {
+                    let ms = value()?.parse::<u64>().map_err(|_| "invalid --movetime".to_string())?;
+                    config.candidate_movetime = std::time::Duration::from_millis(ms);
+                    config.opponent_movetime = std::time::Duration::from_millis(ms);
+                }
+                other => return Err(format!("unexpected argument: {other}")),
+            }
+        }
+        // Own the FENs (generated or the fixed suite) so `&[&str]` refs stay valid.
+        let owned: Vec<String> = match openings {
+            Some(count) => random_opening_fens(count, 8, 0x5EED),
+            None => EXTERNAL_SPRT_POSITIONS.iter().map(|s| s.to_string()).collect(),
+        };
+        let positions: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let records = run_external_opponent_match(&positions, &config)?;
         eprint!("{}", external_tsv_report(&records, &config));
+        print!("{}", sprt_tsv_report(summarize(&records), SprtConfig::default()));
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("search-gate") {
+        // search-gate <tuned_tsv_file> [openings] [depth]: out-of-sample validation
+        // for a SPSA-tuned SearchParams — play the tuned params vs the default over
+        // freshly generated openings (both colours) and emit an SPRT verdict. The
+        // tuned TSV is the 8-value search-param vector (the last row of `spsa`).
+        // Honours RUSTY_FISH_SPSA_NNUE (tune/validate against the shipped NNUE eval).
+        let tuned_path = std::env::args()
+            .nth(2)
+            .ok_or_else(|| "usage: search-gate <tuned_tsv_file> [openings] [depth]".to_string())?;
+        let openings = std::env::args().nth(3).and_then(|arg| arg.parse::<usize>().ok()).unwrap_or(64);
+        let depth = std::env::args().nth(4).and_then(|arg| arg.parse::<u8>().ok()).unwrap_or(6);
+        let tuned_tsv = std::fs::read_to_string(&tuned_path)
+            .map_err(|error| format!("failed to read tuned params {tuned_path}: {error}"))?;
+        let candidate = search_params_from_tsv(&tuned_tsv)?;
+        // Fresh openings (distinct seed from the SPSA training set) => out of sample.
+        let fens = random_opening_fens(openings, 8, 0xA11CE_5EED_C0DE);
+        let records = run_search_gate_fens(&fens, candidate, SearchParams::default(), depth, 160)?;
         print!("{}", sprt_tsv_report(summarize(&records), SprtConfig::default()));
         return Ok(());
     }
@@ -528,6 +583,42 @@ fn main() -> Result<(), String> {
             let file = std::fs::File::open(&source)
                 .map_err(|error| format!("failed to open positions {source}: {error}"))?;
             run_label_sf(std::io::BufReader::new(file), nodes, &engine_path)?;
+        }
+        return Ok(());
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("label-fens") {
+        // label-fens <fen_eval_or_-> [--stm-relative]: convert a pre-evaluated
+        // public dataset — `FEN<sep>eval` rows, tab- or comma-separated (path or
+        // `-` for stdin) — into `cp\town\topp` training rows, taking the cp label
+        // from the file instead of a Stockfish pass. This replaces the whole
+        // `gen-eval-positions | label-sf` self-play + fixed-node fan-out for data
+        // that is already scored. Evals are treated as White-relative (the common
+        // public convention) and flipped to side-to-move POV; pass --stm-relative
+        // when the source is already side-to-move. Malformed rows are skipped.
+        let mut source: Option<String> = None;
+        let mut white_relative = true;
+        let mut args = std::env::args().skip(2);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--stm-relative" => white_relative = false,
+                "--white-relative" => white_relative = true,
+                _ => {
+                    if source.is_some() {
+                        return Err(format!("unexpected argument: {arg}"));
+                    }
+                    source = Some(arg);
+                }
+            }
+        }
+        let source = source
+            .ok_or_else(|| "usage: label-fens <fen_eval_or_-> [--stm-relative]".to_string())?;
+        if source == "-" {
+            run_label_fens(std::io::stdin().lock(), white_relative)?;
+        } else {
+            let file = std::fs::File::open(&source)
+                .map_err(|error| format!("failed to open positions {source}: {error}"))?;
+            run_label_fens(std::io::BufReader::new(file), white_relative)?;
         }
         return Ok(());
     }

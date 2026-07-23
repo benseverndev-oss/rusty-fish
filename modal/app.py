@@ -44,7 +44,7 @@ def _load_wdl_corpus() -> list[dict]:
 # Image A: builds the engine-bench release binary from the repo source.
 rust_image = (
     modal.Image.debian_slim()
-    .apt_install("curl", "build-essential", "pkg-config", "zstd", "stockfish")
+    .apt_install("curl", "build-essential", "pkg-config", "zstd", "stockfish", "jq")
     .run_commands(
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs "
         "| sh -s -- -y --default-toolchain stable"
@@ -458,19 +458,19 @@ def train_wdl_run(shard_names: list[str], hidden: int, epochs: int) -> bytes:
 
 
 @app.function(
-    image=torch_image, gpu="A10G", timeout=60 * 60 * 3, memory=65536,
+    image=torch_image, gpu="A10G", timeout=60 * 60 * 6, memory=32768,
     volumes={"/store": labels_volume},
 )
 def train_from_store(datasets: list[str], hidden: int, epochs: int, lr: float = 1e-3) -> tuple[bytes, float]:
     """Train (cp mode) on the concatenation of the given store datasets. Read-only
     on the store: it globs + concatenates, NEVER deletes.
 
-    Memory: the padded feature tensors are small (N x 32 int32, ~3 GB for the full
-    24-month corpus), but `_load_samples`/`_pad_rows` build transient Python
-    lists-of-lists over every position while ingesting. The 6-month (~3M-position)
-    champion trained fine at 32 GB; the 24-month corpus is ~4x that (~12M
-    positions) and the Python-object load peak scales with it, so the request is
-    64 GB to keep the data-scale sweep off the OOM line."""
+    Memory: `load_corpus` parses straight into the padded int32 matrices (N x 32,
+    ~5 GB for the full 24-month ~19M-position corpus) with no transient
+    lists-of-lists — the earlier list-based loader is what peaked near ~40 GB and
+    forced the 128 GB request. Peak host RAM is now ~5 GB of arrays plus the torch
+    runtime, so 32 GB leaves comfortable headroom (the same request the 6-month
+    champion trained fine under)."""
     import os, train_nnue
 
     labels_volume.reload()
@@ -480,14 +480,16 @@ def train_from_store(datasets: list[str], hidden: int, epochs: int, lr: float = 
         p for d in datasets for p in glob.glob(f"/store/sf/{d}/samples-*.tsv")
     )
     assert shard_paths, f"no shards found for datasets {datasets}"
-    data_path = "/tmp/data.tsv"  # ephemeral container disk, NOT the store
-    with open(data_path, "w", encoding="utf-8") as out:
-        for shard_path in shard_paths:
-            with open(shard_path, "r", encoding="utf-8") as handle:
-                for line in handle:
-                    out.write(line)
-    model, val_loss = train_nnue.train(
-        data_path, hidden, epochs, batch_size=1024, lr=lr, device="cuda", wdl_target=False
+    # Parse the shards straight into padded arrays, memoized on the store volume so
+    # every sweep config after the first skips the multi-minute reparse (and the
+    # multi-GB concat it used to do). The cache is keyed on the shard manifest and
+    # rebuilt whenever it changes; a stale/corrupt cache falls back to a fresh
+    # parse, so it can never feed the trainer the wrong corpus.
+    cache_dir = f"/store/sf/_cache/{'+'.join(sorted(datasets))}"
+    own_np, opp_np, target_np = train_nnue.load_corpus(shard_paths, cache_dir=cache_dir)
+    model, val_loss = train_nnue.train_arrays(
+        own_np, opp_np, target_np, hidden, epochs, batch_size=1024, lr=lr,
+        device="cuda", wdl_target=False,
     )
     os.makedirs("/store/nets", exist_ok=True)
     out_path = "/store/nets/latest.rfnn"
@@ -497,7 +499,7 @@ def train_from_store(datasets: list[str], hidden: int, epochs: int, lr: float = 
         return (handle.read(), val_loss)
 
 
-@app.function(timeout=60 * 60 * 3)
+@app.function(timeout=60 * 60 * 8)
 def run_experiment(config: dict) -> dict:
     """Train one net from the store, val-precheck it, gate it vs the champion, and
     return a structured result. Catches its own errors so a bad config becomes an
@@ -563,6 +565,58 @@ def read_results() -> str:
         return ""
     with open(path, "r", encoding="utf-8") as handle:
         return handle.read()
+
+
+@app.function(image=rust_image, volumes={"/store": labels_volume}, timeout=60 * 60 * 4)
+def label_public_run(url: str, max_positions: int, dataset: str) -> int:
+    """Ingest a pre-evaluated public eval dataset (the lichess eval database, or any
+    JSONL.zst with the same shape) into the store WITHOUT a Stockfish pass, using the
+    `label-fens` subcommand. This is the public-data counterpart to `label_sf_run`:
+    it produces the identical `cp<TAB>own<TAB>opp` store format, so `train_from_store`
+    reads it unchanged.
+
+    Streams `curl | zstd -dc | jq | label-fens` in one pass (zstd isn't seekable, so
+    no byte-range sharding), capped at `max_positions`. jq extracts the deepest eval's
+    best-pv centipawns (mates -> `#N`) and pads the 4-field lichess FEN to 6 fields;
+    `label-fens --white-relative` flips the White-relative eval to side-to-move POV
+    (the same convention the trainer's SF labels use)."""
+    import subprocess, os
+    out_dir = f"/store/sf/{dataset}"
+    os.makedirs(out_dir, exist_ok=True)
+    out = f"{out_dir}/samples-public-0.tsv"
+    jq_filter = (
+        r'(.evals | max_by(.depth)) as $e | $e.pvs[0] as $p | '
+        r'if ($p | has("cp")) then "\(.fen) 0 1,\($p.cp)" '
+        r'elif ($p | has("mate")) then "\(.fen) 0 1,#\($p.mate)" else empty end'
+    )
+    # No `pipefail`: `head` closing the pipe SIGPIPEs curl/zstd/jq by design once
+    # max_positions rows are through; the meaningful exit is label-fens' (last stage).
+    cmd = (
+        f'curl -sS --max-time 14400 "{url}" '
+        f'| zstd -dc --long=31 '
+        f"| jq -rc '{jq_filter}' "
+        f'| head -n {max_positions} '
+        f'| {BIN} label-fens - --white-relative > {out}'
+    )
+    subprocess.run(["bash", "-c", cmd], check=True)
+    labels_volume.commit()
+    with open(out, "r", encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())
+
+
+@app.local_entrypoint()
+def label_public(
+    url: str = "https://database.lichess.org/lichess_db_eval.jsonl.zst",
+    max_positions: int = 3_000_000,
+    dataset: str = "public-lichess",
+):
+    """Ingest a public FEN+eval dataset into the store via `label-fens`, then train
+    on it with `sweep --dataset <dataset>` and gate vs the champion — the head-to-head
+    against the self-labeled corpus.
+
+        modal run --detach modal/app.py::label_public --max-positions 3000000
+    """
+    print(label_public_run.remote(url, max_positions, dataset))
 
 
 def _chunks(lines, size):
@@ -937,7 +991,7 @@ def sha_probe():
         print(line)
 
 
-@app.function(timeout=60 * 60 * 6)
+@app.function(timeout=60 * 60 * 12)
 def run_sweep(
     hs: list[int], es: list[int], ls: list[float], dataset: str,
     gate_depth: int, gate_plies: int, move_time_ms: int, gate_shard_size: int,
@@ -1019,3 +1073,74 @@ def results():
     print(header)
     for line in sorted(rows, key=elo_key, reverse=True):
         print(line)
+
+
+@app.function(image=rust_image, timeout=60 * 60 * 2, volumes={"/store": labels_volume})
+def stockfish_bench_level(elo: int, openings: int, movetime_ms: int) -> tuple:
+    """Play the bundled-net engine vs Stockfish weakened to ~`elo` via
+    UCI_LimitStrength, over `openings` generated openings (both colours), at
+    `movetime_ms` per move for each side. Returns (elo, W, D, L) from the engine's
+    perspective AND persists it to the store, so the result survives a client
+    disconnect (a plain `modal run` loses stdout if the local client dies)."""
+    import os, subprocess
+    cmd = (
+        f"{BIN} external-sprt --opponent-elo {elo} "
+        f"--openings {openings} --movetime {movetime_ms}"
+    )
+    proc = subprocess.run(
+        ["bash", "-c", cmd],
+        capture_output=True, text=True,
+        env={**os.environ, "RUSTY_FISH_EXTERNAL_UCI": "/usr/games/stockfish"},
+    )
+    wins = draws = losses = 0
+    for line in (proc.stderr + "\n" + proc.stdout).splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 9 and parts[-2] in ("Win", "Draw", "Loss"):
+            outcome = parts[-2]
+            wins += outcome == "Win"
+            draws += outcome == "Draw"
+            losses += outcome == "Loss"
+    # One file per Elo level (no cross-container write race) so the bracket
+    # survives client death; read them back via `modal volume get`.
+    os.makedirs("/store/experiments/sfbench", exist_ok=True)
+    with open(f"/store/experiments/sfbench/elo-{elo}.tsv", "w", encoding="utf-8") as handle:
+        handle.write(f"{elo}\t{wins}\t{draws}\t{losses}\t{openings}\t{movetime_ms}\n")
+    labels_volume.commit()
+    return (elo, wins, draws, losses)
+
+
+@app.local_entrypoint()
+def stockfish_bench(
+    elos: str = "1320,1600,1900,2200,2500",
+    openings: int = 48,
+    movetime_ms: int = 100,
+):
+    """Benchmark the bundled-net engine vs Stockfish across a bracket of UCI_Elo
+    levels (both colours, `openings` generated openings each). The ~50% score
+    crossover estimates the engine's Elo at this movetime. Each level -> its own
+    container in parallel.
+
+        modal run modal/app.py::stockfish_bench --elos 1320,1600,1900,2200,2500 --openings 48 --movetime 100
+    """
+    import math
+    levels = [int(x) for x in elos.split(",") if x.strip()]
+    results = list(stockfish_bench_level.starmap([(e, openings, movetime_ms) for e in levels]))
+    print("STOCKFISH_BENCH_BEGIN", flush=True)
+    estimates = []
+    for elo, w, d, l in sorted(results):
+        games = w + d + l
+        if games == 0:
+            print(f"BENCH sf_elo={elo} NO GAMES (error?)")
+            continue
+        score = (w + 0.5 * d) / games
+        if 0 < score < 1:
+            est = elo + 400 * math.log10(score / (1 - score))  # engine Elo implied by this level
+            estimates.append(est)
+            tag = f"engine~{est:.0f}"
+        else:
+            tag = "engine>>sf" if score >= 1 else "engine<<sf"
+        print(f"BENCH sf_elo={elo} W={w} D={d} L={l} games={games} score={score:.3f} {tag}")
+    if estimates:
+        print(f"BENCH_ESTIMATE engine_elo~{sum(estimates)/len(estimates):.0f} "
+              f"(mean over {len(estimates)} bracketing levels, movetime {movetime_ms}ms)")
+    print("STOCKFISH_BENCH_END", flush=True)
