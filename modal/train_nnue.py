@@ -358,23 +358,33 @@ def train_arrays(
     for epoch in range(epochs):
         model.train()
         perm = train_idx[torch.randperm(train_idx.numel(), device=device)]
+        # On the compiled CUDA path, iterate only whole batches so torch.compile
+        # sees a single static [batch_size] shape — the ragged final batch would
+        # otherwise force a second (per-shape) compile. The dropped sub-batch tail
+        # is a different random slice every epoch (perm is reshuffled), so nothing
+        # is systematically excluded; it is <batch_size of ~19M rows (~0.005%). The
+        # CPU path keeps every sample, which is what preserves its bit-for-bit
+        # reproducibility.
+        limit = (perm.numel() // batch_size) * batch_size if on_cuda else perm.numel()
         # Accumulate the epoch's loss on-device and read it back once, after the
         # loop. A per-batch loss.item() forces a GPU->CPU sync every step, which
         # stalls the pipeline and stops the host from queueing the next batch's
         # kernels ahead of time; the running device total avoids that.
         total = torch.zeros((), device=device)
-        for start in range(0, perm.numel(), batch_size):
+        seen = 0
+        for start in range(0, limit, batch_size):
             idx = perm[start:start + batch_size]
             loss = loss_on(idx)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             total += loss.detach() * idx.numel()
+            seen += idx.numel()
         scheduler.step()
         model.eval()
         with torch.no_grad():
             val = mean_loss_batched(val_idx)
-        train_mean = (total / train_idx.numel()).item() if train_idx.numel() else float("nan")
+        train_mean = (total / seen).item() if seen else float("nan")
         print(
             f"epoch {epoch + 1}/{epochs}: train_wdl_loss {train_mean:.6f} "
             f"val_wdl_loss {val:.6f} lr {scheduler.get_last_lr()[0]:.2e}",
