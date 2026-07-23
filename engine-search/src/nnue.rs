@@ -105,6 +105,44 @@ impl Accumulator {
         accumulate(self.perspective_mut(perspective), column, false);
     }
 
+    /// Applies a batch of square changes to both perspectives in a single fused
+    /// pass each: every accumulator lane is read and written once no matter how
+    /// many features the move touched. Each change is `(square, removed, added)`
+    /// — the piece leaving the square (subtracted) and the piece arriving (added).
+    /// The search drives make with `(square, old, new)` and unmake with the pair
+    /// swapped. Bit-exact with repeated [`Accumulator::add_feature`]/
+    /// [`Accumulator::remove_feature`] calls.
+    pub fn apply_changes(
+        &mut self,
+        net: &Nnue,
+        changes: &[(Square, Option<Piece>, Option<Piece>)],
+    ) {
+        let hidden = net.hidden;
+        for perspective in [Color::White, Color::Black] {
+            let mut adds = [0usize; 4];
+            let mut add_count = 0;
+            let mut subs = [0usize; 4];
+            let mut sub_count = 0;
+            for &(square, removed, added) in changes {
+                if let Some(piece) = removed {
+                    subs[sub_count] = feature_index(perspective, piece, square);
+                    sub_count += 1;
+                }
+                if let Some(piece) = added {
+                    adds[add_count] = feature_index(perspective, piece, square);
+                    add_count += 1;
+                }
+            }
+            apply_feature_deltas(
+                &net.feature_weights,
+                hidden,
+                self.perspective_mut(perspective),
+                &adds[..add_count],
+                &subs[..sub_count],
+            );
+        }
+    }
+
     /// Rebuilds both accumulators from scratch for the given board.
     pub fn refresh(net: &Nnue, board: &Board) -> Self {
         let mut accumulator = Self::empty(net);
@@ -314,6 +352,81 @@ fn accumulate(accumulator: &mut [i32], weights: &[i16], add: bool) {
         }
     }
     accumulate_scalar(accumulator, weights, add);
+}
+
+/// Applies several feature columns to one accumulator in a single fused pass:
+/// `add` columns are summed in, `sub` columns subtracted. Fusing keeps the
+/// accumulator resident (one load + one store per lane) instead of re-streaming
+/// it once per feature. `adds`/`subs` hold feature indices into `weights`.
+#[inline]
+fn apply_feature_deltas(
+    weights: &[i16],
+    hidden: usize,
+    accumulator: &mut [i32],
+    adds: &[usize],
+    subs: &[usize],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 is available; feature indices index full `hidden`-length
+            // columns within `weights`, matched to the accumulator length.
+            unsafe {
+                apply_feature_deltas_avx2(weights, hidden, accumulator, adds, subs);
+            }
+            return;
+        }
+    }
+    for &feature in adds {
+        let column = &weights[feature * hidden..feature * hidden + hidden];
+        for (value, weight) in accumulator.iter_mut().zip(column) {
+            *value += i32::from(*weight);
+        }
+    }
+    for &feature in subs {
+        let column = &weights[feature * hidden..feature * hidden + hidden];
+        for (value, weight) in accumulator.iter_mut().zip(column) {
+            *value -= i32::from(*weight);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn apply_feature_deltas_avx2(
+    weights: &[i16],
+    hidden: usize,
+    accumulator: &mut [i32],
+    adds: &[usize],
+    subs: &[usize],
+) {
+    use core::arch::x86_64::*;
+    let chunks = hidden / 8;
+    let acc_ptr = accumulator.as_mut_ptr();
+    let weight_ptr = weights.as_ptr();
+    for chunk in 0..chunks {
+        let offset = chunk * 8;
+        let mut value = _mm256_loadu_si256(acc_ptr.add(offset) as *const __m256i);
+        for &feature in adds {
+            let column = _mm_loadu_si128(weight_ptr.add(feature * hidden + offset) as *const __m128i);
+            value = _mm256_add_epi32(value, _mm256_cvtepi16_epi32(column));
+        }
+        for &feature in subs {
+            let column = _mm_loadu_si128(weight_ptr.add(feature * hidden + offset) as *const __m128i);
+            value = _mm256_sub_epi32(value, _mm256_cvtepi16_epi32(column));
+        }
+        _mm256_storeu_si256(acc_ptr.add(offset) as *mut __m256i, value);
+    }
+    for index in (chunks * 8)..hidden {
+        let mut value = *accumulator.get_unchecked(index);
+        for &feature in adds {
+            value += i32::from(*weights.get_unchecked(feature * hidden + index));
+        }
+        for &feature in subs {
+            value -= i32::from(*weights.get_unchecked(feature * hidden + index));
+        }
+        *accumulator.get_unchecked_mut(index) = value;
+    }
 }
 
 fn accumulate_scalar(accumulator: &mut [i32], weights: &[i16], add: bool) {

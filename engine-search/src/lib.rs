@@ -1490,17 +1490,11 @@ impl Searcher {
             if old == new {
                 continue;
             }
-            if let Some(piece) = old {
-                accumulator.remove_feature(&nnue, Color::White, piece, square);
-                accumulator.remove_feature(&nnue, Color::Black, piece, square);
-            }
-            if let Some(piece) = new {
-                accumulator.add_feature(&nnue, Color::White, piece, square);
-                accumulator.add_feature(&nnue, Color::Black, piece, square);
-            }
             delta.changes[delta.len] = (square, old, new);
             delta.len += 1;
         }
+        // One fused pass per perspective: remove the old piece, add the new one.
+        accumulator.apply_changes(&nnue, &delta.changes[..delta.len]);
         self.nnue_stack.push(delta);
         undo
     }
@@ -1518,18 +1512,13 @@ impl Searcher {
             .nnue_accumulator
             .as_mut()
             .expect("nnue accumulator is initialised while a network is loaded");
-        for &(square, old, new) in delta.changes.iter().take(delta.len) {
-            // Reverse of nnue_make: we removed `old` and added `new`, so now
-            // remove `new` and restore `old`.
-            if let Some(piece) = new {
-                accumulator.remove_feature(&nnue, Color::White, piece, square);
-                accumulator.remove_feature(&nnue, Color::Black, piece, square);
-            }
-            if let Some(piece) = old {
-                accumulator.add_feature(&nnue, Color::White, piece, square);
-                accumulator.add_feature(&nnue, Color::Black, piece, square);
-            }
+        // Reverse of nnue_make: swap each change so the added piece is removed
+        // and the old piece restored, then apply in one fused pass per perspective.
+        let mut reversed = [(Square(0), None, None); 4];
+        for (slot, &(square, old, new)) in reversed.iter_mut().zip(delta.changes.iter()).take(delta.len) {
+            *slot = (square, new, old);
         }
+        accumulator.apply_changes(&nnue, &reversed[..delta.len]);
     }
 
     fn order_moves(
