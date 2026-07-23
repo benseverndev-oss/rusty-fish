@@ -301,10 +301,13 @@ def train_arrays(
         def forward(self, own_rows, opp_rows):
             # own_rows/opp_rows: [B, MAX_FEATURES] int; EmbeddingBag sums each bag's
             # feature rows in one fused gather -> [B, hidden] (padding rows add zero).
-            acc_own = self.transformer(own_rows) + self.feature_bias
-            acc_opp = self.transformer(opp_rows) + self.feature_bias
-            a_own = torch.clamp(acc_own, 0.0, ACTIVATION_CLIP)
-            a_opp = torch.clamp(acc_opp, 0.0, ACTIVATION_CLIP)
+            # Both perspectives share the same table, so they go through a single
+            # call over the stacked [2B, MAX_FEATURES] batch (one kernel launch) and
+            # are split back out — identical results, half the embedding launches.
+            batch = own_rows.shape[0]
+            stacked = self.transformer(torch.cat([own_rows, opp_rows], dim=0))
+            a_own = torch.clamp(stacked[:batch] + self.feature_bias, 0.0, ACTIVATION_CLIP)
+            a_opp = torch.clamp(stacked[batch:] + self.feature_bias, 0.0, ACTIVATION_CLIP)
             features = torch.cat([a_own, a_opp], dim=1)
             # pred is centipawns (inference divides the integer output by 64).
             return self.output(features).squeeze(1) / OUTPUT_SCALE
@@ -316,13 +319,27 @@ def train_arrays(
     val_idx = all_idx[is_val]
 
     model = Nnue(hidden).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # On CUDA, run Adam's whole parameter update in one fused kernel — the
+    # optimizer step is a meaningful slice of each batch for a net this shallow.
+    # fused=True needs CUDA tensors, so off-GPU (the CLI/CPU path) keeps the
+    # standard update, which is also what keeps that path bit-for-bit reproducible.
+    on_cuda = str(device).startswith("cuda")
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, fused=on_cuda)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     def loss_on(idx):
         pred_cp = model(own_t[idx], opp_t[idx])
         pred_wp = torch.sigmoid(pred_cp / WDL_SCALE)
         return ((pred_wp - target_wp[idx]) ** 2).mean()
+
+    if on_cuda:
+        # Fuse the forward+loss into fewer kernels. torch.compile falls back to
+        # eager on any graph break, and a compile-time failure leaves the eager
+        # loss_on in place, so this only ever changes speed, never correctness.
+        try:
+            loss_on = torch.compile(loss_on)
+        except Exception as error:  # noqa: BLE001 - compile is an optimization only
+            print(f"torch.compile unavailable ({error}); using eager", file=sys.stderr)
 
     def mean_loss_batched(idx):
         # Evaluate a mean loss over `idx` in minibatches. Forwarding a large index
