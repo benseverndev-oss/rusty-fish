@@ -132,7 +132,16 @@ def train(
             # weight[feature] is the hidden-vector added to the accumulator, exactly
             # the RFNN feature_weights row-major (feature*hidden + i) layout. The
             # padding row is dropped on export, so the block stays byte-identical.
-            self.transformer = nn.Embedding(INPUT_DIMENSION + 1, hidden, padding_idx=PAD_INDEX)
+            #
+            # EmbeddingBag(mode="sum") fuses the per-bag gather-and-sum: it returns
+            # the [B, hidden] accumulator directly instead of materializing the
+            # [B, MAX_FEATURES, hidden] intermediate that Embedding + .sum(dim=1)
+            # would. Mathematically identical (same rows summed, padding_idx rows
+            # contribute zero and take no gradient), but far cheaper in compute and
+            # activation memory — the dominant cost for a net this shallow.
+            self.transformer = nn.EmbeddingBag(
+                INPUT_DIMENSION + 1, hidden, mode="sum", padding_idx=PAD_INDEX
+            )
             self.feature_bias = nn.Parameter(torch.zeros(hidden))
             self.output = nn.Linear(2 * hidden, 1)
             nn.init.uniform_(self.transformer.weight[:INPUT_DIMENSION], -0.1, 0.1)
@@ -140,9 +149,10 @@ def train(
             nn.init.zeros_(self.output.bias)
 
         def forward(self, own_rows, opp_rows):
-            # own_rows/opp_rows: [B, MAX_FEATURES] int; embed -> [B, F, hidden] -> sum F.
-            acc_own = self.transformer(own_rows).sum(dim=1) + self.feature_bias
-            acc_opp = self.transformer(opp_rows).sum(dim=1) + self.feature_bias
+            # own_rows/opp_rows: [B, MAX_FEATURES] int; EmbeddingBag sums each bag's
+            # feature rows in one fused gather -> [B, hidden] (padding rows add zero).
+            acc_own = self.transformer(own_rows) + self.feature_bias
+            acc_opp = self.transformer(opp_rows) + self.feature_bias
             a_own = torch.clamp(acc_own, 0.0, ACTIVATION_CLIP)
             a_opp = torch.clamp(acc_opp, 0.0, ACTIVATION_CLIP)
             features = torch.cat([a_own, a_opp], dim=1)
@@ -181,19 +191,23 @@ def train(
     for epoch in range(epochs):
         model.train()
         perm = train_idx[torch.randperm(train_idx.numel(), device=device)]
-        total = 0.0
+        # Accumulate the epoch's loss on-device and read it back once, after the
+        # loop. A per-batch loss.item() forces a GPU->CPU sync every step, which
+        # stalls the pipeline and stops the host from queueing the next batch's
+        # kernels ahead of time; the running device total avoids that.
+        total = torch.zeros((), device=device)
         for start in range(0, perm.numel(), batch_size):
             idx = perm[start:start + batch_size]
             loss = loss_on(idx)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            total += loss.item() * idx.numel()
+            total += loss.detach() * idx.numel()
         scheduler.step()
         model.eval()
         with torch.no_grad():
             val = mean_loss_batched(val_idx)
-        train_mean = total / train_idx.numel() if train_idx.numel() else float("nan")
+        train_mean = (total / train_idx.numel()).item() if train_idx.numel() else float("nan")
         print(
             f"epoch {epoch + 1}/{epochs}: train_wdl_loss {train_mean:.6f} "
             f"val_wdl_loss {val:.6f} lr {scheduler.get_last_lr()[0]:.2e}",
