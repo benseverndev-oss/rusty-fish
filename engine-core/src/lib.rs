@@ -674,16 +674,69 @@ impl Board {
         self.generate_legal_move_list().as_slice().to_vec()
     }
 
+    /// Own pieces pinned against the king by an enemy slider: the sole piece on
+    /// the segment between the king and an aligned enemy rook/bishop/queen.
+    /// Moving such a piece off that line would expose the king.
+    fn pinned_pieces(&self, side: Color) -> Bitboard {
+        let Some(king) = self.king_square(side) else {
+            return 0;
+        };
+        let opponent = side.opposite();
+        let enemy_rooks_queens =
+            self.pieces(opponent, PieceKind::Rook) | self.pieces(opponent, PieceKind::Queen);
+        let enemy_bishops_queens =
+            self.pieces(opponent, PieceKind::Bishop) | self.pieces(opponent, PieceKind::Queen);
+        // Sliders aligned with the king if the board were empty — the only pieces
+        // that can pin. `attacks(..., 0)` returns the full unobstructed rays.
+        let mut snipers = (rook_attacks(king, 0) & enemy_rooks_queens)
+            | (bishop_attacks(king, 0) & enemy_bishops_queens);
+
+        let occupied = self.all_occupancy();
+        let own = self.occupancy(side);
+        let king_index = king.0 as usize;
+        let mut pinned = 0;
+        while snipers != 0 {
+            let sniper = pop_lsb(&mut snipers);
+            let between = BETWEEN[king_index][sniper.0 as usize];
+            let blockers = between & occupied;
+            // Exactly one piece between king and sniper, and it is ours → pinned.
+            if blockers.count_ones() == 1 {
+                pinned |= blockers & own;
+            }
+        }
+        pinned
+    }
+
     pub fn generate_legal_move_list(&mut self) -> MoveList {
         let side = self.side_to_move;
         let moves = self.generate_pseudo_legal_moves();
+        let in_check = self.in_check(side);
+        let pinned = self.pinned_pieces(side);
+        let king_square = self.king_square(side);
         let mut legal = MoveList::new();
         for &mv in moves.as_slice() {
-            if let Ok(undo) = self.make_move(mv) {
-                if !self.in_check(side) {
-                    legal.push(mv);
+            // A move needs a full make/unmake legality check only if it could
+            // expose or move into check: the king itself moving, a pinned piece,
+            // an en passant capture (removes two pawns from a rank), or any move
+            // while already in check. Everything else is legal by construction —
+            // moving a non-pinned piece cannot discover an attack on its own king.
+            let is_en_passant = self.en_passant == Some(mv.to)
+                && self
+                    .piece_at(mv.from)
+                    .is_some_and(|piece| piece.kind == PieceKind::Pawn);
+            let needs_full_check = in_check
+                || Some(mv.from) == king_square
+                || pinned & (1_u64 << mv.from.0) != 0
+                || is_en_passant;
+            if needs_full_check {
+                if let Ok(undo) = self.make_move(mv) {
+                    if !self.in_check(side) {
+                        legal.push(mv);
+                    }
+                    self.unmake_move(mv, undo);
                 }
-                self.unmake_move(mv, undo);
+            } else {
+                legal.push(mv);
             }
         }
         legal
@@ -1317,6 +1370,59 @@ fn negative_ray_attacks(square: usize, occupied: Bitboard, ray_table: &[Bitboard
     } else {
         ray ^ ray_table[63 - blockers.leading_zeros() as usize]
     }
+}
+
+/// `BETWEEN[a][b]` is the set of squares strictly between `a` and `b` when they
+/// share a rank, file, or diagonal, and empty otherwise. Used for pin detection:
+/// a slider pins a piece iff exactly one piece sits on the segment to the king.
+const BETWEEN: [[Bitboard; 64]; 64] = build_between_table();
+
+const fn build_between_table() -> [[Bitboard; 64]; 64] {
+    let mut table = [[0; 64]; 64];
+    let mut a = 0usize;
+    while a < 64 {
+        let af = (a % 8) as i8;
+        let ar = (a / 8) as i8;
+        let mut b = 0usize;
+        while b < 64 {
+            let bf = (b % 8) as i8;
+            let br = (b / 8) as i8;
+            let file_diff = bf - af;
+            let rank_diff = br - ar;
+            let file_step = if file_diff > 0 {
+                1
+            } else if file_diff < 0 {
+                -1
+            } else {
+                0
+            };
+            let rank_step = if rank_diff > 0 {
+                1
+            } else if rank_diff < 0 {
+                -1
+            } else {
+                0
+            };
+            let file_abs = if file_diff < 0 { -file_diff } else { file_diff };
+            let rank_abs = if rank_diff < 0 { -rank_diff } else { rank_diff };
+            // Aligned along a rank, file, or diagonal (and distinct).
+            let aligned = a != b && (af == bf || ar == br || file_abs == rank_abs);
+            if aligned {
+                let mut file = af + file_step;
+                let mut rank = ar + rank_step;
+                let mut segment = 0;
+                while file != bf || rank != br {
+                    segment |= 1_u64 << (rank as usize * 8 + file as usize);
+                    file += file_step;
+                    rank += rank_step;
+                }
+                table[a][b] = segment;
+            }
+            b += 1;
+        }
+        a += 1;
+    }
+    table
 }
 
 /// Bishop attack set from `square` given the all-piece `occupied` bitboard,
