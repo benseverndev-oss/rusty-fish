@@ -458,20 +458,19 @@ def train_wdl_run(shard_names: list[str], hidden: int, epochs: int) -> bytes:
 
 
 @app.function(
-    image=torch_image, gpu="A10G", timeout=60 * 60 * 6, memory=131072,
+    image=torch_image, gpu="A10G", timeout=60 * 60 * 6, memory=32768,
     volumes={"/store": labels_volume},
 )
 def train_from_store(datasets: list[str], hidden: int, epochs: int, lr: float = 1e-3) -> tuple[bytes, float]:
     """Train (cp mode) on the concatenation of the given store datasets. Read-only
     on the store: it globs + concatenates, NEVER deletes.
 
-    Memory: the padded feature tensors are small (N x 32 int32, ~3 GB for the full
-    24-month corpus), but `_load_samples`/`_pad_rows` build transient Python
-    lists-of-lists over every position while ingesting. The 6-month (~3M-position)
-    champion trained fine at 32 GB; the actual 24-month corpus measured out to
-    ~19M positions (not the ~12M first estimated — the 2018 months are ~2x the
-    2017 ones), and the Python-object load peak scales with it, so the request is
-    128 GB to keep the data-scale sweep well off the OOM line."""
+    Memory: `load_corpus` parses straight into the padded int32 matrices (N x 32,
+    ~5 GB for the full 24-month ~19M-position corpus) with no transient
+    lists-of-lists — the earlier list-based loader is what peaked near ~40 GB and
+    forced the 128 GB request. Peak host RAM is now ~5 GB of arrays plus the torch
+    runtime, so 32 GB leaves comfortable headroom (the same request the 6-month
+    champion trained fine under)."""
     import os, train_nnue
 
     labels_volume.reload()
