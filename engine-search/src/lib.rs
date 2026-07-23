@@ -502,6 +502,9 @@ pub struct Searcher {
     nnue: Option<Arc<Nnue>>,
     nnue_accumulator: Option<nnue::Accumulator>,
     nnue_stack: Vec<NnueDelta>,
+    /// Reused scratch for move ordering: `(score, move)` pairs sorted per node,
+    /// kept across calls so ordering never heap-allocates in the hot loop.
+    move_order_scratch: Vec<(i32, ChessMove)>,
     opening_book: Option<OpeningBook>,
     syzygy: Option<SyzygyTablebases>,
 }
@@ -538,6 +541,7 @@ impl Default for Searcher {
             nnue: Some(bundled_network()),
             nnue_accumulator: None,
             nnue_stack: Vec::new(),
+            move_order_scratch: Vec::new(),
             opening_book: None,
             syzygy: None,
         }
@@ -822,6 +826,7 @@ impl Searcher {
             nnue,
             nnue_accumulator: None,
             nnue_stack: Vec::new(),
+            move_order_scratch: Vec::new(),
             opening_book: None,
             syzygy: None,
         }
@@ -1522,16 +1527,29 @@ impl Searcher {
     }
 
     fn order_moves(
-        &self,
+        &mut self,
         board: &Board,
         moves: &mut [ChessMove],
         ply: usize,
         tt_move: Option<ChessMove>,
         counter_move: Option<ChessMove>,
     ) {
-        moves.sort_by_cached_key(|mv| {
-            -self.move_order_score(board, *mv, ply, tt_move, counter_move)
-        });
+        // Score each move once into a reused buffer, then sort descending. A
+        // stable sort keyed on the negated score matches the previous
+        // `sort_by_cached_key` ordering exactly (equal scores keep move order),
+        // but reuses one heap allocation across the whole search instead of one
+        // per node.
+        let mut scratch = std::mem::take(&mut self.move_order_scratch);
+        scratch.clear();
+        for &mv in moves.iter() {
+            let score = self.move_order_score(board, mv, ply, tt_move, counter_move);
+            scratch.push((score, mv));
+        }
+        scratch.sort_by(|left, right| right.0.cmp(&left.0));
+        for (slot, entry) in moves.iter_mut().zip(scratch.iter()) {
+            *slot = entry.1;
+        }
+        self.move_order_scratch = scratch;
     }
 
     fn move_order_score(
