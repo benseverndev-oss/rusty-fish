@@ -89,6 +89,50 @@ pub struct MoveDecision {
 /// so the column order stays single-sourced.
 pub const TELEMETRY_TSV_HEADER: &str = "pos_id\tdepth\tply\tmove_index\tis_quiet\tis_priority\tpv_node\tgives_check\tstatic_eval\textension\treduction\tlmp_pruned\traised_alpha\tcaused_cutoff\tneeded_lmr_research\tneeded_pvs_research\tsubtree_nodes\thistory_score\tis_tt_move\tis_killer\tis_counter\tis_capture\tis_promotion\tnode_in_check\ttt_depth";
 
+/// The learned-LMR model's input columns, **by header name**, in the exact order the
+/// model expects them (matching `train_lmr.py`'s `FEATURE_COLS` and the feature
+/// vector the search builds in `negamax`).
+///
+/// Named rather than positional so the dataset exporter resolves them against the
+/// TSV's own header. A future schema change that inserts or reorders a column then
+/// re-maps automatically instead of silently shifting every feature by one.
+pub const LMR_FEATURE_COLUMNS: [&str; crate::lmr_model::LMR_FEATURES] = [
+    "depth",
+    "ply",
+    "move_index",
+    "is_quiet",
+    "is_priority",
+    "pv_node",
+    "gives_check",
+    "static_eval",
+    "extension",
+    "reduction",
+    "history_score",
+    "is_tt_move",
+    "is_killer",
+    "is_counter",
+    "is_capture",
+    "is_promotion",
+    "node_in_check",
+    "tt_depth",
+];
+
+/// Label column: did the searched move raise alpha.
+pub const LMR_TARGET_COLUMN: &str = "raised_alpha";
+
+/// Rows with this column set are dropped from the dataset — a late-move-pruned move
+/// was never searched, so its outcome columns are zeros rather than observations.
+pub const LMR_FILTER_COLUMN: &str = "lmp_pruned";
+
+/// Inclusive clamp bounds applied to unbounded feature columns before they reach the
+/// model, keyed by header name. Training and inference must agree on these: the
+/// trainer fits its standardization on clamped values, so an unclamped mate score or
+/// runaway history entry at inference lands outside the distribution the stored
+/// mean/scale describe. Mirrored by `lmr_model`'s `STATIC_EVAL_CLAMP`/`HISTORY_CLAMP`
+/// and by `train_lmr.py`.
+pub const LMR_FEATURE_CLAMPS: [(&str, f32); 2] =
+    [("static_eval", 2000.0), ("history_score", 20000.0)];
+
 impl MoveDecision {
     /// Serializes this record as one TSV row, prefixed with `pos_id`. The column
     /// order matches [`TELEMETRY_TSV_HEADER`]. Booleans render as `0`/`1`.
@@ -181,7 +225,35 @@ impl TelemetryCollector {
 
 #[cfg(test)]
 mod tests {
-    use super::{MoveDecision, TelemetryCollector, TELEMETRY_TSV_HEADER};
+    use super::{
+        MoveDecision, TelemetryCollector, LMR_FEATURE_CLAMPS, LMR_FEATURE_COLUMNS,
+        LMR_FILTER_COLUMN, LMR_TARGET_COLUMN, TELEMETRY_TSV_HEADER,
+    };
+
+    /// Every name the dataset exporter resolves must actually exist in the header,
+    /// and no feature may be listed twice. Without this a typo would surface only as
+    /// a runtime failure inside a Modal container mid-export.
+    #[test]
+    fn lmr_column_names_all_resolve_against_the_header() {
+        let header: Vec<&str> = TELEMETRY_TSV_HEADER.split('\t').collect();
+        for name in LMR_FEATURE_COLUMNS
+            .iter()
+            .chain([&LMR_TARGET_COLUMN, &LMR_FILTER_COLUMN])
+            .chain(LMR_FEATURE_CLAMPS.iter().map(|(name, _)| name))
+        {
+            assert!(
+                header.contains(name),
+                "{name} is not a column of TELEMETRY_TSV_HEADER"
+            );
+        }
+        let mut seen = LMR_FEATURE_COLUMNS.to_vec();
+        seen.sort_unstable();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(before, seen.len(), "duplicate column in LMR_FEATURE_COLUMNS");
+        // The label must not also be an input — that would be pure leakage.
+        assert!(!LMR_FEATURE_COLUMNS.contains(&LMR_TARGET_COLUMN));
+    }
 
     #[test]
     fn collector_respects_cap_and_counts_drops() {

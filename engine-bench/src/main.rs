@@ -10,7 +10,8 @@ use engine_bench::{
     run_spsa_campaign, run_tactical_suite,
     spsa_tsv_report, sprt, sprt_tsv_report, summarize, tactical_tsv_report, throughput_tsv_report,
     gen_wdl_data_samples_from_reader, WdlSampleConfig,
-    gen_eval_positions_from_reader, run_gen_search_telemetry, run_label_sf, run_label_fens,
+    gen_eval_positions_from_reader, run_gen_search_telemetry, run_lmr_export_features,
+    run_label_sf, run_label_fens,
     search_params_from_tsv, run_search_gate_fens,
 };
 use engine_bench::bench_harness::{
@@ -709,6 +710,44 @@ fn main() -> Result<(), String> {
                 .map_err(|error| format!("failed to open positions {source}: {error}"))?;
             run_gen_search_telemetry(std::io::BufReader::new(file), depth)?;
         }
+        return Ok(());
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("lmr-export-features") {
+        // lmr-export-features <telemetry_tsv_or_-> <out_prefix> [stride] [max_rows]:
+        // stream a `gen-search-telemetry` TSV once and write the learned-LMR training
+        // arrays as two `.npy` files (`<prefix>-X.npy`, `<prefix>-y.npy`) the trainer
+        // memory-maps. Replaces re-parsing ~14 GB of TSV in Python on every run.
+        //
+        // Feature columns resolve by name against the file's own header, `lmp_pruned`
+        // rows are dropped, `stride` decorrelates rows from the same search, and the
+        // unbounded columns are clamped to the same bounds inference clamps to.
+        let source = std::env::args().nth(2).ok_or_else(|| {
+            "usage: lmr-export-features <telemetry_or_-> <out_prefix> [stride] [max_rows]"
+                .to_string()
+        })?;
+        let prefix = std::env::args().nth(3).ok_or_else(|| {
+            "usage: lmr-export-features <telemetry_or_-> <out_prefix> [stride] [max_rows]"
+                .to_string()
+        })?;
+        let stride = arg_u64(4).unwrap_or(24);
+        let max_rows = arg_u64(5).unwrap_or(10_000_000) as usize;
+        let summary = if source == "-" {
+            run_lmr_export_features(std::io::stdin().lock(), &prefix, stride, max_rows)?
+        } else {
+            let file = std::fs::File::open(&source)
+                .map_err(|error| format!("failed to open telemetry {source}: {error}"))?;
+            run_lmr_export_features(file, &prefix, stride, max_rows)?
+        };
+        let base_rate = if summary.rows > 0 {
+            summary.positives as f64 / summary.rows as f64
+        } else {
+            0.0
+        };
+        println!(
+            "LMR_EXPORT_DONE prefix={prefix} rows={} scanned={} base_rate={base_rate:.4}",
+            summary.rows, summary.scanned
+        );
         return Ok(());
     }
 

@@ -736,17 +736,75 @@ def gen_telemetry(
           f"client exit. Record count prints as GEN_TELEMETRY_DONE in `modal app logs`.")
 
 
+def _lmr_cache_prefix(dataset: str, stride: int) -> str:
+    """Cache path keyed on (dataset, stride) — the two inputs that change the rows the
+    exporter emits. Feature set and clamps are pinned by the binary that wrote it."""
+    return f"/store/lmr-cache/{dataset}-s{stride}"
+
+
+@app.function(image=rust_image, volumes={"/store": labels_volume}, timeout=60 * 60 * 3)
+def lmr_export_features_run(dataset: str, stride: int, max_rows: int) -> str:
+    """Parse the telemetry TSV ONCE with the Rust exporter and cache the training
+    arrays as `.npy` the trainer memory-maps.
+
+    A depth-8 pilot dataset is ~14 GB of TSV and the Python loader re-parsed all of it
+    on every training run — ~170M `float()` calls per run — while the gradient work on
+    a ~320-parameter MLP took seconds. `engine-bench lmr-export-features` streams the
+    file once in Rust, applies the stride, the `lmp_pruned` filter and the inference
+    clamps, and writes `<prefix>-X.npy` / `<prefix>-y.npy`. Later runs mmap them."""
+    import os, subprocess
+    labels_volume.reload()
+    src = f"/store/telemetry/{dataset}/samples-telemetry-0.tsv"
+    if not os.path.exists(src):
+        raise FileNotFoundError(f"no telemetry dataset at {src}")
+    prefix = _lmr_cache_prefix(dataset, stride)
+    os.makedirs(os.path.dirname(prefix), exist_ok=True)
+    out = subprocess.run(
+        [BIN, "lmr-export-features", src, prefix, str(stride), str(max_rows)],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    labels_volume.commit()
+    print(out, flush=True)
+    return out
+
+
+@app.local_entrypoint()
+def lmr_export_features(dataset: str = "d8-v2feat", stride: int = 24,
+                        max_rows: int = 10_000_000):
+    """Build the .npy training cache for a telemetry dataset (run once per
+    dataset+stride; every `train_lmr` afterwards mmaps it instead of re-parsing).
+
+        modal run --detach modal/app.py::lmr_export_features --dataset d8-v2feat
+    """
+    call = lmr_export_features_run.spawn(dataset, stride, max_rows)
+    print(f"lmr_export_features dispatched server-side (call {call.object_id}); "
+          f"row count prints as LMR_EXPORT_DONE in `modal app logs`.")
+
+
 @app.function(image=torch_image, timeout=60 * 30, memory=16384, volumes={"/store": labels_volume})
 def train_lmr_run(dataset: str, stride: int, max_rows: int, hidden: int, epochs: int) -> str:
-    """Train the learned-LMR model (Phase 2): stride-sample the telemetry TSV, fit the
-    tiny P(raise-alpha) MLP, and export it to `/store/lmr/{dataset}-h{hidden}.rflm`.
+    """Train the learned-LMR model (Phase 2): load the decision dataset, fit the tiny
+    P(raise-alpha) MLP, and export it to `/store/lmr/{dataset}-h{hidden}.rflm`.
     Reports base rate + val accuracy + val AUC — AUC well above 0.5 means the reduction
-    decision is learnable. CPU is plenty for a 10-feature / ~180-param net."""
+    decision is learnable. CPU is plenty for an 18-feature / ~320-param net; the wall
+    clock here is loading, not gradients, which is why the .npy cache matters.
+
+    Prefers the cache `lmr_export_features` wrote and falls back to parsing the raw TSV
+    (and says which it used, so a silently-stale cache can't masquerade as a fast run)."""
     import os
     import train_lmr as lmr
     labels_volume.reload()
-    path = f"/store/telemetry/{dataset}/samples-telemetry-0.tsv"
-    X, y = lmr.load_telemetry_sample(path, stride=stride, max_rows=max_rows)
+    prefix = _lmr_cache_prefix(dataset, stride)
+    if os.path.exists(f"{prefix}-X.npy"):
+        X, y = lmr.load_npy_cache(prefix)
+        source = f"cache {prefix}"
+        if max_rows < len(y):
+            X, y = X[:max_rows], y[:max_rows]
+    else:
+        path = f"/store/telemetry/{dataset}/samples-telemetry-0.tsv"
+        X, y = lmr.load_telemetry_sample(path, stride=stride, max_rows=max_rows)
+        source = f"tsv {path} (no cache; run lmr_export_features to skip this)"
+    print(f"LMR_TRAIN_SOURCE {source} rows={len(y)}", flush=True)
     model, mean, scale, metrics = lmr.train(X, y, hidden=hidden, epochs=epochs, device="cpu")
     os.makedirs("/store/lmr", exist_ok=True)
     out = f"/store/lmr/{dataset}-h{hidden}.rflm"

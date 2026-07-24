@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use engine_core::{Board, Color, GameStatus};
 use engine_search::{
-    EvalParams, Nnue, SearchLimits, SearchParams, Searcher, TELEMETRY_TSV_HEADER, TaperedScore,
+    EvalParams, LMR_FEATURE_CLAMPS, LMR_FEATURE_COLUMNS, LMR_FILTER_COLUMN, LMR_TARGET_COLUMN,
+    Nnue, SearchLimits, SearchParams, Searcher, TELEMETRY_TSV_HEADER, TaperedScore,
     active_features,
 };
 use pgn_reader::shakmaty::{Chess, Position, uci::UciMove};
@@ -2206,6 +2207,212 @@ pub fn run_gen_search_telemetry<R: std::io::Read>(reader: R, depth: u8) -> Resul
     Ok(())
 }
 
+/// Number of rows the exporter reports alongside the written files.
+pub struct LmrExportSummary {
+    pub rows: usize,
+    pub scanned: u64,
+    pub positives: usize,
+}
+
+/// Feature-vector width, from the single-sourced column list.
+const FEATURES: usize = LMR_FEATURE_COLUMNS.len();
+
+/// `.npy` v1.0 header length. Fixed so the row count can be patched in afterwards
+/// without rewriting the payload: the shape is only known once the stream is done,
+/// and the dict is space-padded to this exact size either way.
+const NPY_HEADER_LEN: usize = 128;
+
+/// Builds a `.npy` v1.0 header for a C-order `<f4` array of the given shape, padded
+/// with spaces to exactly [`NPY_HEADER_LEN`] bytes.
+fn npy_header(rows: usize, cols: Option<usize>) -> Result<[u8; NPY_HEADER_LEN], String> {
+    let shape = match cols {
+        Some(cols) => format!("({rows}, {cols})"),
+        None => format!("({rows},)"),
+    };
+    let dict = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': {shape}, }}");
+    // magic(6) + version(2) + header_len(2) + dict + '\n' must fit the fixed size.
+    let prefix = 10;
+    if prefix + dict.len() + 1 > NPY_HEADER_LEN {
+        return Err(format!("npy header too long for {shape}"));
+    }
+    let mut header = [b' '; NPY_HEADER_LEN];
+    header[..6].copy_from_slice(b"\x93NUMPY");
+    header[6] = 1; // major
+    header[7] = 0; // minor
+    let dict_len = (NPY_HEADER_LEN - prefix) as u16;
+    header[8..10].copy_from_slice(&dict_len.to_le_bytes());
+    header[prefix..prefix + dict.len()].copy_from_slice(dict.as_bytes());
+    header[NPY_HEADER_LEN - 1] = b'\n';
+    Ok(header)
+}
+
+/// Resolves a header name to its 0-based column index in a split TSV header row.
+fn column_index(header: &[&str], name: &str) -> Result<usize, String> {
+    header
+        .iter()
+        .position(|column| *column == name)
+        .ok_or_else(|| format!("telemetry header has no `{name}` column"))
+}
+
+/// Streams a telemetry TSV into two `.npy` files the LMR trainer memory-maps:
+/// `{prefix}-X.npy` (`[rows, LMR_FEATURE_COLUMNS.len()]` f32) and `{prefix}-y.npy`
+/// (`[rows]` f32).
+///
+/// This replaces a pure-Python parse of the same file. The dataset is ~14 GB of TSV
+/// for a depth-8 pilot and every training run re-parsed it from scratch; exporting
+/// once turns each subsequent run into an mmap.
+///
+/// Feature columns are resolved by *name* against the file's own header, so the
+/// export cannot silently mis-map if the schema gains a column. Rows where
+/// [`LMR_FILTER_COLUMN`] is set are dropped (never searched, so their outcome is not
+/// an observation), `stride` decorrelates rows drawn from the same search, and the
+/// clamps in [`LMR_FEATURE_CLAMPS`] are applied here so the cache holds exactly what
+/// the model sees at inference.
+pub fn run_lmr_export_features<R: std::io::Read>(
+    reader: R,
+    prefix: &str,
+    stride: u64,
+    max_rows: usize,
+) -> Result<LmrExportSummary, String> {
+    if stride == 0 {
+        return Err("invalid stride 0: need stride >= 1".to_string());
+    }
+    let mut lines = BufReader::with_capacity(1 << 20, reader).lines();
+    let header_line = lines
+        .next()
+        .transpose()
+        .map_err(|error| format!("failed to read telemetry header: {error}"))?
+        .ok_or_else(|| "telemetry input is empty".to_string())?;
+    let header: Vec<&str> = header_line.trim_end().split('\t').collect();
+
+    let target_index = column_index(&header, LMR_TARGET_COLUMN)?;
+    let filter_index = column_index(&header, LMR_FILTER_COLUMN)?;
+    // Invert the mapping: TSV column -> feature slot, so each row is one forward scan
+    // of `split('\t')` with no per-row allocation and no random access.
+    let mut slot_for: Vec<Option<usize>> = vec![None; header.len()];
+    for (slot, name) in LMR_FEATURE_COLUMNS.iter().enumerate() {
+        slot_for[column_index(&header, name)?] = Some(slot);
+    }
+    // Clamp bounds aligned to feature *position*, so the scan indexes them directly.
+    let mut clamps = [f32::INFINITY; FEATURES];
+    for (name, bound) in LMR_FEATURE_CLAMPS {
+        let at = LMR_FEATURE_COLUMNS
+            .iter()
+            .position(|column| *column == name)
+            .ok_or_else(|| format!("clamped column `{name}` is not an LMR feature"))?;
+        clamps[at] = bound;
+    }
+
+    let x_path = format!("{prefix}-X.npy");
+    let y_path = format!("{prefix}-y.npy");
+    let mut x_out = std::io::BufWriter::with_capacity(
+        1 << 20,
+        std::fs::File::create(&x_path)
+            .map_err(|error| format!("failed to create {x_path}: {error}"))?,
+    );
+    let mut y_out = std::io::BufWriter::with_capacity(
+        1 << 20,
+        std::fs::File::create(&y_path)
+            .map_err(|error| format!("failed to create {y_path}: {error}"))?,
+    );
+    // Placeholder headers; the real row count is patched in below.
+    x_out
+        .write_all(&npy_header(0, Some(FEATURES))?)
+        .map_err(|error| format!("failed to write {x_path}: {error}"))?;
+    y_out
+        .write_all(&npy_header(0, None)?)
+        .map_err(|error| format!("failed to write {y_path}: {error}"))?;
+
+    let mut rows = 0usize;
+    let mut scanned = 0u64;
+    let mut positives = 0usize;
+    for line in lines {
+        let line = line.map_err(|error| format!("failed to read telemetry: {error}"))?;
+        let index = scanned;
+        scanned += 1;
+        if index % stride != 0 {
+            continue;
+        }
+        let mut row = [0f32; FEATURES];
+        let mut target = 0f32;
+        let mut columns = 0usize;
+        let mut keep = true;
+        for (column, field) in line.trim_end().split('\t').enumerate() {
+            columns += 1;
+            if column == filter_index && field == "1" {
+                keep = false; // late-move-pruned: never searched, so not an observation
+                break;
+            }
+            if column == target_index {
+                match field.parse::<f32>() {
+                    Ok(value) => target = value,
+                    Err(_) => {
+                        keep = false;
+                        break;
+                    }
+                }
+            }
+            if let Some(slot) = slot_for.get(column).copied().flatten() {
+                match field.parse::<f32>() {
+                    Ok(value) => row[slot] = value.clamp(-clamps[slot], clamps[slot]),
+                    Err(_) => {
+                        keep = false;
+                        break;
+                    }
+                }
+            }
+        }
+        // A short row is an older schema rather than a parse error; drop it either way.
+        if !keep || columns < header.len() {
+            continue;
+        }
+        for value in row {
+            x_out
+                .write_all(&value.to_le_bytes())
+                .map_err(|error| format!("failed to write {x_path}: {error}"))?;
+        }
+        y_out
+            .write_all(&target.to_le_bytes())
+            .map_err(|error| format!("failed to write {y_path}: {error}"))?;
+        positives += usize::from(target != 0.0);
+        rows += 1;
+        if rows >= max_rows {
+            break;
+        }
+    }
+    x_out
+        .flush()
+        .map_err(|error| format!("failed to flush {x_path}: {error}"))?;
+    y_out
+        .flush()
+        .map_err(|error| format!("failed to flush {y_path}: {error}"))?;
+    drop(x_out);
+    drop(y_out);
+
+    patch_npy_rows(&x_path, rows, Some(FEATURES))?;
+    patch_npy_rows(&y_path, rows, None)?;
+    Ok(LmrExportSummary {
+        rows,
+        scanned,
+        positives,
+    })
+}
+
+/// Rewrites a written `.npy`'s fixed-size header with the final row count.
+fn patch_npy_rows(path: &str, rows: usize, cols: Option<usize>) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom};
+    let header = npy_header(rows, cols)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("failed to reopen {path}: {error}"))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("failed to seek {path}: {error}"))?;
+    file.write_all(&header)
+        .map_err(|error| format!("failed to patch {path} header: {error}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3161,5 +3368,93 @@ mod tests {
     fn label_fen_row_skips_malformed() {
         assert!(super::label_fen_row("not a position line", true).is_none());
         assert!(super::label_fen_row("fen,eval", true).is_none()); // header row
+    }
+
+    /// Builds a TSV body with the real header so the exporter's name resolution is
+    /// exercised rather than bypassed. `overrides` patch named columns per row.
+    fn telemetry_tsv(rows: &[&[(&str, &str)]]) -> String {
+        let header: Vec<&str> = TELEMETRY_TSV_HEADER.split('\t').collect();
+        let mut out = String::from(TELEMETRY_TSV_HEADER);
+        for overrides in rows {
+            let mut fields = vec!["0"; header.len()];
+            for (name, value) in *overrides {
+                let at = header.iter().position(|column| column == name).unwrap();
+                fields[at] = value;
+            }
+            out.push('\n');
+            out.push_str(&fields.join("\t"));
+        }
+        out
+    }
+
+    fn read_npy(path: &str) -> (String, Vec<f32>) {
+        let bytes = std::fs::read(path).unwrap();
+        let header = String::from_utf8(bytes[10..128].to_vec()).unwrap();
+        let values = bytes[128..]
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        (header, values)
+    }
+
+    #[test]
+    fn lmr_export_writes_mmappable_npy_and_honours_filter_stride_and_clamps() {
+        let features = engine_search::LMR_FEATURE_COLUMNS.len();
+        // Row 0: kept. Row 1: stride-skipped. Row 2: lmp_pruned, dropped.
+        // Row 3: stride-skipped. Row 4: kept, with both clamped columns past bound.
+        let tsv = telemetry_tsv(&[
+            &[("depth", "7"), ("raised_alpha", "1"), ("static_eval", "50")],
+            &[("depth", "1")],
+            &[("depth", "2"), ("lmp_pruned", "1")],
+            &[("depth", "3")],
+            &[
+                ("depth", "9"),
+                ("static_eval", "31000"),
+                ("history_score", "-999999"),
+            ],
+        ]);
+        let prefix = std::env::temp_dir()
+            .join(format!("rf-lmr-export-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let summary =
+            super::run_lmr_export_features(tsv.as_bytes(), &prefix, 2, 1_000).unwrap();
+
+        // Rows 0, 2 and 4 survive the stride; row 2 is then dropped by the filter.
+        assert_eq!(summary.rows, 2, "stride + lmp_pruned filter");
+        assert_eq!(summary.scanned, 5);
+        assert_eq!(summary.positives, 1);
+
+        let (x_header, x) = read_npy(&format!("{prefix}-X.npy"));
+        let (y_header, y) = read_npy(&format!("{prefix}-y.npy"));
+        assert!(x_header.contains(&format!("'shape': (2, {features})")), "{x_header}");
+        assert!(y_header.contains("'shape': (2,)"), "{y_header}");
+        assert_eq!(x.len(), 2 * features);
+        assert_eq!(y, vec![1.0, 0.0]);
+
+        // `depth` is feature 0; the two kept rows are the depth-7 and depth-9 ones.
+        assert_eq!(x[0], 7.0);
+        assert_eq!(x[features], 9.0);
+        // Unbounded columns are clamped at export, matching what inference clamps to.
+        let static_eval = engine_search::LMR_FEATURE_COLUMNS
+            .iter()
+            .position(|name| *name == "static_eval")
+            .unwrap();
+        let history = engine_search::LMR_FEATURE_COLUMNS
+            .iter()
+            .position(|name| *name == "history_score")
+            .unwrap();
+        assert_eq!(x[static_eval], 50.0, "in-range value passes through");
+        assert_eq!(x[features + static_eval], 2000.0, "mate score clamped");
+        assert_eq!(x[features + history], -20000.0, "history clamped");
+
+        std::fs::remove_file(format!("{prefix}-X.npy")).ok();
+        std::fs::remove_file(format!("{prefix}-y.npy")).ok();
+    }
+
+    #[test]
+    fn lmr_export_rejects_a_zero_stride_and_a_headerless_input() {
+        assert!(super::run_lmr_export_features(&b""[..], "unused", 0, 10).is_err());
+        assert!(super::run_lmr_export_features(&b""[..], "unused", 1, 10).is_err());
     }
 }
