@@ -142,15 +142,23 @@ impl LmrModel {
 /// Default correction thresholds, per-mille P(raise alpha). `SearchParams` mirrors
 /// these and is what the search actually reads, so they can be tuned per-run.
 ///
-/// Tuned by gated A/B (4096 games, 50 ms/move, equal movetime) — reducing *harder*
-/// than the original guess is worth ~11 Elo, which matches the telemetry: classical
-/// LMR errs on only 2.31% of the moves it reduces, i.e. it is conservative, so the
-/// predictably-safe majority can take another ply.
-///   500 / 20 /  60 (initial guess) -> +38.3 Elo vs classical
-///   500 / 50 / 120 (tuned)         -> +49.6 Elo vs classical
+/// Tuned by gated A/B (4096 games, 50 ms/move, equal movetime, sharded SPRT).
+/// Reducing *harder* than the original guess pays, matching what the telemetry said:
+/// classical LMR errs on only 2.31% of the moves it reduces — it is conservative, so
+/// the predictably-safe majority can take another ply. The curve plateaus:
+///
+///   unreduce/reduce2/reduce1 -> Elo vs classical
+///   500 /  20 /  60 (guess)  -> +38.3
+///   500 /  50 / 120          -> +49.6   (+11.3)
+///   500 / 100 / 220 (ADOPTED)-> +56.5   ( +6.9)
+///   500 / 180 / 400          -> +57.3   ( +0.8, i.e. noise — the plateau)
+///
+/// 220/100 and 400/180 are statistically indistinguishable, so we take the *less*
+/// aggressive of the two: equal measured strength, but less over-reduction tail risk
+/// at time controls longer than the 50 ms the gate exercised.
 pub const DEFAULT_LMR_UNREDUCE_PERMILLE: i32 = 500;
-pub const DEFAULT_LMR_REDUCE2_PERMILLE: i32 = 50;
-pub const DEFAULT_LMR_REDUCE1_PERMILLE: i32 = 120;
+pub const DEFAULT_LMR_REDUCE2_PERMILLE: i32 = 100;
+pub const DEFAULT_LMR_REDUCE1_PERMILLE: i32 = 220;
 
 /// The engine's default learned-LMR model, compiled into the binary and parsed once.
 /// Adopted 2026-07-24 after gating +38.3 Elo (equal movetime, 4096 games, AcceptH1).
