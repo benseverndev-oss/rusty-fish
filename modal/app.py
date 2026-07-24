@@ -771,6 +771,34 @@ def train_lmr(dataset: str = "d8-pilot", stride: int = 24, max_rows: int = 10_00
     print(train_lmr_run.remote(dataset, stride, max_rows, hidden, epochs))
 
 
+@app.function(image=rust_image, volumes={"/store": labels_volume}, timeout=60 * 60 * 2)
+def gate_lmr_run(model_rel: str, nodes: int, openings: int, max_plies: int) -> str:
+    """Gate the learned-LMR model vs classical LMR under EQUAL NODES via the bench
+    harness (`bench-compare nodes`). Both sides are the hand-crafted engine; the
+    candidate additionally loads the RFLM model, so the only variable is the learned
+    reduction correction. Reports W/D/L, SPRT verdict, Elo, and per-side nps."""
+    import subprocess
+    labels_volume.reload()
+    model = f"/store/lmr/{model_rel}"
+    cmd = [BIN, "bench-compare", "nodes", str(nodes), str(openings), str(max_plies), "--lmr", model]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    out = f"LMR_GATE_RESULT_BEGIN\n{result.stdout}LMR_GATE_RESULT_END"
+    print(out, flush=True)
+    return out
+
+
+@app.local_entrypoint()
+def gate_lmr(model: str = "d8-pilot-h16.rflm", nodes: int = 100_000,
+             openings: int = 512, max_plies: int = 120):
+    """Gate learned LMR vs classical LMR under equal nodes + SPRT. `openings`*2 games
+    (both colours). The equal-nodes budget isolates decision-quality-per-node — the
+    honest test for a search-shape change.
+
+        modal run modal/app.py::gate_lmr --nodes 100000 --openings 512
+    """
+    print(gate_lmr_run.remote(model, nodes, openings, max_plies))
+
+
 def _chunks(lines, size):
     for start in range(0, len(lines), size):
         yield "\n".join(lines[start:start + size])
