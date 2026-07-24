@@ -48,6 +48,28 @@ HISTORY_COL = 17      # clamped too: history scores are unbounded and would skew
 MIN_COLUMNS = max(FEATURE_COLS + [TARGET_COL, LMP_PRUNED_COL]) + 1
 
 
+def load_npy_cache(prefix):
+    """Memory-map the arrays `engine-bench lmr-export-features` wrote.
+
+    The exporter already applied the stride, the `lmp_pruned` filter and the feature
+    clamps, so this is the whole load: no parsing, no per-row Python. Returns the same
+    (X, y) contract as `load_telemetry_sample`.
+
+    Why this exists: a depth-8 pilot telemetry TSV is ~14 GB, and re-parsing it in
+    Python per training run dominated wall-clock while the actual gradient work (a
+    ~320-parameter MLP) was seconds. Exporting once makes every later run an mmap.
+    """
+    import numpy as np
+
+    X = np.load(f"{prefix}-X.npy", mmap_mode="r")
+    y = np.load(f"{prefix}-y.npy", mmap_mode="r")
+    if len(X) != len(y):
+        raise ValueError(f"cache row mismatch: X has {len(X)}, y has {len(y)}")
+    if X.shape[1] != INPUT_DIM:
+        raise ValueError(f"cache has {X.shape[1]} features, model wants {INPUT_DIM}")
+    return X, y
+
+
 def load_telemetry_sample(path, stride=24, max_rows=10_000_000):
     """Stride-sample the (huge) telemetry TSV into standardization-ready float arrays.
 
@@ -95,6 +117,11 @@ def train(X, y, hidden=16, epochs=12, batch_size=8192, lr=1e-3, device="cpu"):
     import numpy as np
     import torch
     from torch import nn
+
+    # X/y may be read-only memmaps from the .npy cache; torch.from_numpy needs owned,
+    # writable, contiguous arrays.
+    X = np.ascontiguousarray(X, dtype=np.float32)
+    y = np.ascontiguousarray(y, dtype=np.float32)
 
     mean = X.mean(axis=0)
     std = X.std(axis=0)

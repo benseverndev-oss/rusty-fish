@@ -15,7 +15,10 @@ mod telemetry;
 
 pub use lmr_model::{bundled_lmr_model, LmrModel, LMR_FEATURES};
 pub use nnue::{active_features, bundled_network, Nnue, INPUT_DIMENSION};
-pub use telemetry::{MoveDecision, TelemetryCollector, TELEMETRY_TSV_HEADER};
+pub use telemetry::{
+    MoveDecision, TelemetryCollector, LMR_FEATURE_CLAMPS, LMR_FEATURE_COLUMNS, LMR_FILTER_COLUMN,
+    LMR_TARGET_COLUMN, TELEMETRY_TSV_HEADER,
+};
 
 const MATE_SCORE: i32 = 100_000;
 const MAX_KILLER_PLY: usize = 128;
