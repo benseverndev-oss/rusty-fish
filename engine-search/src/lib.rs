@@ -13,7 +13,7 @@ mod lmr_model;
 mod nnue;
 mod telemetry;
 
-pub use lmr_model::{LmrModel, LMR_FEATURES};
+pub use lmr_model::{bundled_lmr_model, LmrModel, LMR_FEATURES};
 pub use nnue::{active_features, bundled_network, Nnue, INPUT_DIMENSION};
 pub use telemetry::{MoveDecision, TelemetryCollector, TELEMETRY_TSV_HEADER};
 
@@ -558,7 +558,9 @@ impl Default for Searcher {
             opening_book: None,
             syzygy: None,
             telemetry: None,
-            lmr_model: None,
+            // Learned LMR is the default (adopted after gating +38.3 Elo, equal movetime,
+            // 4096 games, AcceptH1). `set_lmr_model(None)` restores classical LMR.
+            lmr_model: Some(bundled_lmr_model()),
         }
     }
 }
@@ -2715,7 +2717,10 @@ mod tests {
         for fen in fens {
             let board = Board::from_fen(fen).unwrap();
             let limits = SearchLimits { depth: Some(8), ..SearchLimits::default() };
+            // `off` = classical LMR (learned LMR is now the default, so disable it
+            // explicitly); `on` = the zero-correction model. They must be identical.
             let mut off = Searcher::default();
+            off.set_lmr_model(None);
             let off_result = off.search(&board, limits.clone());
             let mut on = Searcher::default();
             on.set_lmr_model(Some(model.clone()));

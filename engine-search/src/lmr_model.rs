@@ -8,6 +8,8 @@
 //! | u32 hidden | mean[input_dim] f32 | scale[input_dim] f32 | w1[hidden*input_dim]
 //! f32 (row-major [hidden, input]) | b1[hidden] f32 | w2[hidden] f32 | b2 f32.
 
+use std::sync::LazyLock;
+
 const MAGIC: &[u8; 4] = b"RFLM";
 const VERSION: u32 = 1;
 
@@ -121,6 +123,18 @@ impl LmrModel {
     }
 }
 
+/// The engine's default learned-LMR model, compiled into the binary and parsed once.
+/// Adopted 2026-07-24 after gating +38.3 Elo (equal movetime, 4096 games, AcceptH1).
+static BUNDLED_LMR_MODEL: LazyLock<LmrModel> = LazyLock::new(|| {
+    LmrModel::from_bytes(include_bytes!("../../assets/lmr/rusty-fish-lmr.rflm"))
+        .expect("bundled LMR asset is a valid RFLM model")
+});
+
+/// The bundled default learned-LMR model (a cheap clone of the parsed-once model).
+pub fn bundled_lmr_model() -> LmrModel {
+    BUNDLED_LMR_MODEL.clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +207,14 @@ mod tests {
         let mut bytes = build_rflm(1, &vec![0.0; LMR_FEATURES], &[0.0], &[0.0], 0.0);
         bytes[8] = 9; // corrupt input_dim (byte after magic+version)
         assert!(LmrModel::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn bundled_lmr_model_parses_and_predicts_sanely() {
+        let model = bundled_lmr_model();
+        let feats = [6.0, 4.0, 5.0, 1.0, 0.0, 0.0, 0.0, 20.0, 0.0, 1.0];
+        let p = model.raise_alpha_prob(&feats);
+        assert!((0.0..=1.0).contains(&p), "probability {p} out of [0,1]");
+        assert!((-1..=2).contains(&model.reduction_correction(&feats)));
     }
 }
