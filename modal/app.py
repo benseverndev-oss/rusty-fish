@@ -800,7 +800,8 @@ def gate_lmr(model: str = "d8-pilot-h16.rflm", nodes: int = 100_000,
 
 
 @app.function(image=rust_image, volumes={"/store": labels_volume}, timeout=60 * 60, cpu=2.0)
-def gate_lmr_shard(model_rel: str, movetime_ms: int, openings: int, max_plies: int, seed: int) -> tuple:
+def gate_lmr_shard(model_rel: str, movetime_ms: int, openings: int, max_plies: int, seed: int,
+                   extra: str = "") -> tuple:
     """One gate shard: `bench-compare movetime` with a distinct `--seed` (so shards play
     different openings) + the RFLM model on the candidate. Returns raw (W, D, L) for
     aggregation into one powered SPRT. Movetime (not nodes) because the equal-nodes budget
@@ -811,6 +812,8 @@ def gate_lmr_shard(model_rel: str, movetime_ms: int, openings: int, max_plies: i
     model = f"/store/lmr/{model_rel}"
     cmd = [BIN, "bench-compare", "movetime", str(movetime_ms), str(openings), str(max_plies),
            "--lmr", model, "--seed", str(seed)]
+    if extra:
+        cmd.extend(extra.split())  # e.g. "--lmr-reduce1 120 --lmr-reduce2 50" (policy A/B)
     out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
     wins = draws = losses = 0
     for row in out.strip().splitlines():
@@ -823,11 +826,12 @@ def gate_lmr_shard(model_rel: str, movetime_ms: int, openings: int, max_plies: i
 
 @app.function(timeout=60 * 60 * 2)
 def gate_lmr_sharded_run(model_rel: str, movetime_ms: int, shards: int, openings_per_shard: int,
-                         max_plies: int) -> str:
+                         max_plies: int, extra: str = "") -> str:
     """Powered equal-movetime gate: fan `shards` bench-compare runs across containers, sum
-    W/D/L, run ONE SPRT over the total. Server-side so a spawned run survives client exit."""
+    W/D/L, run ONE SPRT over the total. Server-side so a spawned run survives client exit.
+    `extra` forwards bench-compare flags (e.g. --lmr-reduce1) to A/B the policy."""
     results = list(gate_lmr_shard.starmap(
-        [(model_rel, movetime_ms, openings_per_shard, max_plies, s) for s in range(shards)]
+        [(model_rel, movetime_ms, openings_per_shard, max_plies, s, extra) for s in range(shards)]
     ))
     wins = sum(r[0] for r in results)
     draws = sum(r[1] for r in results)
@@ -842,14 +846,14 @@ def gate_lmr_sharded_run(model_rel: str, movetime_ms: int, shards: int, openings
 
 @app.local_entrypoint()
 def gate_lmr_sharded(model: str = "d8-pilot-h16.rflm", movetime_ms: int = 50, shards: int = 32,
-                     openings_per_shard: int = 64, max_plies: int = 160):
+                     openings_per_shard: int = 64, max_plies: int = 160, extra: str = ""):
     """Decisive equal-movetime SPRT gate for learned LMR, sharded across containers.
     `shards * openings_per_shard * 2` games (default 32*64*2 = 4096). spawn: the client
     exits immediately; the verdict prints as LMR_SHARDED_GATE in `modal app logs`.
 
         modal run --detach modal/app.py::gate_lmr_sharded --movetime-ms 50 --shards 32
     """
-    call = gate_lmr_sharded_run.spawn(model, movetime_ms, shards, openings_per_shard, max_plies)
+    call = gate_lmr_sharded_run.spawn(model, movetime_ms, shards, openings_per_shard, max_plies, extra)
     print(f"gate_lmr_sharded dispatched server-side (call {call.object_id}); it survives "
           f"client exit. Verdict prints as LMR_SHARDED_GATE in `modal app logs`.")
 
