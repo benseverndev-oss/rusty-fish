@@ -58,12 +58,36 @@ pub struct MoveDecision {
     /// Nodes spent searching this move's subtree (delta of the searcher's node
     /// counter across this move's child searches and any re-searches).
     pub subtree_nodes: u64,
+
+    // --- v2 context (APPENDED, never inserted) ---
+    // Measured finding: the learned-LMR model saturated at val AUC ~0.94 across both
+    // more data and more capacity — it is *feature*-limited. These are the cheap,
+    // high-signal fields available at the same hook. They are appended at the end so
+    // every existing column index (notably the target and the lmp_pruned filter) is
+    // unchanged and older readers keep working.
+    /// The move's history-heuristic score at this node.
+    pub history_score: i32,
+    /// The move is the transposition-table move (`is_priority` split into its parts,
+    /// which carry more signal separately than as one OR'd flag).
+    pub is_tt_move: bool,
+    /// The move is a killer at this ply.
+    pub is_killer: bool,
+    /// The move is the counter-move for the previous move.
+    pub is_counter: bool,
+    /// The move captures (including en passant).
+    pub is_capture: bool,
+    /// The move promotes.
+    pub is_promotion: bool,
+    /// The *node* is in check (distinct from `gives_check`, which is the child).
+    pub node_in_check: bool,
+    /// Depth of the transposition-table entry at this node, `0` when there is none.
+    pub tt_depth: u8,
 }
 
 /// TSV header row for the v1 schema, including the leading `pos_id` column that
 /// the dataset generator prepends. Kept adjacent to [`MoveDecision::to_tsv_row`]
 /// so the column order stays single-sourced.
-pub const TELEMETRY_TSV_HEADER: &str = "pos_id\tdepth\tply\tmove_index\tis_quiet\tis_priority\tpv_node\tgives_check\tstatic_eval\textension\treduction\tlmp_pruned\traised_alpha\tcaused_cutoff\tneeded_lmr_research\tneeded_pvs_research\tsubtree_nodes";
+pub const TELEMETRY_TSV_HEADER: &str = "pos_id\tdepth\tply\tmove_index\tis_quiet\tis_priority\tpv_node\tgives_check\tstatic_eval\textension\treduction\tlmp_pruned\traised_alpha\tcaused_cutoff\tneeded_lmr_research\tneeded_pvs_research\tsubtree_nodes\thistory_score\tis_tt_move\tis_killer\tis_counter\tis_capture\tis_promotion\tnode_in_check\ttt_depth";
 
 impl MoveDecision {
     /// Serializes this record as one TSV row, prefixed with `pos_id`. The column
@@ -71,7 +95,8 @@ impl MoveDecision {
     pub fn to_tsv_row(&self, pos_id: u64) -> String {
         let b = |flag: bool| u8::from(flag);
         format!(
-            "{pos_id}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{pos_id}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\
+             \t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.depth,
             self.ply,
             self.move_index,
@@ -88,6 +113,14 @@ impl MoveDecision {
             b(self.needed_lmr_research),
             b(self.needed_pvs_research),
             self.subtree_nodes,
+            self.history_score,
+            b(self.is_tt_move),
+            b(self.is_killer),
+            b(self.is_counter),
+            b(self.is_capture),
+            b(self.is_promotion),
+            b(self.node_in_check),
+            self.tt_depth,
         )
     }
 }
@@ -188,6 +221,14 @@ mod tests {
             needed_lmr_research: false,
             needed_pvs_research: true,
             subtree_nodes: 1234,
+            history_score: -55,
+            is_tt_move: true,
+            is_killer: false,
+            is_counter: true,
+            is_capture: false,
+            is_promotion: true,
+            node_in_check: false,
+            tt_depth: 4,
         };
         let row = record.to_tsv_row(9);
         let header_cols = TELEMETRY_TSV_HEADER.split('\t').count();
@@ -195,7 +236,7 @@ mod tests {
         assert_eq!(header_cols, row_cols, "row arity must match the header");
         assert_eq!(
             row,
-            "9\t7\t3\t5\t1\t0\t1\t0\t-42\t1\t2\t0\t1\t1\t0\t1\t1234"
+            "9\t7\t3\t5\t1\t0\t1\t0\t-42\t1\t2\t0\t1\t1\t0\t1\t1234\t-55\t1\t0\t1\t0\t1\t0\t4"
         );
     }
 }

@@ -26,11 +26,22 @@ import struct
 MAGIC = b"RFLM"
 VERSION = 1
 # Feature columns (order defines the model input vector) and the target/filter cols.
-FEATURE_COLS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]  # depth..reduction
+# v1 context is 1..10 (depth..reduction); v2 appended 17..24 (history_score,
+# is_tt_move, is_killer, is_counter, is_capture, is_promotion, node_in_check,
+# tt_depth). The v2 columns are APPENDED in the TSV, so the target and filter column
+# indices below are unchanged from v1.
+#
+# Why: the v1 model saturated at val AUC ~0.94 across both more data and more
+# capacity — it was feature-limited, not data- or capacity-limited. These columns are
+# the cheap high-signal additions available at the same hook.
+FEATURE_COLS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 17, 18, 19, 20, 21, 22, 23, 24]
 TARGET_COL = 12       # raised_alpha
 LMP_PRUNED_COL = 11   # exclude pruned (unsearched) moves — their outcome is not real
 INPUT_DIM = len(FEATURE_COLS)
 STATIC_EVAL_COL = 8   # clamped before standardization so mate scores don't blow the scale
+HISTORY_COL = 17      # clamped too: history scores are unbounded and would skew the scale
+# Rows shorter than this are a different (older) schema and are skipped.
+MIN_COLUMNS = max(FEATURE_COLS + [TARGET_COL, LMP_PRUNED_COL]) + 1
 
 
 def load_telemetry_sample(path, stride=24, max_rows=10_000_000):
@@ -50,7 +61,7 @@ def load_telemetry_sample(path, stride=24, max_rows=10_000_000):
             if i % stride:
                 continue
             parts = line.rstrip("\n").split("\t")
-            if len(parts) < 17:
+            if len(parts) < MIN_COLUMNS:
                 continue
             if parts[LMP_PRUNED_COL] == "1":
                 continue
@@ -59,9 +70,11 @@ def load_telemetry_sample(path, stride=24, max_rows=10_000_000):
                 y = float(parts[TARGET_COL])
             except ValueError:
                 continue
-            # Clamp static_eval so a single mate-scored node can't dominate the scale.
+            # Clamp the unbounded scalars so one extreme row can't dominate the scale.
             idx = FEATURE_COLS.index(STATIC_EVAL_COL)
             row[idx] = max(-2000.0, min(2000.0, row[idx]))
+            hidx = FEATURE_COLS.index(HISTORY_COL)
+            row[hidx] = max(-20000.0, min(20000.0, row[hidx]))
             feats.append(row)
             targets.append(y)
             if len(targets) >= max_rows:

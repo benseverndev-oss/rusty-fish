@@ -1378,25 +1378,38 @@ impl Searcher {
                 // Late-move pruning: this move (and the rest of the list) is
                 // skipped. Record the pruned move with zeroed outcome fields; it
                 // is not searched. Counterfactual verification is a later phase.
-                if let Some(collector) = self.telemetry.as_mut() {
-                    collector.push(MoveDecision {
-                        depth,
-                        ply: ply as u16,
-                        move_index: move_index as u16,
-                        is_quiet,
-                        is_priority: is_priority_move,
-                        pv_node,
-                        gives_check: false,
-                        static_eval: node_static_eval,
-                        extension: 0,
-                        reduction: 0,
-                        lmp_pruned: true,
-                        raised_alpha: false,
-                        caused_cutoff: false,
-                        needed_lmr_research: false,
-                        needed_pvs_research: false,
-                        subtree_nodes: 0,
-                    });
+                if self.telemetry.is_some() {
+                    let (history_score, is_tt_move, is_killer, is_counter, is_capture,
+                         is_promotion, tt_depth) =
+                        self.telemetry_context(board, mv, ply, previous_move, tt_move, tt_key);
+                    if let Some(collector) = self.telemetry.as_mut() {
+                        collector.push(MoveDecision {
+                            depth,
+                            ply: ply as u16,
+                            move_index: move_index as u16,
+                            is_quiet,
+                            is_priority: is_priority_move,
+                            pv_node,
+                            gives_check: false,
+                            static_eval: node_static_eval,
+                            extension: 0,
+                            reduction: 0,
+                            lmp_pruned: true,
+                            raised_alpha: false,
+                            caused_cutoff: false,
+                            needed_lmr_research: false,
+                            needed_pvs_research: false,
+                            subtree_nodes: 0,
+                            history_score,
+                            is_tt_move,
+                            is_killer,
+                            is_counter,
+                            is_capture,
+                            is_promotion,
+                            node_in_check: in_check,
+                            tt_depth,
+                        });
+                    }
                 }
                 break;
             }
@@ -1487,25 +1500,40 @@ impl Searcher {
             let raised_alpha = score > alpha;
             alpha = alpha.max(score);
             let caused_cutoff = alpha >= beta;
-            if let Some(collector) = self.telemetry.as_mut() {
-                collector.push(MoveDecision {
-                    depth,
-                    ply: ply as u16,
-                    move_index: move_index as u16,
-                    is_quiet,
-                    is_priority: is_priority_move,
-                    pv_node,
-                    gives_check,
-                    static_eval: node_static_eval,
-                    extension,
-                    reduction,
-                    lmp_pruned: false,
-                    raised_alpha,
-                    caused_cutoff,
-                    needed_lmr_research,
-                    needed_pvs_research,
-                    subtree_nodes: self.nodes - subtree_nodes_before,
-                });
+            if self.telemetry.is_some() {
+                // `board` is back to its pre-move state here (unmake above), which is
+                // what `telemetry_context` needs to read capture/history correctly.
+                let (history_score, is_tt_move, is_killer, is_counter, is_capture,
+                     is_promotion, tt_depth) =
+                    self.telemetry_context(board, mv, ply, previous_move, tt_move, tt_key);
+                if let Some(collector) = self.telemetry.as_mut() {
+                    collector.push(MoveDecision {
+                        depth,
+                        ply: ply as u16,
+                        move_index: move_index as u16,
+                        is_quiet,
+                        is_priority: is_priority_move,
+                        pv_node,
+                        gives_check,
+                        static_eval: node_static_eval,
+                        extension,
+                        reduction,
+                        lmp_pruned: false,
+                        raised_alpha,
+                        caused_cutoff,
+                        needed_lmr_research,
+                        needed_pvs_research,
+                        subtree_nodes: self.nodes - subtree_nodes_before,
+                        history_score,
+                        is_tt_move,
+                        is_killer,
+                        is_counter,
+                        is_capture,
+                        is_promotion,
+                        node_in_check: in_check,
+                        tt_depth,
+                    });
+                }
             }
             if caused_cutoff {
                 self.record_cutoff(ply as usize, mv, depth, previous_move, is_quiet);
@@ -1850,6 +1878,44 @@ impl Searcher {
                 && board
                     .piece_at(mv.from)
                     .is_some_and(|piece| piece.kind == PieceKind::Pawn))
+    }
+
+    /// The v2 telemetry context fields for `mv` at this node, as
+    /// `(history_score, is_tt_move, is_killer, is_counter, is_capture, is_promotion,
+    /// tt_depth)`.
+    ///
+    /// Called **only** while telemetry is collecting, so normal play never pays for
+    /// it — in particular `is_priority_move` keeps its short-circuit in the hot loop
+    /// and the killer/counter/TT parts are re-derived here purely for the dataset.
+    /// `board` must be in its pre-move state (both record sites satisfy that: the
+    /// pruned move is never made, and the searched move is recorded after unmake).
+    #[allow(clippy::too_many_arguments)]
+    fn telemetry_context(
+        &self,
+        board: &Board,
+        mv: ChessMove,
+        ply: i32,
+        previous_move: Option<ChessMove>,
+        tt_move: Option<ChessMove>,
+        tt_key: u64,
+    ) -> (i32, bool, bool, bool, bool, bool, u8) {
+        let history_score = self.history[history_index(mv)];
+        let is_tt_move = Some(mv) == tt_move;
+        let is_killer = self
+            .killer_moves
+            .get(ply as usize)
+            .is_some_and(|killers| killers.contains(&Some(mv)));
+        let is_counter = previous_move
+            .and_then(|previous| self.counter_moves[history_index(previous)])
+            == Some(mv);
+        let is_capture = board.piece_at(mv.to).is_some()
+            || (board.en_passant() == Some(mv.to)
+                && board
+                    .piece_at(mv.from)
+                    .is_some_and(|piece| piece.kind == PieceKind::Pawn));
+        let is_promotion = mv.promotion.is_some();
+        let tt_depth = self.tt.get(tt_key).map_or(0, |entry| entry.depth);
+        (history_score, is_tt_move, is_killer, is_counter, is_capture, is_promotion, tt_depth)
     }
 
     fn tt_capacity_entries(&self) -> usize {
