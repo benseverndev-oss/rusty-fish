@@ -3373,8 +3373,8 @@ mod tests {
     /// Builds a TSV body with the real header so the exporter's name resolution is
     /// exercised rather than bypassed. `overrides` patch named columns per row.
     fn telemetry_tsv(rows: &[&[(&str, &str)]]) -> String {
-        let header: Vec<&str> = TELEMETRY_TSV_HEADER.split('\t').collect();
-        let mut out = String::from(TELEMETRY_TSV_HEADER);
+        let header: Vec<&str> = engine_search::TELEMETRY_TSV_HEADER.split('\t').collect();
+        let mut out = String::from(engine_search::TELEMETRY_TSV_HEADER);
         for overrides in rows {
             let mut fields = vec!["0"; header.len()];
             for (name, value) in *overrides {
