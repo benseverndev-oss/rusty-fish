@@ -639,7 +639,7 @@ fn main() -> Result<(), String> {
         let max_plies = arg_u32(5).unwrap_or(120);
         let candidate = apply_lmr_flag(EngineConfig::handcrafted("candidate"))?;
         let baseline = EngineConfig::handcrafted("baseline");
-        let fens = compare_openings(openings, BENCH_COMPARE_SEED);
+        let fens = compare_openings(openings, BENCH_COMPARE_SEED.wrapping_add(seed_offset()));
         let report = run_bench_compare(
             &fens,
             &candidate,
@@ -656,7 +656,7 @@ fn main() -> Result<(), String> {
         let max_plies = arg_u32(3).unwrap_or(120);
         let candidate = apply_lmr_flag(EngineConfig::handcrafted("candidate"))?;
         let baseline = EngineConfig::handcrafted("baseline");
-        let fens = compare_openings(openings, BENCH_COMPARE_SEED);
+        let fens = compare_openings(openings, BENCH_COMPARE_SEED.wrapping_add(seed_offset()));
         let modes = [
             BudgetMode::Nodes(10_000),
             BudgetMode::Nodes(50_000),
@@ -676,7 +676,7 @@ fn main() -> Result<(), String> {
         let max_plies = arg_u32(3).unwrap_or(120);
         let candidate = apply_lmr_flag(EngineConfig::handcrafted("candidate"))?;
         let baseline = EngineConfig::handcrafted("baseline");
-        let fens = compare_openings(openings, BENCH_COMPARE_SEED);
+        let fens = compare_openings(openings, BENCH_COMPARE_SEED.wrapping_add(seed_offset()));
         let mut config = BenchReportConfig::default();
         config.max_plies = max_plies;
         let report = run_bench_report(&fens, &candidate, &baseline, config)?;
@@ -780,6 +780,13 @@ fn apply_lmr_flag(candidate: EngineConfig) -> Result<EngineConfig, String> {
         Some(path) => Ok(candidate.with_lmr(engine_search::LmrModel::from_file(&path)?)),
         None => Ok(candidate),
     }
+}
+
+/// A `--seed <n>` opening-seed offset (default 0) so sharded gate runs — each an
+/// independent `bench-compare` — play DIFFERENT openings, letting a Modal fan-out sum
+/// their W/D/L into one powered SPRT.
+fn seed_offset() -> u64 {
+    flag_value("--seed").and_then(|value| value.parse::<u64>().ok()).unwrap_or(0)
 }
 
 fn join_usize(values: &[usize]) -> String {
