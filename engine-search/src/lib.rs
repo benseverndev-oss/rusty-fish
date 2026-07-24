@@ -1395,12 +1395,20 @@ impl Searcher {
                 .max(u8::from(singular_extension));
             let next_depth = depth.saturating_sub(1) + extension.min(1);
             let base_reduction = late_move_reduction(depth, move_index, is_quiet && extension == 0);
-            // Learned-LMR correction (Phase 2): only adjust moves the classical formula
-            // already reduces (`base_reduction > 0`), so the model never introduces a
-            // reduction on an early / tactical / PV move; the re-search below keeps any
-            // over-reduction tactically safe. `None` (default) => byte-identical search.
+            // Learned-LMR correction (Phase 2). The model may both ADJUST a classical
+            // reduction and INTRODUCE one on a quiet, unextended move the classical
+            // formula leaves at full depth (it only reduces from move_index >= 3) — that
+            // is where most of the remaining headroom is, since ~85% of moves are
+            // unreduced. Guards that keep it safe:
+            //   - never `move_index == 0`: the PV move is searched full-window, but the
+            //     LMR re-search below is null-window, which would be wrong for a PV node;
+            //   - never a tactical/extended move (`extension != 0`) or a noisy move;
+            //   - `depth >= 3`, matching where reductions are meaningful at all.
+            // Any over-reduction stays tactically safe via the existing re-search.
+            // `None` (the classical baseline) => byte-identical search.
+            let model_eligible = is_quiet && extension == 0 && move_index >= 1 && depth >= 3;
             let reduction = match self.lmr_model.as_ref() {
-                Some(model) if base_reduction > 0 => {
+                Some(model) if model_eligible => {
                     let feats = [
                         f32::from(depth),
                         ply as f32,
