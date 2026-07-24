@@ -204,6 +204,21 @@ pub fn bundled_lmr_model() -> LmrModel {
     BUNDLED_LMR_MODEL.clone()
 }
 
+/// Bias that puts an all-zero-weight model in the middle of the no-correction band
+/// `[reduce1, unreduce)`, expressed as a logit so the forward pass reproduces exactly
+/// that probability for every input.
+///
+/// Derived from the threshold constants rather than hardcoded: a fixture pinned to
+/// one set of thresholds silently stops testing what it claims the moment they are
+/// re-swept, which is exactly what happened when the v2 model moved the band.
+#[cfg(test)]
+pub(crate) fn neutral_correction_bias() -> f32 {
+    let permille =
+        (DEFAULT_LMR_REDUCE1_PERMILLE + DEFAULT_LMR_UNREDUCE_PERMILLE) as f32 / 2.0;
+    let probability = permille / 1000.0;
+    (probability / (1.0 - probability)).ln()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,12 +276,18 @@ mod tests {
 
     #[test]
     fn zero_weights_with_neutral_bias_gives_zero_correction() {
-        // All-zero weights => out = b2; b2 = -1 => p = sigmoid(-1) ~= 0.269, which is in
-        // [0.06, 0.50) => correction 0. This is the model used by the search's
-        // byte-identical test (its only effect is via the correction).
-        let model =
-            LmrModel::from_bytes(&build_rflm(1, &vec![0.0; LMR_FEATURES], &[0.0], &[0.0], -1.0))
-                .unwrap();
+        // All-zero weights => out = b2 for every input, so the bias alone decides the
+        // probability. `neutral_correction_bias` places it mid-band, which is the
+        // model the search's byte-identical test installs (its only possible effect on
+        // the search is via the correction, so a zero correction must change nothing).
+        let model = LmrModel::from_bytes(&build_rflm(
+            1,
+            &vec![0.0; LMR_FEATURES],
+            &[0.0],
+            &[0.0],
+            neutral_correction_bias(),
+        ))
+        .unwrap();
         assert_eq!(model.reduction_correction(&[42.0; LMR_FEATURES]), 0);
     }
 
