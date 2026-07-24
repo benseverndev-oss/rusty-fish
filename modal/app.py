@@ -635,6 +635,64 @@ def label_public(
           f"client exit. Row count prints as LABEL_PUBLIC_DONE in `modal app logs`.")
 
 
+@app.function(image=rust_image, volumes={"/store": labels_volume}, timeout=60 * 60 * 8)
+def gen_telemetry_run(url: str, max_positions: int, depth: int, dataset: str) -> int:
+    """Phase 2 (learned LMR) dataset generation: stream FENs from the lichess eval DB,
+    run a depth-`depth` search over each with per-move-decision telemetry (Phase 1's
+    `gen-search-telemetry`), and land the TSV in the store at
+    `/store/telemetry/{dataset}/`.
+
+    Unlike `label_public` (which just reads pre-computed evals), this runs a FULL search
+    per position, so it is search-compute-heavy — one bounded single-container stream at
+    pilot scale (`zstd` isn't seekable, so no byte-range sharding; scale later shards a
+    materialized FEN list). Each position emits many `MoveDecision` rows, so `records`
+    >> `positions`. Streams `curl | zstd -dc | jq '.fen + " 0 1"' | head | gen-search-telemetry`;
+    the jq pads the 4-field lichess FEN to 6 fields the engine's `from_fen` wants."""
+    import subprocess, os
+    out_dir = f"/store/telemetry/{dataset}"
+    os.makedirs(out_dir, exist_ok=True)
+    out = f"{out_dir}/samples-telemetry-0.tsv"
+    # No `pipefail`: `head` closing the pipe SIGPIPEs curl/zstd/jq by design once
+    # max_positions FENs are through; the meaningful exit is gen-search-telemetry's.
+    cmd = (
+        f'curl -sS --max-time 14400 "{url}" '
+        f'| zstd -dc --long=31 '
+        r"""| jq -r '.fen + " 0 1"' """
+        f'| head -n {max_positions} '
+        f'| {BIN} gen-search-telemetry - {depth} > {out}'
+    )
+    subprocess.run(["bash", "-c", cmd], check=True)
+    labels_volume.commit()
+    with open(out, "r", encoding="utf-8") as handle:
+        rows = sum(1 for line in handle if line.strip())
+    records = max(rows - 1, 0)  # minus the single TSV header row
+    print(f"GEN_TELEMETRY_DONE dataset={dataset} depth={depth} positions<={max_positions} "
+          f"records={records}", flush=True)
+    return records
+
+
+@app.local_entrypoint()
+def gen_telemetry(
+    url: str = "https://database.lichess.org/lichess_db_eval.jsonl.zst",
+    max_positions: int = 5000,
+    depth: int = 8,
+    dataset: str = "d8-pilot",
+):
+    """Generate the search-decision dataset for learned LMR (Phase 2). Runs depth-`depth`
+    searches over lichess FENs with per-move-decision telemetry into
+    `/store/telemetry/<dataset>`. The pilot default is deliberately small (5000 positions,
+    depth 8) to measure per-position record volume + class balance (raised_alpha /
+    needed_lmr_research rates) before committing to a full-scale generation config.
+
+        modal run --detach modal/app.py::gen_telemetry --max-positions 5000 --depth 8
+
+    spawn: the client exits immediately; the record count prints server-side as
+    GEN_TELEMETRY_DONE (retrieve via `modal app logs`)."""
+    call = gen_telemetry_run.spawn(url, max_positions, depth, dataset)
+    print(f"gen_telemetry dispatched server-side (call {call.object_id}); it survives "
+          f"client exit. Record count prints as GEN_TELEMETRY_DONE in `modal app logs`.")
+
+
 def _chunks(lines, size):
     for start in range(0, len(lines), size):
         yield "\n".join(lines[start:start + size])
