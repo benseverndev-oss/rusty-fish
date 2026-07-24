@@ -9,9 +9,11 @@ use pyrrhic_rs::{
     Color as TbColor, DtzProbeValue, EngineAdapter, Piece as TbPiece, TableBases, WdlProbeResult,
 };
 
+mod lmr_model;
 mod nnue;
 mod telemetry;
 
+pub use lmr_model::{LmrModel, LMR_FEATURES};
 pub use nnue::{active_features, bundled_network, Nnue, INPUT_DIMENSION};
 pub use telemetry::{MoveDecision, TelemetryCollector, TELEMETRY_TSV_HEADER};
 
@@ -513,6 +515,11 @@ pub struct Searcher {
     /// record site a single cheap branch with no allocation and no effect on the
     /// search; `Some` collects a [`MoveDecision`] per move considered.
     telemetry: Option<TelemetryCollector>,
+    /// Optional learned-LMR model (Phase 2). `None` (the default) keeps the classical
+    /// late-move reduction unchanged — the search is byte-identical to LMR-off. `Some`
+    /// applies a clamped reduction correction to moves the classical formula already
+    /// reduces.
+    lmr_model: Option<LmrModel>,
 }
 
 /// One square's piece change from a move: `(square, before, after)`.
@@ -551,6 +558,7 @@ impl Default for Searcher {
             opening_book: None,
             syzygy: None,
             telemetry: None,
+            lmr_model: None,
         }
     }
 }
@@ -819,6 +827,13 @@ impl Searcher {
         self.telemetry = None;
     }
 
+    /// Installs (or clears with `None`) the learned-LMR model (Phase 2). With no model
+    /// the search is byte-identical to classical LMR; with a model, moves the classical
+    /// formula reduces get a clamped reduction correction.
+    pub fn set_lmr_model(&mut self, model: Option<LmrModel>) {
+        self.lmr_model = model;
+    }
+
     /// Drains and returns the collected [`MoveDecision`] records, leaving
     /// collection enabled (if it was) and ready to collect again. Returns an
     /// empty vector when telemetry is disabled.
@@ -839,6 +854,7 @@ impl Searcher {
         params: SearchParams,
         eval_params: EvalParams,
         nnue: Option<Arc<Nnue>>,
+        lmr_model: Option<LmrModel>,
     ) -> Self {
         Self {
             nodes: 0,
@@ -860,6 +876,7 @@ impl Searcher {
             opening_book: None,
             syzygy: None,
             telemetry: None,
+            lmr_model,
         }
     }
 
@@ -1008,10 +1025,11 @@ impl Searcher {
                 let params = self.params;
                 let eval_params = self.eval_params;
                 let nnue = self.nnue.clone();
+                let lmr = self.lmr_model.clone();
                 let helper_board = board.clone();
                 let stop = Arc::clone(&shared_stop);
                 helper_handles.push(thread::spawn(move || {
-                    Searcher::helper(tt, options, params, eval_params, nnue).run_lazy_smp_helper(
+                    Searcher::helper(tt, options, params, eval_params, nnue, lmr).run_lazy_smp_helper(
                         &helper_board,
                         max_depth,
                         deadline,
@@ -1374,7 +1392,31 @@ impl Searcher {
                 .max(pawn_extension)
                 .max(u8::from(singular_extension));
             let next_depth = depth.saturating_sub(1) + extension.min(1);
-            let reduction = late_move_reduction(depth, move_index, is_quiet && extension == 0);
+            let base_reduction = late_move_reduction(depth, move_index, is_quiet && extension == 0);
+            // Learned-LMR correction (Phase 2): only adjust moves the classical formula
+            // already reduces (`base_reduction > 0`), so the model never introduces a
+            // reduction on an early / tactical / PV move; the re-search below keeps any
+            // over-reduction tactically safe. `None` (default) => byte-identical search.
+            let reduction = match self.lmr_model.as_ref() {
+                Some(model) if base_reduction > 0 => {
+                    let feats = [
+                        f32::from(depth),
+                        ply as f32,
+                        move_index as f32,
+                        f32::from(u8::from(is_quiet)),
+                        f32::from(u8::from(is_priority_move)),
+                        f32::from(u8::from(pv_node)),
+                        f32::from(u8::from(gives_check)),
+                        node_static_eval as f32,
+                        f32::from(extension),
+                        f32::from(base_reduction),
+                    ];
+                    let corrected =
+                        i16::from(base_reduction) + i16::from(model.reduction_correction(&feats));
+                    corrected.clamp(0, i16::from(next_depth)) as u8
+                }
+                _ => base_reduction,
+            };
             let search_depth = next_depth.saturating_sub(reduction);
             // Snapshot the node counter to attribute this move's subtree size.
             let subtree_nodes_before = self.nodes;
@@ -2627,7 +2669,7 @@ mod tests {
     use pyrrhic_rs::{Piece as TbPiece, WdlProbeResult};
 
     use super::{
-        Bound, ClockControl, EvalParams, MATE_SCORE, Nnue, OpeningBook, SearchLimits, SearchOptions,
+        Bound, ClockControl, EvalParams, LMR_FEATURES, LmrModel, MATE_SCORE, Nnue, OpeningBook, SearchLimits, SearchOptions,
         SearchParams, Searcher, SharedTranspositionTable, SyzygyRootProbe,
         SyzygyTablebases, SyzygyWdl, TaperedScore, TranspositionEntry, TranspositionTable,
         evaluate_position, history_index, late_move_reduction, passed_pawn_extension,
@@ -2636,6 +2678,53 @@ mod tests {
         reverse_futility_margin, can_apply_static_pruning, can_try_singular_extension,
         singular_verification_beta,
     };
+
+    /// Builds an all-zero-weights RFLM with `b2 = -1` so P(raise alpha) = sigmoid(-1)
+    /// ~= 0.27 for every input -> `reduction_correction` is always 0. Installing it must
+    /// therefore leave the search byte-identical to LMR-off.
+    fn zero_correction_lmr_model() -> LmrModel {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RFLM");
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // version
+        bytes.extend_from_slice(&(LMR_FEATURES as u32).to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // hidden
+        for _ in 0..LMR_FEATURES {
+            bytes.extend_from_slice(&0f32.to_le_bytes()); // mean
+        }
+        for _ in 0..LMR_FEATURES {
+            bytes.extend_from_slice(&1f32.to_le_bytes()); // scale
+        }
+        for _ in 0..LMR_FEATURES {
+            bytes.extend_from_slice(&0f32.to_le_bytes()); // w1
+        }
+        bytes.extend_from_slice(&0f32.to_le_bytes()); // b1
+        bytes.extend_from_slice(&0f32.to_le_bytes()); // w2
+        bytes.extend_from_slice(&(-1f32).to_le_bytes()); // b2
+        LmrModel::from_bytes(&bytes).expect("valid RFLM")
+    }
+
+    #[test]
+    fn lmr_model_with_zero_correction_is_byte_identical_to_lmr_off() {
+        let model = zero_correction_lmr_model();
+        assert_eq!(model.reduction_correction(&[0.0; LMR_FEATURES]), 0);
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 4 4",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        ];
+        for fen in fens {
+            let board = Board::from_fen(fen).unwrap();
+            let limits = SearchLimits { depth: Some(8), ..SearchLimits::default() };
+            let mut off = Searcher::default();
+            let off_result = off.search(&board, limits.clone());
+            let mut on = Searcher::default();
+            on.set_lmr_model(Some(model.clone()));
+            let on_result = on.search(&board, limits.clone());
+            assert_eq!(off_result.best_move, on_result.best_move, "best_move differs for {fen}");
+            assert_eq!(off_result.score_cp, on_result.score_cp, "score differs for {fen}");
+            assert_eq!(off_result.nodes, on_result.nodes, "node count differs for {fen}");
+        }
+    }
 
     #[test]
     fn default_search_options_use_one_thread() {

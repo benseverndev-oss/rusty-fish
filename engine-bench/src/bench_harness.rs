@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use engine_core::{Board, Color};
 use engine_search::{
-    EvalParams, Nnue, SearchLimits, SearchParams, SearchResult, Searcher,
+    EvalParams, LmrModel, Nnue, SearchLimits, SearchParams, SearchResult, Searcher,
 };
 
 use super::{
@@ -69,6 +69,10 @@ pub struct EngineConfig {
     /// When `Some`, the searcher keeps this NNUE net; when `None` it plays the
     /// hand-crafted evaluation (mirrors the gate convention in `lib.rs`).
     pub nnue: Option<Arc<Nnue>>,
+    /// When `Some`, the searcher applies this learned-LMR model (Phase 2). `None`
+    /// keeps classical LMR — the A/B knob for gating a learned-LMR candidate vs the
+    /// classical baseline under equal nodes.
+    pub lmr: Option<LmrModel>,
 }
 
 impl EngineConfig {
@@ -81,6 +85,7 @@ impl EngineConfig {
             search: SearchParams::default(),
             eval: EvalParams::default(),
             nnue: None,
+            lmr: None,
         }
     }
 
@@ -92,7 +97,15 @@ impl EngineConfig {
             search,
             eval: EvalParams::default(),
             nnue: None,
+            lmr: None,
         }
+    }
+
+    /// Installs a learned-LMR model, returning `self` for a builder-style A/B setup
+    /// (`EngineConfig::handcrafted("cand").with_lmr(model)` vs the classical baseline).
+    pub fn with_lmr(mut self, model: LmrModel) -> Self {
+        self.lmr = Some(model);
+        self
     }
 }
 
@@ -103,6 +116,7 @@ impl EngineConfig {
 fn config_searcher(config: &EngineConfig) -> Searcher {
     let mut searcher = Searcher::default();
     searcher.set_nnue(config.nnue.clone());
+    searcher.set_lmr_model(config.lmr.clone());
     searcher.set_search_params(config.search);
     searcher.set_eval_params(config.eval);
     let mut options = searcher.options().clone();
