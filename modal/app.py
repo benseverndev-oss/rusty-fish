@@ -799,6 +799,59 @@ def gate_lmr(model: str = "d8-pilot-h16.rflm", nodes: int = 100_000,
     print(gate_lmr_run.remote(model, nodes, openings, max_plies))
 
 
+@app.function(image=rust_image, volumes={"/store": labels_volume}, timeout=60 * 30)
+def gate_lmr_shard(model_rel: str, nodes: int, openings: int, max_plies: int, seed: int) -> tuple:
+    """One gate shard: `bench-compare nodes` with a distinct `--seed` (so shards play
+    different openings) + the RFLM model on the candidate. Returns raw (W, D, L) for
+    aggregation into one powered SPRT."""
+    import subprocess
+    labels_volume.reload()
+    model = f"/store/lmr/{model_rel}"
+    cmd = [BIN, "bench-compare", "nodes", str(nodes), str(openings), str(max_plies),
+           "--lmr", model, "--seed", str(seed)]
+    out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+    wins = draws = losses = 0
+    for row in out.strip().splitlines():
+        if not row or row.startswith("engine_version"):
+            continue
+        parts = row.split("\t")  # ...wins(4) draws(5) losses(6)...
+        wins += int(parts[4]); draws += int(parts[5]); losses += int(parts[6])
+    return (wins, draws, losses)
+
+
+@app.function(timeout=60 * 60 * 2)
+def gate_lmr_sharded_run(model_rel: str, nodes: int, shards: int, openings_per_shard: int,
+                         max_plies: int) -> str:
+    """Powered equal-nodes gate: fan `shards` bench-compare runs across containers, sum
+    W/D/L, run ONE SPRT over the total. Server-side so a spawned run survives client exit."""
+    results = list(gate_lmr_shard.starmap(
+        [(model_rel, nodes, openings_per_shard, max_plies, s) for s in range(shards)]
+    ))
+    wins = sum(r[0] for r in results)
+    draws = sum(r[1] for r in results)
+    losses = sum(r[2] for r in results)
+    verdict = sprt_verdict.remote(wins, draws, losses)
+    out = (f"LMR_SHARDED_GATE_BEGIN\n"
+           f"learned-LMR vs classical, equal nodes={nodes}: {wins}W {draws}D {losses}L "
+           f"over {wins + draws + losses} games\n{verdict}\nLMR_SHARDED_GATE_END")
+    print(out, flush=True)
+    return out
+
+
+@app.local_entrypoint()
+def gate_lmr_sharded(model: str = "d8-pilot-h16.rflm", nodes: int = 20_000, shards: int = 32,
+                     openings_per_shard: int = 64, max_plies: int = 120):
+    """Decisive equal-nodes SPRT gate for learned LMR, sharded across containers.
+    `shards * openings_per_shard * 2` games (default 32*64*2 = 4096). spawn: the client
+    exits immediately; the verdict prints as LMR_SHARDED_GATE in `modal app logs`.
+
+        modal run --detach modal/app.py::gate_lmr_sharded --shards 32 --openings-per-shard 64
+    """
+    call = gate_lmr_sharded_run.spawn(model, nodes, shards, openings_per_shard, max_plies)
+    print(f"gate_lmr_sharded dispatched server-side (call {call.object_id}); it survives "
+          f"client exit. Verdict prints as LMR_SHARDED_GATE in `modal app logs`.")
+
+
 def _chunks(lines, size):
     for start in range(0, len(lines), size):
         yield "\n".join(lines[start:start + size])
