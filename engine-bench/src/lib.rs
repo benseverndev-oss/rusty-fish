@@ -1135,6 +1135,9 @@ pub fn vector_to_search_params(vector: &[f64; SPSA_DIMENSIONS]) -> SearchParams 
         late_move_pruning_scale: clamped[6].round() as usize,
         null_move_reduction: clamped[7].round() as u8,
         mobility_scale: 0,
+        // LMR correction thresholds are excluded from the SPSA vector (tuned by
+        // direct gated A/B); keep their defaults.
+        ..SearchParams::default()
     }
 }
 
@@ -2604,6 +2607,7 @@ mod tests {
                 late_move_pruning_scale: 2,
                 null_move_reduction: 3,
                 mobility_scale: 0,
+                ..SearchParams::default()
             }
         );
     }

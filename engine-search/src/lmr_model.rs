@@ -105,23 +105,45 @@ impl LmrModel {
         1.0 / (1.0 + (-out).exp())
     }
 
-    /// Reduction correction in plies, always in `[-1, +2]`. Conservative v1 mapping:
-    /// reduce *more* only on predictably-safe moves (very low P(raise alpha)),
-    /// un-reduce a move likely to raise alpha. The thresholds are deliberately
-    /// cautious; the equal-nodes SPRT gate is the arbiter and can retune them.
-    pub fn reduction_correction(&self, feats: &[f32; LMR_FEATURES]) -> i8 {
-        let p = self.raise_alpha_prob(feats);
-        if p >= 0.50 {
+    /// Reduction correction in plies, always in `[-1, +2]`, from per-mille P(raise
+    /// alpha) thresholds. Integers so the policy can live in `SearchParams` and be
+    /// tuned by gated A/B — the model stays a pure predictor, the policy is tunable.
+    pub fn reduction_correction_with(
+        &self,
+        feats: &[f32; LMR_FEATURES],
+        unreduce_permille: i32,
+        reduce2_permille: i32,
+        reduce1_permille: i32,
+    ) -> i8 {
+        let permille = (self.raise_alpha_prob(feats) * 1000.0) as i32;
+        if permille >= unreduce_permille {
             -1
-        } else if p < 0.02 {
+        } else if permille < reduce2_permille {
             2
-        } else if p < 0.06 {
+        } else if permille < reduce1_permille {
             1
         } else {
             0
         }
     }
+
+    /// [`reduction_correction_with`](Self::reduction_correction_with) at the default
+    /// thresholds (the settings that gated +38.3 Elo).
+    pub fn reduction_correction(&self, feats: &[f32; LMR_FEATURES]) -> i8 {
+        self.reduction_correction_with(
+            feats,
+            DEFAULT_LMR_UNREDUCE_PERMILLE,
+            DEFAULT_LMR_REDUCE2_PERMILLE,
+            DEFAULT_LMR_REDUCE1_PERMILLE,
+        )
+    }
 }
+
+/// Default correction thresholds, per-mille P(raise alpha). `SearchParams` mirrors
+/// these and is what the search actually reads, so they can be tuned per-run.
+pub const DEFAULT_LMR_UNREDUCE_PERMILLE: i32 = 500;
+pub const DEFAULT_LMR_REDUCE2_PERMILLE: i32 = 20;
+pub const DEFAULT_LMR_REDUCE1_PERMILLE: i32 = 60;
 
 /// The engine's default learned-LMR model, compiled into the binary and parsed once.
 /// Adopted 2026-07-24 after gating +38.3 Elo (equal movetime, 4096 games, AcceptH1).
