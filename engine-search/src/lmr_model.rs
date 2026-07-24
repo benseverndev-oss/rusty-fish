@@ -141,9 +141,16 @@ impl LmrModel {
 
 /// Default correction thresholds, per-mille P(raise alpha). `SearchParams` mirrors
 /// these and is what the search actually reads, so they can be tuned per-run.
+///
+/// Tuned by gated A/B (4096 games, 50 ms/move, equal movetime) — reducing *harder*
+/// than the original guess is worth ~11 Elo, which matches the telemetry: classical
+/// LMR errs on only 2.31% of the moves it reduces, i.e. it is conservative, so the
+/// predictably-safe majority can take another ply.
+///   500 / 20 /  60 (initial guess) -> +38.3 Elo vs classical
+///   500 / 50 / 120 (tuned)         -> +49.6 Elo vs classical
 pub const DEFAULT_LMR_UNREDUCE_PERMILLE: i32 = 500;
-pub const DEFAULT_LMR_REDUCE2_PERMILLE: i32 = 20;
-pub const DEFAULT_LMR_REDUCE1_PERMILLE: i32 = 60;
+pub const DEFAULT_LMR_REDUCE2_PERMILLE: i32 = 50;
+pub const DEFAULT_LMR_REDUCE1_PERMILLE: i32 = 120;
 
 /// The engine's default learned-LMR model, compiled into the binary and parsed once.
 /// Adopted 2026-07-24 after gating +38.3 Elo (equal movetime, 4096 games, AcceptH1).
