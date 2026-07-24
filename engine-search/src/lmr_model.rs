@@ -153,7 +153,7 @@ impl LmrModel {
     }
 
     /// [`reduction_correction_with`](Self::reduction_correction_with) at the default
-    /// thresholds (the settings that gated +38.3 Elo).
+    /// thresholds (the settings the bundled model was swept for).
     pub fn reduction_correction(&self, feats: &[f32; LMR_FEATURES]) -> i8 {
         self.reduction_correction_with(
             feats,
@@ -167,23 +167,29 @@ impl LmrModel {
 /// Default correction thresholds, per-mille P(raise alpha). `SearchParams` mirrors
 /// these and is what the search actually reads, so they can be tuned per-run.
 ///
-/// Tuned by gated A/B (4096 games, 50 ms/move, equal movetime, sharded SPRT).
-/// Reducing *harder* than the original guess pays, matching what the telemetry said:
-/// classical LMR errs on only 2.31% of the moves it reduces — it is conservative, so
-/// the predictably-safe majority can take another ply. The curve plateaus:
+/// Tuned by gated A/B at equal movetime (50 ms/move, sharded SPRT). Reducing *harder*
+/// than the original guess pays, matching what the telemetry said: classical LMR errs
+/// on only 2.31% of the moves it reduces, so the predictably-safe majority can take
+/// another ply.
 ///
-///   unreduce/reduce2/reduce1 -> Elo vs classical
-///   500 /  20 /  60 (guess)  -> +38.3
-///   500 /  50 / 120          -> +49.6   (+11.3)
-///   500 / 100 / 220 (ADOPTED)-> +56.5   ( +6.9)
-///   500 / 180 / 400          -> +57.3   ( +0.8, i.e. noise — the plateau)
+/// **These are per-model.** The thresholds slice a probability distribution, and a
+/// retrained model recalibrates — so a model swap without a re-sweep is a regression,
+/// not a neutral change. Measured, at 16384 games (SE ~±2.3 Elo):
 ///
-/// 220/100 and 400/180 are statistically indistinguishable, so we take the *less*
-/// aggressive of the two: equal measured strength, but less over-reduction tail risk
-/// at time controls longer than the 50 ms the gate exercised.
+///   model              unreduce/reduce2/reduce1 -> Elo vs classical
+///   v1 (10 features)   500 / 100 / 220          -> +57.7
+///   v2 (18 features)   500 / 100 / 220          -> +50.6   (v1's thresholds: -7.1)
+///   v2 (18 features)   500 / 250 / 450 (ADOPTED)-> +57.2   (re-swept: recovered)
+///
+/// The earlier 4096-game sweep (+38.3 -> +49.6 -> +56.5 -> +57.3) established the
+/// direction, but its steps were 1-2 sigma at that sample size and its fine ordering
+/// should not be read as resolved.
+///
+/// `reduce1` has little headroom left: at >= `unreduce` it is unreachable, because the
+/// unreduce branch is tested first.
 pub const DEFAULT_LMR_UNREDUCE_PERMILLE: i32 = 500;
-pub const DEFAULT_LMR_REDUCE2_PERMILLE: i32 = 100;
-pub const DEFAULT_LMR_REDUCE1_PERMILLE: i32 = 220;
+pub const DEFAULT_LMR_REDUCE2_PERMILLE: i32 = 250;
+pub const DEFAULT_LMR_REDUCE1_PERMILLE: i32 = 450;
 
 /// The engine's default learned-LMR model, compiled into the binary and parsed once.
 /// Adopted 2026-07-24 after gating +38.3 Elo (equal movetime, 4096 games, AcceptH1),
