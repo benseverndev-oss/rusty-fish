@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use engine_core::{Board, Color, GameStatus};
 use engine_search::{
-    EvalParams, Nnue, SearchLimits, SearchParams, Searcher, TaperedScore, active_features,
+    EvalParams, Nnue, SearchLimits, SearchParams, Searcher, TELEMETRY_TSV_HEADER, TaperedScore,
+    active_features,
 };
 use pgn_reader::shakmaty::{Chess, Position, uci::UciMove};
 use pgn_reader::{RawTag, Reader, SanPlus, Visitor};
@@ -2134,6 +2135,66 @@ pub fn run_label_fens<R: std::io::Read>(reader: R, white_relative: bool) -> Resu
         .map_err(|error| format!("failed to flush labelled positions: {error}"))?;
     if skipped > 0 {
         eprintln!("label-fens: skipped {skipped} lines (malformed FEN or eval)");
+    }
+    Ok(())
+}
+
+/// Per-position record cap for `gen-search-telemetry`. A depth-N search over a
+/// midgame position emits at most a few hundred thousand move decisions; this
+/// bounds a pathological position without truncating realistic ones. Records are
+/// drained per position, so the cap applies per search, not per shard.
+pub const SEARCH_TELEMETRY_CAP: usize = 4_000_000;
+
+/// Reads FENs one per line and, for each, runs a fixed-depth search with
+/// per-move-decision telemetry enabled, printing every collected `MoveDecision`
+/// as a TSV row prefixed with a per-position `pos_id` (0-based, in input order).
+/// The header row is printed once. Malformed FENs are counted and skipped, then
+/// reported on stderr at the end, the same shard-friendly ergonomics as
+/// [`run_label_sf`]. `pos_id` increments once per searched position (skipped
+/// FENs produce no rows and do not consume an id); it groups the rows emitted by
+/// one search.
+pub fn run_gen_search_telemetry<R: std::io::Read>(reader: R, depth: u8) -> Result<(), String> {
+    if depth == 0 {
+        return Err("invalid depth 0: need depth >= 1".to_string());
+    }
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    writeln!(out, "{TELEMETRY_TSV_HEADER}")
+        .map_err(|error| format!("failed to write telemetry header: {error}"))?;
+    let mut searcher = Searcher::default();
+    searcher.enable_telemetry(SEARCH_TELEMETRY_CAP);
+    let mut skipped: u64 = 0;
+    let mut pos_id: u64 = 0;
+    for line in BufReader::new(reader).lines() {
+        let line = line.map_err(|error| format!("failed to read positions: {error}"))?;
+        let fen = line.trim();
+        if fen.is_empty() {
+            continue;
+        }
+        let board = match Board::from_fen(fen) {
+            Ok(board) => board,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        searcher.search(
+            &board,
+            SearchLimits {
+                depth: Some(depth),
+                ..SearchLimits::default()
+            },
+        );
+        for record in searcher.take_telemetry() {
+            writeln!(out, "{}", record.to_tsv_row(pos_id))
+                .map_err(|error| format!("failed to write telemetry row: {error}"))?;
+        }
+        pos_id += 1;
+    }
+    out.flush()
+        .map_err(|error| format!("failed to flush telemetry: {error}"))?;
+    if skipped > 0 {
+        eprintln!("gen-search-telemetry: skipped {skipped} malformed FENs");
     }
     Ok(())
 }

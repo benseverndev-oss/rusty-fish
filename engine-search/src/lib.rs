@@ -10,8 +10,10 @@ use pyrrhic_rs::{
 };
 
 mod nnue;
+mod telemetry;
 
 pub use nnue::{active_features, bundled_network, Nnue, INPUT_DIMENSION};
+pub use telemetry::{MoveDecision, TelemetryCollector, TELEMETRY_TSV_HEADER};
 
 const MATE_SCORE: i32 = 100_000;
 const MAX_KILLER_PLY: usize = 128;
@@ -507,6 +509,10 @@ pub struct Searcher {
     move_order_scratch: Vec<(i32, ChessMove)>,
     opening_book: Option<OpeningBook>,
     syzygy: Option<SyzygyTablebases>,
+    /// Optional per-move-decision telemetry sink. `None` (the default) makes the
+    /// record site a single cheap branch with no allocation and no effect on the
+    /// search; `Some` collects a [`MoveDecision`] per move considered.
+    telemetry: Option<TelemetryCollector>,
 }
 
 /// One square's piece change from a move: `(square, before, after)`.
@@ -544,6 +550,7 @@ impl Default for Searcher {
             move_order_scratch: Vec::new(),
             opening_book: None,
             syzygy: None,
+            telemetry: None,
         }
     }
 }
@@ -799,6 +806,29 @@ impl Searcher {
         self.syzygy = syzygy;
     }
 
+    /// Enables per-move-decision telemetry collection, holding at most `cap`
+    /// records (the cap bounds memory on deep searches). Collection is purely
+    /// observational: it never changes a search decision. Records accumulate
+    /// across searches until drained with [`take_telemetry`](Self::take_telemetry).
+    pub fn enable_telemetry(&mut self, cap: usize) {
+        self.telemetry = Some(TelemetryCollector::new(cap));
+    }
+
+    /// Disables telemetry collection and discards any undrained records.
+    pub fn disable_telemetry(&mut self) {
+        self.telemetry = None;
+    }
+
+    /// Drains and returns the collected [`MoveDecision`] records, leaving
+    /// collection enabled (if it was) and ready to collect again. Returns an
+    /// empty vector when telemetry is disabled.
+    pub fn take_telemetry(&mut self) -> Vec<MoveDecision> {
+        self.telemetry
+            .as_mut()
+            .map(TelemetryCollector::take)
+            .unwrap_or_default()
+    }
+
     /// Builds a helper searcher for Lazy SMP. It shares the transposition table
     /// (via the `Arc`) but keeps its own killer/history/counter-move tables and
     /// never consults the opening book or Syzygy tablebases; the primary thread
@@ -829,6 +859,7 @@ impl Searcher {
             move_order_scratch: Vec::new(),
             opening_book: None,
             syzygy: None,
+            telemetry: None,
         }
     }
 
@@ -1224,8 +1255,14 @@ impl Searcher {
             beta,
             self.has_non_pawn_material(board, board.side_to_move),
         );
+        // The node's static eval, when one is computed. Recorded verbatim into
+        // telemetry (0 when static pruning did not apply, so no eval was taken).
+        // This only *reads* the value the pruning logic already computes; it adds
+        // no evaluation call and cannot perturb the search.
+        let mut node_static_eval: i32 = 0;
         if can_static_prune {
             let static_eval = self.evaluate(board);
+            node_static_eval = static_eval;
             if depth == 1 && static_eval + razor_margin(&self.params, depth) <= alpha {
                 return (self.quiescence(board, alpha, beta), Vec::new());
             }
@@ -1297,21 +1334,52 @@ impl Searcher {
                 || previous_move
                     .and_then(|previous| self.counter_moves[history_index(previous)])
                     == Some(mv);
+            // PV node iff a full-width window remains at this decision. Cheap to
+            // compute; used only for telemetry.
+            let pv_node = beta - alpha > 1;
             if can_static_prune
                 && move_index >= late_move_pruning_limit(&self.params, depth)
                 && is_quiet
                 && pawn_extension == 0
                 && !is_priority_move
             {
+                // Late-move pruning: this move (and the rest of the list) is
+                // skipped. Record the pruned move with zeroed outcome fields; it
+                // is not searched. Counterfactual verification is a later phase.
+                if let Some(collector) = self.telemetry.as_mut() {
+                    collector.push(MoveDecision {
+                        depth,
+                        ply: ply as u16,
+                        move_index: move_index as u16,
+                        is_quiet,
+                        is_priority: is_priority_move,
+                        pv_node,
+                        gives_check: false,
+                        static_eval: node_static_eval,
+                        extension: 0,
+                        reduction: 0,
+                        lmp_pruned: true,
+                        raised_alpha: false,
+                        caused_cutoff: false,
+                        needed_lmr_research: false,
+                        needed_pvs_research: false,
+                        subtree_nodes: 0,
+                    });
+                }
                 break;
             }
             let undo = self.nnue_make(board, mv);
-            let extension = u8::from(board.in_check(board.side_to_move))
+            let gives_check = board.in_check(board.side_to_move);
+            let extension = u8::from(gives_check)
                 .max(pawn_extension)
                 .max(u8::from(singular_extension));
             let next_depth = depth.saturating_sub(1) + extension.min(1);
             let reduction = late_move_reduction(depth, move_index, is_quiet && extension == 0);
             let search_depth = next_depth.saturating_sub(reduction);
+            // Snapshot the node counter to attribute this move's subtree size.
+            let subtree_nodes_before = self.nodes;
+            let mut needed_lmr_research = false;
+            let mut needed_pvs_research = false;
             let (mut score, mut line) = if move_index == 0 {
                 let (score, line) =
                     self.negamax(board, search_depth, ply + 1, -beta, -alpha, Some(mv), None);
@@ -1329,12 +1397,14 @@ impl Searcher {
                 (-score, line)
             };
             if reduction > 0 && score > alpha && !self.stopped {
+                needed_lmr_research = true;
                 let (reduced_score, reduced_line) =
                     self.negamax(board, next_depth, ply + 1, -alpha - 1, -alpha, Some(mv), None);
                 score = -reduced_score;
                 line = reduced_line;
             }
             if move_index > 0 && score > alpha && score < beta && !self.stopped {
+                needed_pvs_research = true;
                 let (full_score, full_line) =
                     self.negamax(board, next_depth, ply + 1, -beta, -alpha, Some(mv), None);
                 score = -full_score;
@@ -1348,8 +1418,34 @@ impl Searcher {
                 best_line.push(mv);
                 best_line.append(&mut line);
             }
+            // Outcome of a searched move, captured before and after the alpha
+            // update. `caused_cutoff` reuses the same `alpha >= beta` test the
+            // cutoff branch below uses, so telemetry reads exactly the search's
+            // own decision without altering it.
+            let raised_alpha = score > alpha;
             alpha = alpha.max(score);
-            if alpha >= beta {
+            let caused_cutoff = alpha >= beta;
+            if let Some(collector) = self.telemetry.as_mut() {
+                collector.push(MoveDecision {
+                    depth,
+                    ply: ply as u16,
+                    move_index: move_index as u16,
+                    is_quiet,
+                    is_priority: is_priority_move,
+                    pv_node,
+                    gives_check,
+                    static_eval: node_static_eval,
+                    extension,
+                    reduction,
+                    lmp_pruned: false,
+                    raised_alpha,
+                    caused_cutoff,
+                    needed_lmr_research,
+                    needed_pvs_research,
+                    subtree_nodes: self.nodes - subtree_nodes_before,
+                });
+            }
+            if caused_cutoff {
                 self.record_cutoff(ply as usize, mv, depth, previous_move, is_quiet);
                 break;
             }
@@ -3250,6 +3346,166 @@ mod tests {
         assert_eq!(
             result.best_move.map(|mv| mv.to_uci()),
             Some("e1e2".to_string())
+        );
+    }
+
+    // ---- Phase 1 search telemetry ----------------------------------------
+
+    /// A spread of positions for the telemetry tests: startpos, Kiwipete (a rich
+    /// tactical middlegame), an open middlegame, a quiet middlegame, and a pawn
+    /// endgame. Depth 6 gives each a deep enough tree to exercise LMP, LMR, and
+    /// PVS re-searches.
+    const TELEMETRY_FENS: [&str; 5] = [
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 1",
+        "r1bq1rk1/pp1nbppp/2p1pn2/3p4/3P4/2NBPN2/PPQ1BPPP/R3K2R w KQ - 4 8",
+        "8/5pk1/6p1/8/8/6P1/5PK1/8 w - - 0 1",
+    ];
+
+    const TELEMETRY_DEPTH: u8 = 6;
+    const TELEMETRY_CAP: usize = 50_000_000;
+
+    /// THE INVIOLABLE INVARIANT: enabling telemetry must not change any search
+    /// decision. A fixed-depth search with telemetry off and on must return the
+    /// same best move, score, depth, and PV, and — most tellingly — the same
+    /// final node count. If collection perturbed the search (an extra eval, a
+    /// reordered decision) the node counts would diverge.
+    #[test]
+    fn telemetry_never_perturbs_the_search() {
+        for fen in TELEMETRY_FENS {
+            let board = Board::from_fen(fen).unwrap();
+            let limits = SearchLimits {
+                depth: Some(TELEMETRY_DEPTH),
+                ..SearchLimits::default()
+            };
+
+            let mut plain = Searcher::default();
+            let baseline = plain.search(&board, limits.clone());
+
+            let mut instrumented = Searcher::default();
+            instrumented.enable_telemetry(TELEMETRY_CAP);
+            let observed = instrumented.search(&board, limits);
+
+            assert_eq!(baseline.best_move, observed.best_move, "best-move drift for {fen}");
+            assert_eq!(baseline.score_cp, observed.score_cp, "score drift for {fen}");
+            assert_eq!(baseline.depth, observed.depth, "depth drift for {fen}");
+            assert_eq!(baseline.pv, observed.pv, "pv drift for {fen}");
+            assert_eq!(
+                baseline.nodes, observed.nodes,
+                "node-count drift for {fen}: telemetry perturbed the search"
+            );
+
+            // Sanity: collection actually produced a dataset.
+            let records = instrumented.take_telemetry();
+            assert!(!records.is_empty(), "no telemetry collected for {fen}");
+        }
+    }
+
+    /// Every record must be structurally sound: `move_index` within the legal
+    /// move ceiling, `extension`/`reduction` in their known ranges, a cutoff
+    /// implies alpha was raised, and an LMP-pruned move carries zeroed outcomes.
+    #[test]
+    fn telemetry_records_are_well_formed() {
+        let mut searcher = Searcher::default();
+        searcher.enable_telemetry(TELEMETRY_CAP);
+        for fen in TELEMETRY_FENS {
+            let board = Board::from_fen(fen).unwrap();
+            searcher.search(
+                &board,
+                SearchLimits {
+                    depth: Some(TELEMETRY_DEPTH),
+                    ..SearchLimits::default()
+                },
+            );
+            let records = searcher.take_telemetry();
+            assert!(!records.is_empty(), "no telemetry collected for {fen}");
+            for record in &records {
+                // 218 is the maximum number of legal moves in any legal position.
+                assert!(record.move_index < 218, "move_index out of range: {record:?}");
+                // `extension` is a max of 0/1 flags; `reduction` is 0, 1, or 2.
+                assert!(record.extension <= 1, "extension out of range: {record:?}");
+                assert!(record.reduction <= 2, "reduction out of range: {record:?}");
+                if record.caused_cutoff {
+                    assert!(
+                        record.raised_alpha,
+                        "cutoff without raising alpha: {record:?}"
+                    );
+                    assert!(!record.lmp_pruned, "pruned move cannot cut: {record:?}");
+                }
+                if record.lmp_pruned {
+                    assert_eq!(record.subtree_nodes, 0, "pruned move searched: {record:?}");
+                    assert!(!record.raised_alpha, "pruned move raised alpha: {record:?}");
+                    assert!(!record.caused_cutoff, "pruned move cut: {record:?}");
+                    assert!(!record.needed_lmr_research, "pruned move re-searched: {record:?}");
+                    assert!(!record.needed_pvs_research, "pruned move re-searched: {record:?}");
+                    assert_eq!(record.extension, 0, "pruned move extended: {record:?}");
+                    assert_eq!(record.reduction, 0, "pruned move reduced: {record:?}");
+                }
+            }
+        }
+    }
+
+    /// A rich middlegame searched deep enough must exercise late-move pruning, so
+    /// at least one `lmp_pruned` record is present.
+    #[test]
+    fn telemetry_captures_late_move_pruning() {
+        let board = Board::from_fen(
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        )
+        .unwrap();
+        let mut searcher = Searcher::default();
+        searcher.enable_telemetry(TELEMETRY_CAP);
+        searcher.search(
+            &board,
+            SearchLimits {
+                depth: Some(TELEMETRY_DEPTH),
+                ..SearchLimits::default()
+            },
+        );
+        let records = searcher.take_telemetry();
+        assert!(
+            records.iter().any(|record| record.lmp_pruned),
+            "expected at least one late-move-pruning record"
+        );
+    }
+
+    /// At a single node forced to fail high, exactly one move causes the cutoff
+    /// and it is the last move recorded (the loop breaks on cutoff). A depth-1
+    /// `negamax` isolates one node's move loop — its depth-0 children are
+    /// quiescence, which emits no telemetry — so the whole record set belongs to
+    /// that one node.
+    #[test]
+    fn telemetry_cutoff_is_the_single_last_searched_move() {
+        let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
+        let board = Board::from_fen(fen).unwrap();
+
+        // The node's true value under a full window, from a throwaway searcher so
+        // no transposition entry leaks into the fail-high run below.
+        let full_score = {
+            let mut probe = Searcher::default();
+            let mut probe_board = board.clone();
+            probe.nnue_refresh(&probe_board);
+            probe
+                .negamax(&mut probe_board, 1, 0, -MATE_SCORE, MATE_SCORE, None, None)
+                .0
+        };
+
+        // Search the same node with beta pinned to its own value: the best move
+        // reaches `full_score == beta`, forcing a cutoff, while lesser moves do
+        // not — so the cutoff lands on the best move wherever it is ordered.
+        let mut searcher = Searcher::default();
+        searcher.enable_telemetry(TELEMETRY_CAP);
+        let mut search_board = board.clone();
+        searcher.nnue_refresh(&search_board);
+        searcher.negamax(&mut search_board, 1, 0, -MATE_SCORE, full_score, None, None);
+        let records = searcher.take_telemetry();
+
+        let cutoffs = records.iter().filter(|record| record.caused_cutoff).count();
+        assert_eq!(cutoffs, 1, "a fail-high node must have exactly one cutoff move");
+        assert!(
+            records.last().is_some_and(|record| record.caused_cutoff),
+            "the cutoff move must be the last move searched at the node"
         );
     }
 }
