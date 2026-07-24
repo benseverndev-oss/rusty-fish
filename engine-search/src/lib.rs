@@ -3503,6 +3503,9 @@ mod tests {
     fn telemetry_records_are_well_formed() {
         let mut searcher = Searcher::default();
         searcher.enable_telemetry(TELEMETRY_CAP);
+        // Telemetry observes classical LMR (learned LMR is the default now, but the
+        // generator disables it so the dataset reflects the baseline being corrected).
+        searcher.set_lmr_model(None);
         for fen in TELEMETRY_FENS {
             let board = Board::from_fen(fen).unwrap();
             searcher.search(
