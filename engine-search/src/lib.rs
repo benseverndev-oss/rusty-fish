@@ -1311,8 +1311,8 @@ impl Searcher {
         }
 
         // One probe, three readers (TT move, singular candidate, and the learned-LMR
-        // `tt_depth` feature). Copied out so it does not borrow `self` across the loop.
-        let tt_entry = self.tt.get(tt_key).copied();
+        // `tt_depth` feature).
+        let tt_entry = self.tt.get(tt_key);
         let tt_move = tt_entry.and_then(|entry| entry.best_move);
         let tt_depth = tt_entry.map_or(0, |entry| entry.depth);
         let counter_move = previous_move.and_then(|mv| self.counter_moves[history_index(mv)]);
