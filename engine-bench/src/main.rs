@@ -637,7 +637,7 @@ fn main() -> Result<(), String> {
         let mode = parse_budget_mode(2, 3)?;
         let openings = arg_u32(4).unwrap_or(16) as usize;
         let max_plies = arg_u32(5).unwrap_or(120);
-        let candidate = EngineConfig::handcrafted("candidate");
+        let candidate = apply_lmr_flag(EngineConfig::handcrafted("candidate"))?;
         let baseline = EngineConfig::handcrafted("baseline");
         let fens = compare_openings(openings, BENCH_COMPARE_SEED);
         let report = run_bench_compare(
@@ -654,7 +654,7 @@ fn main() -> Result<(), String> {
         // budgets so a change can be checked for time-control dependence.
         let openings = arg_u32(2).unwrap_or(16) as usize;
         let max_plies = arg_u32(3).unwrap_or(120);
-        let candidate = EngineConfig::handcrafted("candidate");
+        let candidate = apply_lmr_flag(EngineConfig::handcrafted("candidate"))?;
         let baseline = EngineConfig::handcrafted("baseline");
         let fens = compare_openings(openings, BENCH_COMPARE_SEED);
         let modes = [
@@ -674,7 +674,7 @@ fn main() -> Result<(), String> {
         // tactical suite, and a throughput measurement, in one consolidated block.
         let openings = arg_u32(2).unwrap_or(16) as usize;
         let max_plies = arg_u32(3).unwrap_or(120);
-        let candidate = EngineConfig::handcrafted("candidate");
+        let candidate = apply_lmr_flag(EngineConfig::handcrafted("candidate"))?;
         let baseline = EngineConfig::handcrafted("baseline");
         let fens = compare_openings(openings, BENCH_COMPARE_SEED);
         let mut config = BenchReportConfig::default();
@@ -759,6 +759,27 @@ fn arg_u32(index: usize) -> Option<u32> {
 
 fn arg_u64(index: usize) -> Option<u64> {
     std::env::args().nth(index).and_then(|arg| arg.parse::<u64>().ok())
+}
+
+/// The value following a `--flag` anywhere on the command line, if present.
+fn flag_value(name: &str) -> Option<String> {
+    let mut args = std::env::args();
+    while let Some(arg) = args.next() {
+        if arg == name {
+            return args.next();
+        }
+    }
+    None
+}
+
+/// If `--lmr <path>` is present (place it after the positional args), load the RFLM
+/// learned-LMR model and install it on the candidate — the A/B knob for gating a
+/// learned-LMR net vs the classical-LMR baseline under equal nodes.
+fn apply_lmr_flag(candidate: EngineConfig) -> Result<EngineConfig, String> {
+    match flag_value("--lmr") {
+        Some(path) => Ok(candidate.with_lmr(engine_search::LmrModel::from_file(&path)?)),
+        None => Ok(candidate),
+    }
 }
 
 fn join_usize(values: &[usize]) -> String {
