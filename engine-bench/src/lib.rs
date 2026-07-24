@@ -2163,6 +2163,10 @@ pub fn run_gen_search_telemetry<R: std::io::Read>(reader: R, depth: u8) -> Resul
         .map_err(|error| format!("failed to write telemetry header: {error}"))?;
     let mut searcher = Searcher::default();
     searcher.enable_telemetry(SEARCH_TELEMETRY_CAP);
+    // Observe CLASSICAL LMR (learned LMR is now the default): the telemetry is the
+    // training substrate for the reduction corrector, so its `reduction`/`raised_alpha`
+    // must reflect the baseline the model corrects, not the model's own decisions.
+    searcher.set_lmr_model(None);
     let mut skipped: u64 = 0;
     let mut pos_id: u64 = 0;
     for line in BufReader::new(reader).lines() {
