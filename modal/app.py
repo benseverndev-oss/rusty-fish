@@ -799,7 +799,7 @@ def gate_lmr(model: str = "d8-pilot-h16.rflm", nodes: int = 100_000,
     print(gate_lmr_run.remote(model, nodes, openings, max_plies))
 
 
-@app.function(image=rust_image, volumes={"/store": labels_volume}, timeout=60 * 30)
+@app.function(image=rust_image, volumes={"/store": labels_volume}, timeout=60 * 60, cpu=2.0)
 def gate_lmr_shard(model_rel: str, nodes: int, openings: int, max_plies: int, seed: int) -> tuple:
     """One gate shard: `bench-compare nodes` with a distinct `--seed` (so shards play
     different openings) + the RFLM model on the candidate. Returns raw (W, D, L) for
