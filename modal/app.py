@@ -58,6 +58,7 @@ torch_image = (
     modal.Image.debian_slim()
     .pip_install("torch", "numpy")  # numpy: the store loader parses straight into np arrays
     .add_local_file(str(pathlib.Path(__file__).parent / "train_nnue.py"), "/root/train_nnue.py")
+    .add_local_file(str(pathlib.Path(__file__).parent / "train_lmr.py"), "/root/train_lmr.py")
 )
 
 app = modal.App("rusty-fish-nnue")
@@ -635,6 +636,48 @@ def label_public(
           f"client exit. Row count prints as LABEL_PUBLIC_DONE in `modal app logs`.")
 
 
+@app.function(volumes={"/store": labels_volume}, timeout=60 * 30)
+def telemetry_stats(dataset: str, max_lines: int = 40_000_000) -> str:
+    """Summarize a telemetry TSV's class balance over its first `max_lines` records —
+    the numbers that drive the learned-LMR model design. Key stat: of REDUCED moves
+    (reduction>0), the fraction that `needed_lmr_research` = how often classical LMR is
+    wrong = the ceiling on what a learned reduction correction can buy."""
+    import os
+    from collections import Counter
+    labels_volume.reload()
+    path = f"/store/telemetry/{dataset}/samples-telemetry-0.tsv"
+    size_gb = os.path.getsize(path) / 1e9
+    n = lmp = reduced = red_re = raised = cutoff = pvs_re = quiet = priority = pv = 0
+    red = Counter()
+    maxpos = 0
+    with open(path) as handle:
+        handle.readline()  # header
+        for i, line in enumerate(handle):
+            if i >= max_lines:
+                break
+            p = line.rstrip("\n").split("\t")
+            if len(p) < 17:
+                continue
+            n += 1
+            maxpos = max(maxpos, int(p[0]))
+            quiet += int(p[4]); priority += int(p[5]); pv += int(p[6])
+            r = int(p[10]); red[min(r, 4)] += 1
+            lmp += int(p[11]); raised += int(p[12]); cutoff += int(p[13]); pvs_re += int(p[15])
+            if r > 0:
+                reduced += 1
+                red_re += int(p[14])  # needed_lmr_research among reduced moves
+    pc = lambda x, d=n: f"{100 * x / d:.2f}%" if d else "n/a"
+    out = "\n".join([
+        f"TELEMETRY_STATS dataset={dataset} file={size_gb:.1f}GB sampled={n} (first {max_lines} lines, up to pos_id {maxpos})",
+        f"  lmp_pruned={pc(lmp)}  reduced(r>0)={pc(reduced)}  pv_node={pc(pv)}  is_quiet={pc(quiet)}  is_priority={pc(priority)}",
+        f"  raised_alpha={pc(raised)}  caused_cutoff={pc(cutoff)}  needed_pvs_research={pc(pvs_re)}",
+        f"  ** needed_lmr_research AMONG REDUCED = {pc(red_re, reduced)} ** (classical-LMR error rate; the learned-correction ceiling)",
+        f"  reduction hist (capped@4): " + ", ".join(f"{k}:{pc(v)}" for k, v in sorted(red.items())),
+    ])
+    print(out, flush=True)
+    return out
+
+
 @app.function(image=rust_image, volumes={"/store": labels_volume}, timeout=60 * 60 * 8)
 def gen_telemetry_run(url: str, max_positions: int, depth: int, dataset: str) -> int:
     """Phase 2 (learned LMR) dataset generation: stream FENs from the lichess eval DB,
@@ -691,6 +734,41 @@ def gen_telemetry(
     call = gen_telemetry_run.spawn(url, max_positions, depth, dataset)
     print(f"gen_telemetry dispatched server-side (call {call.object_id}); it survives "
           f"client exit. Record count prints as GEN_TELEMETRY_DONE in `modal app logs`.")
+
+
+@app.function(image=torch_image, timeout=60 * 30, memory=16384, volumes={"/store": labels_volume})
+def train_lmr_run(dataset: str, stride: int, max_rows: int, hidden: int, epochs: int) -> str:
+    """Train the learned-LMR model (Phase 2): stride-sample the telemetry TSV, fit the
+    tiny P(raise-alpha) MLP, and export it to `/store/lmr/{dataset}-h{hidden}.rflm`.
+    Reports base rate + val accuracy + val AUC — AUC well above 0.5 means the reduction
+    decision is learnable. CPU is plenty for a 10-feature / ~180-param net."""
+    import os
+    import train_lmr as lmr
+    labels_volume.reload()
+    path = f"/store/telemetry/{dataset}/samples-telemetry-0.tsv"
+    X, y = lmr.load_telemetry_sample(path, stride=stride, max_rows=max_rows)
+    model, mean, scale, metrics = lmr.train(X, y, hidden=hidden, epochs=epochs, device="cpu")
+    os.makedirs("/store/lmr", exist_ok=True)
+    out = f"/store/lmr/{dataset}-h{hidden}.rflm"
+    lmr.export_rflm(model, mean, scale, out)
+    labels_volume.commit()
+    summary = (f"LMR_TRAIN_DONE model={out} samples={metrics['n']} "
+               f"base_rate={metrics['base_rate']:.4f} val_acc={metrics['val_acc']:.4f} "
+               f"val_auc={metrics['val_auc']:.4f}")
+    print(summary, flush=True)
+    return summary
+
+
+@app.local_entrypoint()
+def train_lmr(dataset: str = "d8-pilot", stride: int = 24, max_rows: int = 10_000_000,
+              hidden: int = 16, epochs: int = 12):
+    """Train + export the learned-LMR model from a telemetry dataset. Prints val AUC:
+    > 0.5 = the reduction decision carries signal; near 0.5 = it doesn't and the whole
+    correction idea is unlikely to gate.
+
+        modal run modal/app.py::train_lmr --dataset d8-pilot --hidden 16
+    """
+    print(train_lmr_run.remote(dataset, stride, max_rows, hidden, epochs))
 
 
 def _chunks(lines, size):
