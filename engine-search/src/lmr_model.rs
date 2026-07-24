@@ -2,11 +2,14 @@
 //! from the search context, loaded from the `RFLM` format `modal/train_lmr.py`
 //! exports. The search turns the probability into a clamped reduction correction
 //! (`reduction = classical + clamp(correction, -1, +2)`). Inference is a handful of
-//! FLOPs (10 -> hidden -> 1), cheap enough for the hot loop.
+//! FLOPs (18 -> hidden -> 1), cheap enough for the hot loop.
 //!
 //! RFLM v1 layout (little-endian): magic `b"RFLM"` | u32 version=1 | u32 input_dim
 //! | u32 hidden | mean[input_dim] f32 | scale[input_dim] f32 | w1[hidden*input_dim]
 //! f32 (row-major [hidden, input]) | b1[hidden] f32 | w2[hidden] f32 | b2 f32.
+//!
+//! `input_dim` is checked against [`LMR_FEATURES`] on load, so widening the feature
+//! set and swapping the bundled asset have to happen in the same commit.
 
 use std::sync::LazyLock;
 
@@ -15,8 +18,25 @@ const VERSION: u32 = 1;
 
 /// The context features, in the exact order the trainer used (train_lmr.py
 /// `FEATURE_COLS`): depth, ply, move_index, is_quiet, is_priority, pv_node,
-/// gives_check, static_eval, extension, reduction.
-pub const LMR_FEATURES: usize = 10;
+/// gives_check, static_eval, extension, reduction, history_score, is_tt_move,
+/// is_killer, is_counter, is_capture, is_promotion, node_in_check, tt_depth.
+///
+/// The first ten are the v1 set. The last eight were added after the v1 model
+/// saturated at val AUC ~0.94 against both more data (depth-9/192M -> 0.9378) and
+/// more capacity (hidden 64 -> 0.9396): it was feature-limited, not data- or
+/// capacity-limited. Widening to 18 moved val AUC to 0.9463 at the same hidden 16.
+pub const LMR_FEATURES: usize = 18;
+
+/// Index of `static_eval` in the feature vector.
+const FEAT_STATIC_EVAL: usize = 7;
+/// Index of `history_score` in the feature vector.
+const FEAT_HISTORY: usize = 10;
+/// Clamp bounds mirroring `train_lmr.py`'s `load_telemetry_sample`. Both scalars are
+/// unbounded in the search (mate scores; uncapped history), and the trainer clamps
+/// them before fitting the standardization, so inference has to clamp identically or
+/// the extremes land far outside the distribution the model was standardized on.
+const STATIC_EVAL_CLAMP: f32 = 2000.0;
+const HISTORY_CLAMP: f32 = 20000.0;
 
 /// A loaded learned-LMR model. Immutable after load, cheap to share behind `Arc`.
 #[derive(Clone, Debug, PartialEq)]
@@ -87,9 +107,14 @@ impl LmrModel {
         Self::from_bytes(&bytes)
     }
 
-    /// P(move raises alpha) for the raw (un-normalized) feature vector. Standardizes
-    /// with the stored mean/scale, then runs the forward pass (matching the trainer).
-    pub fn raise_alpha_prob(&self, feats: &[f32; LMR_FEATURES]) -> f32 {
+    /// P(move raises alpha) for the raw (un-normalized) feature vector. Clamps the two
+    /// unbounded scalars exactly as the trainer does, standardizes with the stored
+    /// mean/scale, then runs the forward pass (matching the trainer).
+    pub fn raise_alpha_prob(&self, raw: &[f32; LMR_FEATURES]) -> f32 {
+        let mut feats = *raw;
+        feats[FEAT_STATIC_EVAL] =
+            feats[FEAT_STATIC_EVAL].clamp(-STATIC_EVAL_CLAMP, STATIC_EVAL_CLAMP);
+        feats[FEAT_HISTORY] = feats[FEAT_HISTORY].clamp(-HISTORY_CLAMP, HISTORY_CLAMP);
         let mut out = self.b2;
         for j in 0..self.hidden {
             let mut h = self.b1[j];
@@ -161,7 +186,8 @@ pub const DEFAULT_LMR_REDUCE2_PERMILLE: i32 = 100;
 pub const DEFAULT_LMR_REDUCE1_PERMILLE: i32 = 220;
 
 /// The engine's default learned-LMR model, compiled into the binary and parsed once.
-/// Adopted 2026-07-24 after gating +38.3 Elo (equal movetime, 4096 games, AcceptH1).
+/// Adopted 2026-07-24 after gating +38.3 Elo (equal movetime, 4096 games, AcceptH1),
+/// then re-trained on the 18-feature telemetry (`d8-v2feat`, val AUC 0.9463).
 static BUNDLED_LMR_MODEL: LazyLock<LmrModel> = LazyLock::new(|| {
     LmrModel::from_bytes(include_bytes!("../../assets/lmr/rusty-fish-lmr.rflm"))
         .expect("bundled LMR asset is a valid RFLM model")
@@ -249,9 +275,38 @@ mod tests {
     #[test]
     fn bundled_lmr_model_parses_and_predicts_sanely() {
         let model = bundled_lmr_model();
-        let feats = [6.0, 4.0, 5.0, 1.0, 0.0, 0.0, 0.0, 20.0, 0.0, 1.0];
+        // depth, ply, move_index, is_quiet, is_priority, pv_node, gives_check,
+        // static_eval, extension, reduction, history, tt/killer/counter/capture/promo,
+        // node_in_check, tt_depth.
+        let feats = [
+            6.0, 4.0, 5.0, 1.0, 0.0, 0.0, 0.0, 20.0, 0.0, 1.0, 350.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+            0.0, 5.0,
+        ];
         let p = model.raise_alpha_prob(&feats);
         assert!((0.0..=1.0).contains(&p), "probability {p} out of [0,1]");
         assert!((-1..=2).contains(&model.reduction_correction(&feats)));
+    }
+
+    #[test]
+    fn unbounded_scalars_are_clamped_like_the_trainer() {
+        // A single unit weight on static_eval: a mate-sized eval must score exactly as
+        // the clamp bound does, which is the largest value the trainer ever saw.
+        let mut w1 = vec![0.0f32; LMR_FEATURES];
+        w1[FEAT_STATIC_EVAL] = 1.0;
+        let model = LmrModel::from_bytes(&build_rflm(1, &w1, &[0.0], &[1.0], 0.0)).unwrap();
+        let mut at_bound = [0.0f32; LMR_FEATURES];
+        at_bound[FEAT_STATIC_EVAL] = STATIC_EVAL_CLAMP;
+        let mut way_past = [0.0f32; LMR_FEATURES];
+        way_past[FEAT_STATIC_EVAL] = 30_000.0; // a mate score
+        assert_eq!(model.raise_alpha_prob(&at_bound), model.raise_alpha_prob(&way_past));
+
+        let mut w1 = vec![0.0f32; LMR_FEATURES];
+        w1[FEAT_HISTORY] = 1.0;
+        let model = LmrModel::from_bytes(&build_rflm(1, &w1, &[0.0], &[1.0], 0.0)).unwrap();
+        let mut at_bound = [0.0f32; LMR_FEATURES];
+        at_bound[FEAT_HISTORY] = -HISTORY_CLAMP;
+        let mut way_past = [0.0f32; LMR_FEATURES];
+        way_past[FEAT_HISTORY] = -1_000_000.0;
+        assert_eq!(model.raise_alpha_prob(&at_bound), model.raise_alpha_prob(&way_past));
     }
 }

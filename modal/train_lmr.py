@@ -4,8 +4,8 @@ dataset. The engine turns that probability into a clamped reduction correction
 (`reduction = classical + clamp(learned, -1, +2)`): low P(raise alpha) -> reduce
 more (save nodes), borderline -> leave it.
 
-Model: 10 standardized features -> `hidden` ReLU -> 1 logit (sigmoid). ~180 params;
-inference is a handful of FLOPs, cheap enough for the hot loop.
+Model: 18 standardized features -> `hidden` ReLU -> 1 logit (sigmoid). ~320 params at
+hidden 16; inference is a handful of FLOPs, cheap enough for the hot loop.
 
 Export format RFLM v1 (little-endian):
   magic b"RFLM" | u32 version=1 | u32 input_dim | u32 hidden
@@ -18,7 +18,11 @@ TSV schema (0-based columns) the reader consumes:
   0 pos_id 1 depth 2 ply 3 move_index 4 is_quiet 5 is_priority 6 pv_node
   7 gives_check 8 static_eval 9 extension 10 reduction 11 lmp_pruned
   12 raised_alpha 13 caused_cutoff 14 needed_lmr_research 15 needed_pvs_research
-  16 subtree_nodes
+  16 subtree_nodes 17 history_score 18 is_tt_move 19 is_killer 20 is_counter
+  21 is_capture 22 is_promotion 23 node_in_check 24 tt_depth
+
+Columns 17..24 are the v2 additions, appended so every v1 index (notably the target
+and the `lmp_pruned` filter) is unchanged.
 """
 
 import struct
