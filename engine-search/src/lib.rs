@@ -1310,27 +1310,24 @@ impl Searcher {
             }
         }
 
-        let tt_move = self.tt.get(tt_key).and_then(|entry| entry.best_move);
+        // One probe, three readers (TT move, singular candidate, and the learned-LMR
+        // `tt_depth` feature). Copied out so it does not borrow `self` across the loop.
+        let tt_entry = self.tt.get(tt_key).copied();
+        let tt_move = tt_entry.and_then(|entry| entry.best_move);
+        let tt_depth = tt_entry.map_or(0, |entry| entry.depth);
+        let counter_move = previous_move.and_then(|mv| self.counter_moves[history_index(mv)]);
         let singular_candidate = excluded_move.is_none().then(|| {
-            self.tt
-                .get(tt_key)
-                .filter(|entry| {
-                    can_try_singular_extension(
-                        depth,
-                        in_check,
-                        self.has_non_pawn_material(board, board.side_to_move),
-                        *entry,
-                    )
-                })
+            tt_entry.filter(|entry| {
+                can_try_singular_extension(
+                    depth,
+                    in_check,
+                    self.has_non_pawn_material(board, board.side_to_move),
+                    *entry,
+                )
+            })
         }).flatten();
         let mut moves = board.generate_legal_move_list();
-        self.order_moves(
-            board,
-            moves.as_mut_slice(),
-            ply as usize,
-            tt_move,
-            previous_move.and_then(|mv| self.counter_moves[history_index(mv)]),
-        );
+        self.order_moves(board, moves.as_mut_slice(), ply as usize, tt_move, counter_move);
         if moves.is_empty() {
             return (self.evaluate_terminal(board, ply), Vec::new());
         }
@@ -1356,16 +1353,25 @@ impl Searcher {
                         .0
                         < singular_verification_beta(entry.score)
             });
-            let is_quiet = self.is_quiet_move(board, mv);
+            // `is_quiet` is the same predicate as before, just decomposed: the learned-LMR
+            // feature set wants capture and promotion separately, and the ordering flags
+            // carry more signal apart than OR'd into one `is_priority` bit.
+            let is_capture = self.is_capture_move(board, mv);
+            let is_promotion = mv.promotion.is_some();
+            let is_quiet = !is_capture && !is_promotion;
+            // Snapshot at the DECISION point, not after the move's subtree: deeper
+            // cutoffs on this same from/to bump the shared history table, so a
+            // post-search read would leak the outcome into the feature and train the
+            // model on information the reduction decision cannot have.
+            let history_score = self.history[history_index(mv)];
             let pawn_extension = passed_pawn_extension(board, mv);
-            let is_priority_move = Some(mv) == tt_move
-                || self
-                    .killer_moves
-                    .get(ply as usize)
-                    .is_some_and(|killers| killers.contains(&Some(mv)))
-                || previous_move
-                    .and_then(|previous| self.counter_moves[history_index(previous)])
-                    == Some(mv);
+            let is_tt_move = Some(mv) == tt_move;
+            let is_killer = self
+                .killer_moves
+                .get(ply as usize)
+                .is_some_and(|killers| killers.contains(&Some(mv)));
+            let is_counter = counter_move == Some(mv);
+            let is_priority_move = is_tt_move || is_killer || is_counter;
             // PV node iff a full-width window remains at this decision. Cheap to
             // compute; used only for telemetry.
             let pv_node = beta - alpha > 1;
@@ -1378,38 +1384,33 @@ impl Searcher {
                 // Late-move pruning: this move (and the rest of the list) is
                 // skipped. Record the pruned move with zeroed outcome fields; it
                 // is not searched. Counterfactual verification is a later phase.
-                if self.telemetry.is_some() {
-                    let (history_score, is_tt_move, is_killer, is_counter, is_capture,
-                         is_promotion, tt_depth) =
-                        self.telemetry_context(board, mv, ply, previous_move, tt_move, tt_key);
-                    if let Some(collector) = self.telemetry.as_mut() {
-                        collector.push(MoveDecision {
-                            depth,
-                            ply: ply as u16,
-                            move_index: move_index as u16,
-                            is_quiet,
-                            is_priority: is_priority_move,
-                            pv_node,
-                            gives_check: false,
-                            static_eval: node_static_eval,
-                            extension: 0,
-                            reduction: 0,
-                            lmp_pruned: true,
-                            raised_alpha: false,
-                            caused_cutoff: false,
-                            needed_lmr_research: false,
-                            needed_pvs_research: false,
-                            subtree_nodes: 0,
-                            history_score,
-                            is_tt_move,
-                            is_killer,
-                            is_counter,
-                            is_capture,
-                            is_promotion,
-                            node_in_check: in_check,
-                            tt_depth,
-                        });
-                    }
+                if let Some(collector) = self.telemetry.as_mut() {
+                    collector.push(MoveDecision {
+                        depth,
+                        ply: ply as u16,
+                        move_index: move_index as u16,
+                        is_quiet,
+                        is_priority: is_priority_move,
+                        pv_node,
+                        gives_check: false,
+                        static_eval: node_static_eval,
+                        extension: 0,
+                        reduction: 0,
+                        lmp_pruned: true,
+                        raised_alpha: false,
+                        caused_cutoff: false,
+                        needed_lmr_research: false,
+                        needed_pvs_research: false,
+                        subtree_nodes: 0,
+                        history_score,
+                        is_tt_move,
+                        is_killer,
+                        is_counter,
+                        is_capture,
+                        is_promotion,
+                        node_in_check: in_check,
+                        tt_depth,
+                    });
                 }
                 break;
             }
@@ -1426,6 +1427,7 @@ impl Searcher {
             // over-reduction tactically safe. `None` (default) => byte-identical search.
             let reduction = match self.lmr_model.as_ref() {
                 Some(model) if base_reduction > 0 => {
+                    // Order is load-bearing: it must match `train_lmr.py`'s FEATURE_COLS.
                     let feats = [
                         f32::from(depth),
                         ply as f32,
@@ -1500,40 +1502,33 @@ impl Searcher {
             let raised_alpha = score > alpha;
             alpha = alpha.max(score);
             let caused_cutoff = alpha >= beta;
-            if self.telemetry.is_some() {
-                // `board` is back to its pre-move state here (unmake above), which is
-                // what `telemetry_context` needs to read capture/history correctly.
-                let (history_score, is_tt_move, is_killer, is_counter, is_capture,
-                     is_promotion, tt_depth) =
-                    self.telemetry_context(board, mv, ply, previous_move, tt_move, tt_key);
-                if let Some(collector) = self.telemetry.as_mut() {
-                    collector.push(MoveDecision {
-                        depth,
-                        ply: ply as u16,
-                        move_index: move_index as u16,
-                        is_quiet,
-                        is_priority: is_priority_move,
-                        pv_node,
-                        gives_check,
-                        static_eval: node_static_eval,
-                        extension,
-                        reduction,
-                        lmp_pruned: false,
-                        raised_alpha,
-                        caused_cutoff,
-                        needed_lmr_research,
-                        needed_pvs_research,
-                        subtree_nodes: self.nodes - subtree_nodes_before,
-                        history_score,
-                        is_tt_move,
-                        is_killer,
-                        is_counter,
-                        is_capture,
-                        is_promotion,
-                        node_in_check: in_check,
-                        tt_depth,
-                    });
-                }
+            if let Some(collector) = self.telemetry.as_mut() {
+                collector.push(MoveDecision {
+                    depth,
+                    ply: ply as u16,
+                    move_index: move_index as u16,
+                    is_quiet,
+                    is_priority: is_priority_move,
+                    pv_node,
+                    gives_check,
+                    static_eval: node_static_eval,
+                    extension,
+                    reduction,
+                    lmp_pruned: false,
+                    raised_alpha,
+                    caused_cutoff,
+                    needed_lmr_research,
+                    needed_pvs_research,
+                    subtree_nodes: self.nodes - subtree_nodes_before,
+                    history_score,
+                    is_tt_move,
+                    is_killer,
+                    is_counter,
+                    is_capture,
+                    is_promotion,
+                    node_in_check: in_check,
+                    tt_depth,
+                });
             }
             if caused_cutoff {
                 self.record_cutoff(ply as usize, mv, depth, previous_move, is_quiet);
@@ -1871,51 +1866,17 @@ impl Searcher {
         stand_pat + captured_value + 75 >= alpha
     }
 
-    fn is_quiet_move(&self, board: &Board, mv: ChessMove) -> bool {
-        mv.promotion.is_none()
-            && board.piece_at(mv.to).is_none()
-            && !(board.en_passant() == Some(mv.to)
+    /// The move captures, including en passant. `board` must be in its pre-move state.
+    fn is_capture_move(&self, board: &Board, mv: ChessMove) -> bool {
+        board.piece_at(mv.to).is_some()
+            || (board.en_passant() == Some(mv.to)
                 && board
                     .piece_at(mv.from)
                     .is_some_and(|piece| piece.kind == PieceKind::Pawn))
     }
 
-    /// The v2 telemetry context fields for `mv` at this node, as
-    /// `(history_score, is_tt_move, is_killer, is_counter, is_capture, is_promotion,
-    /// tt_depth)`.
-    ///
-    /// Called **only** while telemetry is collecting, so normal play never pays for
-    /// it — in particular `is_priority_move` keeps its short-circuit in the hot loop
-    /// and the killer/counter/TT parts are re-derived here purely for the dataset.
-    /// `board` must be in its pre-move state (both record sites satisfy that: the
-    /// pruned move is never made, and the searched move is recorded after unmake).
-    #[allow(clippy::too_many_arguments)]
-    fn telemetry_context(
-        &self,
-        board: &Board,
-        mv: ChessMove,
-        ply: i32,
-        previous_move: Option<ChessMove>,
-        tt_move: Option<ChessMove>,
-        tt_key: u64,
-    ) -> (i32, bool, bool, bool, bool, bool, u8) {
-        let history_score = self.history[history_index(mv)];
-        let is_tt_move = Some(mv) == tt_move;
-        let is_killer = self
-            .killer_moves
-            .get(ply as usize)
-            .is_some_and(|killers| killers.contains(&Some(mv)));
-        let is_counter = previous_move
-            .and_then(|previous| self.counter_moves[history_index(previous)])
-            == Some(mv);
-        let is_capture = board.piece_at(mv.to).is_some()
-            || (board.en_passant() == Some(mv.to)
-                && board
-                    .piece_at(mv.from)
-                    .is_some_and(|piece| piece.kind == PieceKind::Pawn));
-        let is_promotion = mv.promotion.is_some();
-        let tt_depth = self.tt.get(tt_key).map_or(0, |entry| entry.depth);
-        (history_score, is_tt_move, is_killer, is_counter, is_capture, is_promotion, tt_depth)
+    fn is_quiet_move(&self, board: &Board, mv: ChessMove) -> bool {
+        mv.promotion.is_none() && !self.is_capture_move(board, mv)
     }
 
     fn tt_capacity_entries(&self) -> usize {
@@ -3607,6 +3568,18 @@ mod tests {
                 // `extension` is a max of 0/1 flags; `reduction` is 0, 1, or 2.
                 assert!(record.extension <= 1, "extension out of range: {record:?}");
                 assert!(record.reduction <= 2, "reduction out of range: {record:?}");
+                // The v1 flags are now derived from the v2 ones rather than computed
+                // separately; these pin the two decompositions so they cannot drift.
+                assert_eq!(
+                    record.is_quiet,
+                    !record.is_capture && !record.is_promotion,
+                    "is_quiet must be exactly not-capture and not-promotion: {record:?}"
+                );
+                assert_eq!(
+                    record.is_priority,
+                    record.is_tt_move || record.is_killer || record.is_counter,
+                    "is_priority must be exactly the OR of its parts: {record:?}"
+                );
                 if record.caused_cutoff {
                     assert!(
                         record.raised_alpha,
