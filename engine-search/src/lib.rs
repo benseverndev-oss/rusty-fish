@@ -110,6 +110,15 @@ pub struct SearchParams {
     /// Scales the mobility evaluation term, 0–100. 0 disables it (and skips its
     /// cost). Excluded from the SPSA vector; tuned in a later sub-project.
     pub mobility_scale: i32,
+    /// Learned-LMR correction thresholds, as per-mille P(raise alpha) so they are
+    /// integers like every other tunable. Above `unreduce` the move looks likely to
+    /// raise alpha, so reduce one ply LESS; below `reduce2`/`reduce1` it looks
+    /// predictably safe, so reduce 2/1 plies MORE. Excluded from the SPSA vector
+    /// (three params tune more cleanly by direct gated A/B than in an 11-dim
+    /// campaign, and it keeps the tuned-params TSV format stable).
+    pub lmr_unreduce_permille: i32,
+    pub lmr_reduce2_permille: i32,
+    pub lmr_reduce1_permille: i32,
 }
 
 impl Default for SearchParams {
@@ -124,6 +133,9 @@ impl Default for SearchParams {
             late_move_pruning_scale: 2,
             null_move_reduction: 3,
             mobility_scale: 100,
+            lmr_unreduce_permille: lmr_model::DEFAULT_LMR_UNREDUCE_PERMILLE,
+            lmr_reduce2_permille: lmr_model::DEFAULT_LMR_REDUCE2_PERMILLE,
+            lmr_reduce1_permille: lmr_model::DEFAULT_LMR_REDUCE1_PERMILLE,
         }
     }
 }
@@ -1413,8 +1425,14 @@ impl Searcher {
                         f32::from(extension),
                         f32::from(base_reduction),
                     ];
-                    let corrected =
-                        i16::from(base_reduction) + i16::from(model.reduction_correction(&feats));
+                    // Policy thresholds come from SearchParams so they're tunable.
+                    let correction = model.reduction_correction_with(
+                        &feats,
+                        self.params.lmr_unreduce_permille,
+                        self.params.lmr_reduce2_permille,
+                        self.params.lmr_reduce1_permille,
+                    );
+                    let corrected = i16::from(base_reduction) + i16::from(correction);
                     corrected.clamp(0, i16::from(next_depth)) as u8
                 }
                 _ => base_reduction,

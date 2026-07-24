@@ -776,10 +776,24 @@ fn flag_value(name: &str) -> Option<String> {
 /// learned-LMR model and install it on the candidate — the A/B knob for gating a
 /// learned-LMR net vs the classical-LMR baseline under equal nodes.
 fn apply_lmr_flag(candidate: EngineConfig) -> Result<EngineConfig, String> {
-    match flag_value("--lmr") {
-        Some(path) => Ok(candidate.with_lmr(engine_search::LmrModel::from_file(&path)?)),
-        None => Ok(candidate),
+    let mut candidate = match flag_value("--lmr") {
+        Some(path) => candidate.with_lmr(engine_search::LmrModel::from_file(&path)?),
+        None => candidate,
+    };
+    // Optional per-mille correction-threshold overrides, so a gate can A/B the
+    // learned-LMR *policy* (how aggressively P(raise alpha) maps to plies) while
+    // holding the model fixed. This is how the thresholds get tuned.
+    let permille = |name: &str| flag_value(name).and_then(|value| value.parse::<i32>().ok());
+    if let Some(value) = permille("--lmr-unreduce") {
+        candidate.search.lmr_unreduce_permille = value;
     }
+    if let Some(value) = permille("--lmr-reduce2") {
+        candidate.search.lmr_reduce2_permille = value;
+    }
+    if let Some(value) = permille("--lmr-reduce1") {
+        candidate.search.lmr_reduce1_permille = value;
+    }
+    Ok(candidate)
 }
 
 /// A `--seed <n>` opening-seed offset (default 0) so sharded gate runs — each an
