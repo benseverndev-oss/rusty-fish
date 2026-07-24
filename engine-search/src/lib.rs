@@ -854,6 +854,7 @@ impl Searcher {
         params: SearchParams,
         eval_params: EvalParams,
         nnue: Option<Arc<Nnue>>,
+        lmr_model: Option<LmrModel>,
     ) -> Self {
         Self {
             nodes: 0,
@@ -875,6 +876,7 @@ impl Searcher {
             opening_book: None,
             syzygy: None,
             telemetry: None,
+            lmr_model,
         }
     }
 
@@ -1023,10 +1025,11 @@ impl Searcher {
                 let params = self.params;
                 let eval_params = self.eval_params;
                 let nnue = self.nnue.clone();
+                let lmr = self.lmr_model.clone();
                 let helper_board = board.clone();
                 let stop = Arc::clone(&shared_stop);
                 helper_handles.push(thread::spawn(move || {
-                    Searcher::helper(tt, options, params, eval_params, nnue).run_lazy_smp_helper(
+                    Searcher::helper(tt, options, params, eval_params, nnue, lmr).run_lazy_smp_helper(
                         &helper_board,
                         max_depth,
                         deadline,
