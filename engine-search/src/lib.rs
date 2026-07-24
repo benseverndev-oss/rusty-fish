@@ -1439,6 +1439,14 @@ impl Searcher {
                         node_static_eval as f32,
                         f32::from(extension),
                         f32::from(base_reduction),
+                        history_score as f32,
+                        f32::from(u8::from(is_tt_move)),
+                        f32::from(u8::from(is_killer)),
+                        f32::from(u8::from(is_counter)),
+                        f32::from(u8::from(is_capture)),
+                        f32::from(u8::from(is_promotion)),
+                        f32::from(u8::from(in_check)),
+                        f32::from(tt_depth),
                     ];
                     // Policy thresholds come from SearchParams so they're tunable.
                     let correction = model.reduction_correction_with(
