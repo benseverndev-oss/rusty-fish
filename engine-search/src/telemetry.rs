@@ -103,12 +103,37 @@ pub struct MoveDecision {
     /// Kind of the captured piece, `1..=6` (pawn..king), `0` for a non-capture. En
     /// passant records the captured pawn as `1`, matching `is_capture`.
     pub captured_piece: u8,
+
+    // --- v4 context (APPENDED, never inserted) ---
+    // Replay support for decision-mutation label augmentation. `caused_cutoff` is
+    // order-dependent — only the *first* move (in search order) whose score reaches beta
+    // is credited, because the loop then breaks. These four columns let an offline pass
+    // replay a node's cutoff logic under a *different* move order and re-derive the
+    // labels, synthesizing counterfactual "this move would have cut first" examples with
+    // no extra search. Appended, so every existing column index is unchanged.
+    /// Groups the move-decisions of one search node. Unique within a single searched
+    /// position (it is the node counter at node entry); combine with `pos_id` across
+    /// positions. A node's rows are *not* contiguous in the stream — child subtrees emit
+    /// between them — so replay groups by `(pos_id, node_id)`.
+    pub node_id: u64,
+    /// The score the search assigned this move (this node's perspective), the value
+    /// compared against `node_beta`/the running alpha. `0` for an unsearched move
+    /// (`lmp_pruned`). Order-dependent windows (PVS null-window, LMR) make it a bound for
+    /// late fail-low moves, but a move whose true value reaches beta fails high and is
+    /// re-searched to an accurate score, so the `>= node_beta` cutoff test stays faithful.
+    pub move_score: i32,
+    /// The node's alpha at the start of its move loop (after any TT raise). The running
+    /// alpha a replay starts from.
+    pub node_alpha: i32,
+    /// The node's beta (constant across the move loop). A move cuts iff `move_score >=
+    /// node_beta`.
+    pub node_beta: i32,
 }
 
 /// TSV header row for the v1 schema, including the leading `pos_id` column that
 /// the dataset generator prepends. Kept adjacent to [`MoveDecision::to_tsv_row`]
 /// so the column order stays single-sourced.
-pub const TELEMETRY_TSV_HEADER: &str = "pos_id\tdepth\tply\tmove_index\tis_quiet\tis_priority\tpv_node\tgives_check\tstatic_eval\textension\treduction\tlmp_pruned\traised_alpha\tcaused_cutoff\tneeded_lmr_research\tneeded_pvs_research\tsubtree_nodes\thistory_score\tis_tt_move\tis_killer\tis_counter\tis_capture\tis_promotion\tnode_in_check\ttt_depth\torder_score\tsee\tmover_piece\tcaptured_piece";
+pub const TELEMETRY_TSV_HEADER: &str = "pos_id\tdepth\tply\tmove_index\tis_quiet\tis_priority\tpv_node\tgives_check\tstatic_eval\textension\treduction\tlmp_pruned\traised_alpha\tcaused_cutoff\tneeded_lmr_research\tneeded_pvs_research\tsubtree_nodes\thistory_score\tis_tt_move\tis_killer\tis_counter\tis_capture\tis_promotion\tnode_in_check\ttt_depth\torder_score\tsee\tmover_piece\tcaptured_piece\tnode_id\tmove_score\tnode_alpha\tnode_beta";
 
 /// The learned-LMR model's input columns, **by header name**, in the exact order the
 /// model expects them (matching `train_lmr.py`'s `FEATURE_COLS` and the feature
@@ -204,7 +229,7 @@ impl MoveDecision {
         let b = |flag: bool| u8::from(flag);
         format!(
             "{pos_id}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\
-             \t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+             \t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.depth,
             self.ply,
             self.move_index,
@@ -233,6 +258,10 @@ impl MoveDecision {
             self.see,
             self.mover_piece,
             self.captured_piece,
+            self.node_id,
+            self.move_score,
+            self.node_alpha,
+            self.node_beta,
         )
     }
 }
@@ -413,6 +442,10 @@ mod tests {
             see: -17,
             mover_piece: 3,
             captured_piece: 5,
+            node_id: 4242,
+            move_score: -128,
+            node_alpha: -30,
+            node_beta: 25,
         };
         let row = record.to_tsv_row(9);
         let header_cols = TELEMETRY_TSV_HEADER.split('\t').count();
@@ -421,7 +454,7 @@ mod tests {
         assert_eq!(
             row,
             "9\t7\t3\t5\t1\t0\t1\t0\t-42\t1\t2\t0\t1\t1\t0\t1\t1234\t-55\t1\t0\t1\t0\t1\t0\t4\
-             \t1000042\t-17\t3\t5"
+             \t1000042\t-17\t3\t5\t4242\t-128\t-30\t25"
         );
     }
 }

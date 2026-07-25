@@ -1304,6 +1304,11 @@ impl Searcher {
             return (self.evaluate(board), Vec::new());
         }
         self.nodes += 1;
+        // Unique id for this node within the current search (the node counter at entry),
+        // used only to group this node's telemetry rows for offline cutoff replay — a
+        // node's rows are not contiguous in the stream because child subtrees emit
+        // between them. A plain read; it never affects the search.
+        let node_id = self.nodes;
         let original_alpha = alpha;
         let tt_key = board.position_hash();
         let in_check = board.in_check(board.side_to_move);
@@ -1408,6 +1413,9 @@ impl Searcher {
             return (self.evaluate_terminal(board, ply), Vec::new());
         }
 
+        // The move loop's starting alpha (after any TT raise), captured before the loop
+        // mutates it — the fixed value a cutoff replay starts its running alpha from.
+        let node_alpha = alpha;
         let mut best_score = -MATE_SCORE;
         let mut best_line = Vec::new();
         for (move_index, &mv) in moves.as_slice().iter().enumerate() {
@@ -1518,6 +1526,10 @@ impl Searcher {
                         see,
                         mover_piece,
                         captured_piece,
+                        node_id,
+                        move_score: 0, // late-move-pruned: not searched
+                        node_alpha,
+                        node_beta: beta,
                     });
                 }
                 break;
@@ -1648,6 +1660,10 @@ impl Searcher {
                     see,
                     mover_piece,
                     captured_piece,
+                    node_id,
+                    move_score: score,
+                    node_alpha,
+                    node_beta: beta,
                 });
             }
             if caused_cutoff {

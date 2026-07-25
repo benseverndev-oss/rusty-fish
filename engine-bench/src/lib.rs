@@ -16,6 +16,7 @@ use pgn_reader::shakmaty::{Chess, Position, uci::UciMove};
 use pgn_reader::{RawTag, Reader, SanPlus, Visitor};
 
 pub mod bench_harness;
+pub mod mutate;
 pub mod policy_train;
 pub mod train;
 

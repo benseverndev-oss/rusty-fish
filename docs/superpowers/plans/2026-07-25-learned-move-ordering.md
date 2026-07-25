@@ -237,3 +237,38 @@ approximate labels. Trainer and model formats stay put; only the dataset grows/s
   experiment: one round of policy-ordered relabel → retrain → re-gate at K=4/bound≈500.
 - Generalises beyond ordering — the same replay trick could densify LMR / pruning labels
   (`raised_alpha`, `needed_lmr_research` are also order/threshold-dependent).
+
+#### Tier 1 — built (2026-07-25)
+
+Shipped: **v4 telemetry** (append-only `node_id`, `move_score`, `node_alpha`, `node_beta`
+— byte-identical invariant still green), a **replay engine + `gen-mutated-labels`** step
+(`<telemetry_v4|-> <mutations_per_node> [seed]`) that groups rows by `(pos_id, node_id)`,
+replays each node's cutoff logic under seeded shuffles, and emits rows in the *same*
+schema (so the output concatenates with real telemetry and feeds `train-policy`
+unchanged). End-to-end validated: 2.19M telemetry rows → 3.53M mutated rows →
+`train-policy` trains on the 5.7M-row union.
+
+**Sharpened finding while building it — Tier 1 cannot add new `caused_cutoff` signal,
+and here's the precise reason.** A move cuts iff `move_score ≥ node_beta`. Within a node
+only *one* searched move ever records that (the loop breaks at the first cutoff), and
+every searched non-cutter genuinely has `move_score < node_beta`. So the recorded
+`caused_cutoff` **already is** the counterfactual "would this move cut if ordered first?"
+for every *searched* move — reordering them changes nothing. The moves that could be
+undiscovered cutters are the *unsearched* tail (after the cutoff, or LMP-pruned), and
+those have no recorded score. **Only re-search (Tier 2) can label them.** What Tier 1
+*does* add is counterfactual **`raised_alpha`** labels (order-dependent on the running
+alpha) — the denser target — plus it is the exact substrate Tier 2 needs.
+
+**Fidelity measured** (the open question above): replaying the *actual* order reproduces
+the recorded labels for **97.2%** of nodes on real depth-8 telemetry. The ~3% gap is the
+PVS-null-window / LMR approximation (a late fail-low move's recorded score is a bound),
+exactly where the caveat predicted — and low enough to trust Tier 1 for `raised_alpha`
+augmentation. (One doc-note above is now refined: replay does *not* meaningfully
+synthesize `caused_cutoff`; that claim is superseded by the finding here.)
+
+**So the recommended next step is Tier 2, not a Tier-1 volume push:** sampled re-search
+under policy-predicted ordering (the DAgger loop) is the only thing that manufactures the
+missing "an unsearched move would have cut first" labels — the actual off-policy signal.
+Tier 1's `raised_alpha` output is worth one cheap experiment (retrain on the
+`raised_alpha` target with the augmented set, re-gate at K=4/bound≈500) but is not
+expected to beat the −55 Elo on its own.

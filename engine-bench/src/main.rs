@@ -15,6 +15,7 @@ use engine_bench::{
     search_params_from_tsv, run_search_gate_fens, run_policy_gate_fens, measure_policy_overhead,
 };
 use engine_bench::policy_train::{PolicyTrainConfig, train_policy};
+use engine_bench::mutate::gen_mutated_labels;
 use engine_bench::bench_harness::{
     BenchCompareConfig, BenchReportConfig, BudgetMode, EngineConfig, bench_compare_tsv_report,
     bench_full_report_text, bench_sweep_tsv_report, compare_openings, run_bench_compare,
@@ -877,6 +878,39 @@ fn main() -> Result<(), String> {
             "POLICY_TRAIN_DONE out={out_path} rows={} scanned={} base_rate={:.4} \
              val_acc={:.4} val_auc={:.4}",
             summary.rows, summary.scanned, summary.base_rate, summary.val_accuracy, summary.val_auc
+        );
+        return Ok(());
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("gen-mutated-labels") {
+        // gen-mutated-labels <telemetry_v4_tsv_or_-> <mutations_per_node> [seed]:
+        // Tier 1 decision-mutation augmentation. Reads a v4 `gen-search-telemetry` TSV,
+        // groups rows by node, and replays each node's cutoff logic under shuffled move
+        // orders to emit counterfactual rows (same schema, so the output concatenates
+        // with real telemetry and feeds `train-policy` unchanged). Prints the node/row
+        // counts and the actual-order replay fidelity to stderr — see the module docs for
+        // what this can and cannot synthesize (new `raised_alpha`, not new cutters).
+        let usage = "usage: gen-mutated-labels <telemetry_v4_or_-> <mutations_per_node> [seed]";
+        let source = std::env::args().nth(2).ok_or_else(|| usage.to_string())?;
+        let mutations = arg_u64(3).ok_or_else(|| usage.to_string())?;
+        let seed = arg_u64(4).unwrap_or(0);
+        let stdout = std::io::stdout();
+        let writer = std::io::BufWriter::new(stdout.lock());
+        let summary = if source == "-" {
+            gen_mutated_labels(std::io::stdin().lock(), writer, mutations, seed)?
+        } else {
+            let file = std::fs::File::open(&source)
+                .map_err(|error| format!("failed to open telemetry {source}: {error}"))?;
+            gen_mutated_labels(std::io::BufReader::new(file), writer, mutations, seed)?
+        };
+        eprintln!(
+            "GEN_MUTATED_DONE nodes={} mutable_nodes={} emitted_rows={} fidelity={}",
+            summary.nodes,
+            summary.mutable_nodes,
+            summary.emitted_rows,
+            summary
+                .fidelity()
+                .map_or_else(|| "n/a".to_string(), |value| format!("{value:.4}")),
         );
         return Ok(());
     }
