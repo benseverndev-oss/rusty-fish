@@ -9,7 +9,7 @@ use std::time::Duration;
 use engine_core::{Board, Color, GameStatus};
 use engine_search::{
     EvalParams, LMR_FEATURE_CLAMPS, LMR_FEATURE_COLUMNS, LMR_FILTER_COLUMN, LMR_TARGET_COLUMN,
-    Nnue, SearchLimits, SearchParams, Searcher, TELEMETRY_TSV_HEADER, TaperedScore,
+    Nnue, PolicyModel, SearchLimits, SearchParams, Searcher, TELEMETRY_TSV_HEADER, TaperedScore,
     active_features,
 };
 use pgn_reader::shakmaty::{Chess, Position, uci::UciMove};
@@ -840,6 +840,149 @@ pub fn run_search_gate_fens<S: AsRef<str>>(
         }
     }
     Ok(records)
+}
+
+/// Per-side search totals over a policy gate, used to report the tree-efficiency
+/// side of the story alongside Elo. Better move ordering finds a cutoff sooner, so
+/// at equal movetime it doesn't spend *fewer* nodes — it reaches *greater depth* in
+/// the same time. `avg_depth` is therefore the leading indicator of an ordering win
+/// (it moves even when Elo is flat); `avg_nodes` is reported too so a change in
+/// nodes-per-move is visible rather than hidden.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct PolicyGateTally {
+    pub nodes: u64,
+    pub depth_sum: u64,
+    pub moves: u64,
+}
+
+impl PolicyGateTally {
+    pub fn avg_depth(self) -> f64 {
+        if self.moves == 0 {
+            0.0
+        } else {
+            self.depth_sum as f64 / self.moves as f64
+        }
+    }
+
+    pub fn avg_nodes(self) -> f64 {
+        if self.moves == 0 {
+            0.0
+        } else {
+            self.nodes as f64 / self.moves as f64
+        }
+    }
+}
+
+/// The result of a policy gate: the per-game records (feed [`summarize`] then
+/// [`sprt`]) plus each side's search totals.
+pub struct PolicyGateResult {
+    pub records: Vec<GameRecord>,
+    pub candidate: PolicyGateTally,
+    pub baseline: PolicyGateTally,
+}
+
+/// A policy-gate searcher: the *real shipped engine* (`Searcher::default()` — NNUE
+/// and learned LMR both on, which is where the policy would actually run), with the
+/// move overhead trimmed so a small `movetime` budget is spent searching rather than
+/// reserved, and the given policy installed. `None` is the baseline — ordering
+/// byte-identical to the shipped engine. This deliberately does NOT strip NNUE the
+/// way [`gate_searcher`] does: the mobility/eval gates isolate a hand-crafted eval
+/// term, but the move-ordering policy is only meaningful against the eval and
+/// reductions it ships with, so candidate and baseline differ *only* in the policy.
+fn policy_gate_searcher(policy: Option<PolicyModel>, order_bound: i32) -> Searcher {
+    let mut searcher = Searcher::default();
+    let params = SearchParams { policy_order_bound: order_bound, ..SearchParams::default() };
+    searcher.set_search_params(params);
+    searcher.set_policy_model(policy);
+    let mut options = searcher.options().clone();
+    options.move_overhead = Duration::from_millis(3);
+    searcher.set_options(options);
+    searcher
+}
+
+/// Plays one gate game: the candidate (policy installed) against the baseline (no
+/// policy), both the shipped engine otherwise, each thinking for a fixed `move_time`
+/// per move. Accumulates each side's node/depth totals into the tallies. Movetime
+/// (not depth) bounds each move, so the whole game's cost is bounded by
+/// `max_plies * move_time` regardless of how sharp the position is.
+#[allow(clippy::too_many_arguments)]
+fn play_policy_game(
+    fen: &str,
+    candidate_color: Color,
+    policy: &PolicyModel,
+    order_bound: i32,
+    move_time: Duration,
+    max_plies: u32,
+    candidate_tally: &mut PolicyGateTally,
+    baseline_tally: &mut PolicyGateTally,
+) -> Result<GameRecord, String> {
+    let mut board = Board::from_fen(fen)?;
+    let mut candidate = policy_gate_searcher(Some(policy.clone()), order_bound);
+    let mut baseline = policy_gate_searcher(None, order_bound);
+    for ply in 0..max_plies {
+        let is_candidate = board.side_to_move == candidate_color;
+        let searcher = if is_candidate { &mut candidate } else { &mut baseline };
+        let result = searcher.search(
+            &board,
+            SearchLimits {
+                movetime: Some(move_time),
+                ..SearchLimits::default()
+            },
+        );
+        let tally = if is_candidate { &mut *candidate_tally } else { &mut *baseline_tally };
+        tally.nodes += result.nodes;
+        tally.depth_sum += u64::from(result.depth);
+        tally.moves += 1;
+        let Some(mv) = result.best_move else {
+            return Ok(GameRecord {
+                fen: fen.to_string(),
+                candidate_color,
+                outcome: outcome_from_status(board.game_status(), candidate_color),
+                plies: ply,
+            });
+        };
+        board.make_move(mv)?;
+    }
+    Ok(GameRecord {
+        fen: fen.to_string(),
+        candidate_color,
+        outcome: GameOutcome::Draw,
+        plies: max_plies,
+    })
+}
+
+/// The Phase 4 move-ordering gate over an explicit set of opening FENs — the
+/// shardable core so a fan-out can play a slice per container, exactly like
+/// [`run_mobility_gate_fens`]. Plays the `policy`-installed candidate against the
+/// no-policy baseline over each FEN color-swapped, at the same `move_time` per move,
+/// capped at `max_plies`. The two searchers are identical but for
+/// `set_policy_model`, so the SPRT isolates the learned ordering correction;
+/// `order_bound` scales the correction (`SearchParams::policy_order_bound`).
+pub fn run_policy_gate_fens<S: AsRef<str>>(
+    fens: &[S],
+    policy: &PolicyModel,
+    order_bound: i32,
+    move_time: Duration,
+    max_plies: u32,
+) -> Result<PolicyGateResult, String> {
+    let mut records = Vec::with_capacity(fens.len() * 2);
+    let mut candidate = PolicyGateTally::default();
+    let mut baseline = PolicyGateTally::default();
+    for fen in fens {
+        for candidate_color in [Color::White, Color::Black] {
+            records.push(play_policy_game(
+                fen.as_ref(),
+                candidate_color,
+                policy,
+                order_bound,
+                move_time,
+                max_plies,
+                &mut candidate,
+                &mut baseline,
+            )?);
+        }
+    }
+    Ok(PolicyGateResult { records, candidate, baseline })
 }
 
 fn play_external_game(
@@ -2424,7 +2567,8 @@ mod tests {
         external_tsv_report, measure_throughput, run_eval_spsa_campaign,
         run_spsa_campaign, run_tactical_suite, search_params_to_vector, spsa_tsv_report,
         spsa_update, sprt, tactical_solve_rate, tactical_tsv_report, throughput_tsv_report,
-        vector_to_eval_params, vector_to_search_params, MatchConfig, SprtConfig, SprtDecision,
+        vector_to_eval_params, vector_to_search_params, MatchConfig, PolicyGateTally, SprtConfig,
+        SprtDecision,
         random_opening_fens, run_eval_gate_fens, run_mobility_gate, run_nnue_gauntlet,
         run_nnue_gauntlet_with_move_time, sprt_tsv_report, summarize, BaselineMode,
         baseline_searcher,
@@ -2950,6 +3094,16 @@ mod tests {
         assert_eq!(sample.depth, 3);
         assert!(sample.nodes > 0);
         assert!(sample.nodes_per_second > 0);
+    }
+
+    #[test]
+    fn policy_gate_tally_averages_over_moves_and_is_zero_when_empty() {
+        let empty = PolicyGateTally::default();
+        assert_eq!(empty.avg_depth(), 0.0);
+        assert_eq!(empty.avg_nodes(), 0.0);
+        let tally = PolicyGateTally { nodes: 300, depth_sum: 24, moves: 4 };
+        assert_eq!(tally.avg_depth(), 6.0);
+        assert_eq!(tally.avg_nodes(), 75.0);
     }
 
     #[test]

@@ -63,3 +63,43 @@ node*, not absolute regression.
 - New model formats validate dims on load and swap the bundled asset in the same
   commit that changes the feature set.
 - Nothing is adopted without an SPRT pass at equal movetime over diverse openings.
+
+## Results so far (2026-07-25)
+
+**Step 2 — the signal is real.** Trained on real telemetry (100.2M depth-8
+move-decision rows from 2000 openings; 5M kept at stride 8), `train-policy` reaches
+**val AUC ≈ 0.933** (val_acc 0.847, base_rate 0.232), stable across seeds (0.9324 /
+0.9330). "Search this move first" is clearly learnable from ordering-time features —
+well past the 0.6 bar. Caveat: the feature set includes `order_score`/`move_index`
+(the classical rank), so part of that AUC is the model *reproducing* an already-good
+ranker; AUC measures prediction, not incremental value over classical.
+
+**Step 4 — the gate exists (`engine-bench gate-policy`).** Candidate installs the
+RFPO via `set_policy_model(Some(..))`, baseline `None`, both otherwise the shipped
+default engine, equal movetime, color-swapped, sharded over an openings file; emits
+`W\tD\tL` on stdout (feed `sprt`) and a per-side avg-depth / avg-nodes / node-ratio
+summary on stderr.
+
+**Step 4 — first result: inference cost dominates.** Smoke over 12 openings (24
+games) at 20 ms:
+
+| order_bound | W-D-L | Elo (24g, wide CI) | node_ratio (cand/base) | depth Δ |
+|---|---|---|---|---|
+| 0 (ordering unchanged) | 3-5-16 | −211 | 0.680 | −0.42 |
+| 500 | 4-7-13 | −137 | 0.676 | −0.31 |
+| 4000 (default) | 2-5-17 | −255 | 0.677 | −0.50 |
+
+The node_ratio is ~0.68 **regardless of bound** — even at `bound=0`, where ordering
+is byte-identical to classical. So the regression is dominated not by bad ordering but
+by the **per-move inference tax**: `order_moves` builds the 29-feature vector (incl.
+`static_exchange_evaluation`) and runs the MLP forward pass for *every move at every
+main-`negamax` node*, costing ~32% NPS → ~0.4 plies shallower at equal movetime. A
+bound sweep (best at 500) can't overcome that. The Elo numbers are directional (24
+games), but node_ratio is essentially deterministic and robust.
+
+**Next before adoption:** make inference cheap enough to pay for itself — e.g. reuse
+the classical SEE already computed in `move_order_score` instead of recomputing it,
+lazy/partial feature building, or apply the correction only to a top-k slice of moves
+rather than every move at every node — then re-gate at a fuller game count. The
+offline signal (AUC 0.93) says the policy *knows* something; the open question is
+whether re-ranking can be made cheap enough for that to net positive at real TC.

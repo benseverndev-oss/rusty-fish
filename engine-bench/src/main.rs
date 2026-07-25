@@ -12,7 +12,7 @@ use engine_bench::{
     gen_wdl_data_samples_from_reader, WdlSampleConfig,
     gen_eval_positions_from_reader, run_gen_search_telemetry, run_lmr_export_features,
     run_label_sf, run_label_fens,
-    search_params_from_tsv, run_search_gate_fens,
+    search_params_from_tsv, run_search_gate_fens, run_policy_gate_fens,
 };
 use engine_bench::policy_train::{PolicyTrainConfig, train_policy};
 use engine_bench::bench_harness::{
@@ -21,7 +21,7 @@ use engine_bench::bench_harness::{
     run_bench_report, run_bench_sweep,
 };
 use engine_bench::train::{generate_training_samples, train_nnue, TrainConfig};
-use engine_search::{EvalParams, Nnue, SearchParams};
+use engine_search::{DEFAULT_POLICY_ORDER_BOUND, EvalParams, Nnue, PolicyModel, SearchParams};
 
 /// Shared middlegame sampling window for both `gen-wdl-data` and
 /// `gen-eval-positions`. Single-sourced so the Stockfish teacher labels the
@@ -313,6 +313,57 @@ fn main() -> Result<(), String> {
         )?;
         let score = summarize(&records);
         println!("{}\t{}\t{}", score.wins, score.draws, score.losses);
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("gate-policy") {
+        // gate-policy <policy.rfpo> <openings_file> [move_time_ms] [order_bound]:
+        // play the Phase 4 move-ordering policy (candidate) vs classical ordering
+        // (baseline) over the file's openings, color-swapped, at equal movetime;
+        // emit "W\tD\tL" on stdout (shardable — a fan-out sums slices, then `sprt`
+        // gives the verdict). The engine is otherwise the shipped default on both
+        // sides, so the SPRT isolates the learned ordering correction. A per-side
+        // node/depth summary — the tree-efficiency signal that moves even when Elo
+        // is flat — goes to stderr along with the local SPRT verdict.
+        let usage = "usage: gate-policy <policy.rfpo> <openings_file> [move_time_ms] [order_bound]";
+        let policy_path = std::env::args().nth(2).ok_or_else(|| usage.to_string())?;
+        let openings_path = std::env::args().nth(3).ok_or_else(|| usage.to_string())?;
+        let move_time = Duration::from_millis(arg_u64(4).unwrap_or(100));
+        let order_bound = arg_u64(5)
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or(DEFAULT_POLICY_ORDER_BOUND);
+        let policy = PolicyModel::from_file(&policy_path)?;
+        let contents = std::fs::read_to_string(&openings_path)
+            .map_err(|error| format!("failed to read openings {openings_path}: {error}"))?;
+        let fens: Vec<&str> = contents.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let result = run_policy_gate_fens(&fens, &policy, order_bound, move_time, 160)?;
+        let score = summarize(&result.records);
+        println!("{}\t{}\t{}", score.wins, score.draws, score.losses);
+        let decision = sprt(score, SprtConfig::default()).map(|verdict| verdict.decision);
+        eprintln!(
+            "gate-policy: {}W {}D {}L; elo {}; decision = {decision:?}",
+            score.wins,
+            score.draws,
+            score.losses,
+            score.elo_difference().map_or_else(|| "n/a".to_string(), |elo| format!("{elo:.1}")),
+        );
+        let (cand, base) = (result.candidate, result.baseline);
+        let node_ratio = if base.nodes == 0 {
+            0.0
+        } else {
+            cand.nodes as f64 / base.nodes as f64
+        };
+        eprintln!(
+            "gate-policy nodes: candidate avg_depth={:.2} avg_nodes={:.0} total={} | \
+             baseline avg_depth={:.2} avg_nodes={:.0} total={} | depth_delta={:+.2} node_ratio={:.3}",
+            cand.avg_depth(),
+            cand.avg_nodes(),
+            cand.nodes,
+            base.avg_depth(),
+            base.avg_nodes(),
+            base.nodes,
+            cand.avg_depth() - base.avg_depth(),
+            node_ratio,
+        );
         return Ok(());
     }
     if std::env::args().nth(1).as_deref() == Some("mobility-gate-file") {
