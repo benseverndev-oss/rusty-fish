@@ -144,16 +144,39 @@ built-in check) and reports `on/off` time. `gate-policy` gained a `[top_k]` arg.
 | 500 | 4 | 17-20-23 | **−35** | 0.827 | −0.08 |
 
 Lower `K` → lower tax → less depth lost at equal movetime → Elo climbs from the
-original −255 toward neutral. At `K=4` the candidate is only ~0.08 plies shallower and
-the result is break-even within noise. **Inference cost is no longer the blocker.**
+original −255 toward the −35 point estimate above. At `K=4` the candidate is only ~0.08
+plies shallower. **Inference cost is no longer the blocker.**
 
-**What's left is the ordering-quality question, now isolated:** even with cheap
-inference the policy is not yet a *gain*, only ~neutral. Because `order_score` is a
-feature, the model largely reproduces classical ordering, so its re-ranking has little
-new to add. Next: a proper SPRT campaign sweeping (`bound`, `K`) at thousands of games
-to find whether any setting is positive, and — if not — a target/feature change that
-makes the policy re-rank *differently* from classical (a pairwise/listwise ranking loss,
-or dropping `order_score`/`move_index` so the model can't just echo the classical rank).
+**Big campaign settles the sign — it's a real regression.** The best config from the
+sweep (`K=4`, `bound=500`, 30 ms), run at **1200 games** (4 single-threaded shards,
+out-of-sample seeds), sharded through `gate-policy` → `sprt`:
+
+```
+309W 393D 498L  →  Elo -55.2  ·  LLR -4.23  ·  SPRT decision = AcceptH0 (elo0=0, elo1=5)
+```
+
+The SPRT **decisively accepts H0** (the policy is not a ≥5-Elo gain), and the point
+estimate is −55 Elo with a ~±14 Elo CI that clearly excludes 0. The hopeful −35 at 60
+games was the optimistic tail of the noise; the tight measurement lands solidly
+negative. So even with inference made cheap, **this policy at its best config genuinely
+costs ~55 Elo.**
+
+**Conclusion: the lever is the training distribution, not more tuning.** Inference cost
+is fixed and threshold/`K` tuning has been swept — the regression is what's left, and it
+traces to the policy having little *new* to say: trained on classical-order labels with
+`order_score` as a feature, it mostly re-derives the classical rank and the small
+residual perturbation is net-negative. Threshold re-sweeps won't fix a model that echoes
+the baseline. The two real next moves:
+
+1. **Change what the labels represent** — the *decision-mutation / off-policy relabel*
+   idea below (train on labels from orderings the policy itself would take, DAgger-style)
+   is the direct attack; this campaign is the "if not, …" that motivates it.
+2. **Change what the model can see** — drop `order_score`/`move_index` (the classical
+   rank) so the model can't echo it, and/or move from pointwise `caused_cutoff` to a
+   pairwise/listwise ranking loss.
+
+Until one of those moves the needle offline *and* through a ≥1000-game gate, the policy
+stays opt-in with no bundled asset — the default search is unchanged.
 
 ## Ideas / backlog
 
