@@ -16,7 +16,9 @@ mod telemetry;
 
 pub use lmr_model::{bundled_lmr_model, LmrModel, LMR_FEATURES};
 pub use nnue::{active_features, bundled_network, Nnue, INPUT_DIMENSION};
-pub use policy_model::{PolicyModel, POLICY_CLAMP_INDICES, POLICY_FEATURES};
+pub use policy_model::{
+    PolicyModel, DEFAULT_POLICY_ORDER_BOUND, POLICY_CLAMP_INDICES, POLICY_FEATURES,
+};
 pub use telemetry::{
     MoveDecision, TelemetryCollector, LMR_FEATURE_CLAMPS, LMR_FEATURE_COLUMNS, LMR_FILTER_COLUMN,
     LMR_TARGET_COLUMN, POLICY_FEATURE_CLAMPS, POLICY_FEATURE_COLUMNS, POLICY_TARGET_COLUMN,
@@ -125,6 +127,12 @@ pub struct SearchParams {
     pub lmr_unreduce_permille: i32,
     pub lmr_reduce2_permille: i32,
     pub lmr_reduce1_permille: i32,
+    /// Magnitude of the learned move-ordering correction (Phase 4), in classical
+    /// order-score units. Only has an effect when a [`PolicyModel`] is installed; with
+    /// no policy the orderer is byte-identical regardless of this value. Kept in
+    /// `SearchParams` so it can be gated by A/B while the model stays a pure predictor,
+    /// exactly like the LMR thresholds. Excluded from the SPSA vector.
+    pub policy_order_bound: i32,
 }
 
 impl Default for SearchParams {
@@ -142,6 +150,7 @@ impl Default for SearchParams {
             lmr_unreduce_permille: lmr_model::DEFAULT_LMR_UNREDUCE_PERMILLE,
             lmr_reduce2_permille: lmr_model::DEFAULT_LMR_REDUCE2_PERMILLE,
             lmr_reduce1_permille: lmr_model::DEFAULT_LMR_REDUCE1_PERMILLE,
+            policy_order_bound: policy_model::DEFAULT_POLICY_ORDER_BOUND,
         }
     }
 }
@@ -538,6 +547,24 @@ pub struct Searcher {
     /// applies a clamped reduction correction to moves the classical formula already
     /// reduces.
     lmr_model: Option<LmrModel>,
+    /// Optional learned move-ordering policy (Phase 4). `None` (the default) keeps the
+    /// classical move ordering exactly — the search is byte-identical to policy-off.
+    /// `Some` adds a clamped, `SearchParams`-scaled correction to each move's ordering
+    /// score in the main `negamax` move loop (not root, not quiescence).
+    policy_model: Option<PolicyModel>,
+}
+
+/// Node-level context the move-ordering policy needs, computed once per node and shared
+/// across every move scored there. The per-move fields (captures, history, piece kinds,
+/// the classical order score) are derived in [`Searcher::policy_features`]; these are
+/// the fields that are constant for the node.
+#[derive(Clone, Copy)]
+struct PolicyOrderContext {
+    depth: u8,
+    pv_node: bool,
+    node_in_check: bool,
+    static_eval: i32,
+    tt_depth: u8,
 }
 
 /// One square's piece change from a move: `(square, before, after)`.
@@ -579,6 +606,9 @@ impl Default for Searcher {
             // Learned LMR is the default (adopted after gating +38.3 Elo, equal movetime,
             // 4096 games, AcceptH1). `set_lmr_model(None)` restores classical LMR.
             lmr_model: Some(bundled_lmr_model()),
+            // No bundled ordering policy yet — Phase 4 is wired but unadopted, so the
+            // default orderer is classical. `set_policy_model(Some(..))` opts in.
+            policy_model: None,
         }
     }
 }
@@ -854,6 +884,14 @@ impl Searcher {
         self.lmr_model = model;
     }
 
+    /// Installs (or clears with `None`) the learned move-ordering policy (Phase 4).
+    /// With no policy the move ordering is byte-identical to classical; with a policy,
+    /// each move in the main `negamax` loop gets a clamped, `SearchParams`-scaled
+    /// ordering correction (root and quiescence ordering are left classical).
+    pub fn set_policy_model(&mut self, model: Option<PolicyModel>) {
+        self.policy_model = model;
+    }
+
     /// Drains and returns the collected [`MoveDecision`] records, leaving
     /// collection enabled (if it was) and ready to collect again. Returns an
     /// empty vector when telemetry is disabled.
@@ -875,6 +913,7 @@ impl Searcher {
         eval_params: EvalParams,
         nnue: Option<Arc<Nnue>>,
         lmr_model: Option<LmrModel>,
+        policy_model: Option<PolicyModel>,
     ) -> Self {
         Self {
             nodes: 0,
@@ -897,6 +936,7 @@ impl Searcher {
             syzygy: None,
             telemetry: None,
             lmr_model,
+            policy_model,
         }
     }
 
@@ -1046,10 +1086,12 @@ impl Searcher {
                 let eval_params = self.eval_params;
                 let nnue = self.nnue.clone();
                 let lmr = self.lmr_model.clone();
+                let policy = self.policy_model.clone();
                 let helper_board = board.clone();
                 let stop = Arc::clone(&shared_stop);
                 helper_handles.push(thread::spawn(move || {
-                    Searcher::helper(tt, options, params, eval_params, nnue, lmr).run_lazy_smp_helper(
+                    Searcher::helper(tt, options, params, eval_params, nnue, lmr, policy)
+                        .run_lazy_smp_helper(
                         &helper_board,
                         max_depth,
                         deadline,
@@ -1177,7 +1219,7 @@ impl Searcher {
             .get(board.position_hash())
             .and_then(|entry| entry.best_move);
         let mut moves = board.generate_legal_move_list();
-        self.order_moves(board, moves.as_mut_slice(), 0, tt_move, None);
+        self.order_moves(board, moves.as_mut_slice(), 0, tt_move, None, None);
         if moves.is_empty() {
             return (self.evaluate_terminal(board, 0), Vec::new());
         }
@@ -1333,7 +1375,25 @@ impl Searcher {
             })
         }).flatten();
         let mut moves = board.generate_legal_move_list();
-        self.order_moves(board, moves.as_mut_slice(), ply as usize, tt_move, counter_move);
+        // Node context for the learned move-ordering policy (Phase 4). `pv_node`,
+        // `node_in_check`, and `static_eval` mirror what the v3 telemetry recorded, so
+        // ordering-time features match the training distribution. Ignored entirely when
+        // no policy is installed (the default), leaving the ordering classical.
+        let policy_ctx = PolicyOrderContext {
+            depth,
+            pv_node: beta - alpha > 1,
+            node_in_check: in_check,
+            static_eval: node_static_eval,
+            tt_depth,
+        };
+        self.order_moves(
+            board,
+            moves.as_mut_slice(),
+            ply as usize,
+            tt_move,
+            counter_move,
+            Some(policy_ctx),
+        );
         if moves.is_empty() {
             return (self.evaluate_terminal(board, ply), Vec::new());
         }
@@ -1622,7 +1682,7 @@ impl Searcher {
                 .tt
                 .get(board.position_hash())
                 .and_then(|entry| entry.best_move);
-            self.order_moves(board, evasions.as_mut_slice(), 0, tt_move, None);
+            self.order_moves(board, evasions.as_mut_slice(), 0, tt_move, None, None);
             if evasions.is_empty() {
                 return self.evaluate_terminal(board, 0);
             }
@@ -1645,7 +1705,7 @@ impl Searcher {
         alpha = alpha.max(stand_pat);
 
         let mut moves = board.generate_capture_move_list();
-        self.order_moves(board, moves.as_mut_slice(), 0, None, None);
+        self.order_moves(board, moves.as_mut_slice(), 0, None, None, None);
         for &mv in moves.as_slice() {
             if !self.is_promising_quiescence_capture(board, mv, stand_pat, alpha) {
                 continue;
@@ -1773,6 +1833,7 @@ impl Searcher {
         ply: usize,
         tt_move: Option<ChessMove>,
         counter_move: Option<ChessMove>,
+        policy_ctx: Option<PolicyOrderContext>,
     ) {
         // Score each move once into a reused buffer, then sort descending. A
         // stable sort keyed on the negated score matches the previous
@@ -1781,8 +1842,23 @@ impl Searcher {
         // per node.
         let mut scratch = std::mem::take(&mut self.move_order_scratch);
         scratch.clear();
+        // Learned move ordering (Phase 4) applies only when a policy is installed AND
+        // the caller supplied node context (the main `negamax` loop — not root, not
+        // quiescence). With either absent the score is exactly the classical one, so
+        // the ordering is byte-identical to policy-off.
+        let policy = match (self.policy_model.as_ref(), policy_ctx) {
+            (Some(model), Some(ctx)) => Some((model, ctx)),
+            _ => None,
+        };
         for &mv in moves.iter() {
-            let score = self.move_order_score(board, mv, ply, tt_move, counter_move);
+            let mut score = self.move_order_score(board, mv, ply, tt_move, counter_move);
+            if let Some((model, ctx)) = policy {
+                // `score` is the classical order score, which is itself the
+                // `order_score` feature — so the correction is a residual on top of it.
+                let feats =
+                    self.policy_features(board, mv, &ctx, ply, score, tt_move, counter_move);
+                score = score.saturating_add(model.order_correction(&feats, self.params.policy_order_bound));
+            }
             scratch.push((score, mv));
         }
         scratch.sort_by(|left, right| right.0.cmp(&left.0));
@@ -1790,6 +1866,66 @@ impl Searcher {
             *slot = entry.1;
         }
         self.move_order_scratch = scratch;
+    }
+
+    /// Builds the policy's ordering-time feature vector for `mv`, in exactly the order
+    /// of [`POLICY_FEATURE_COLUMNS`](crate::POLICY_FEATURE_COLUMNS). This mirrors the v3
+    /// telemetry the policy is trained on field-for-field, so the features at inference
+    /// match the features at training. `order_score` is the classical score already
+    /// computed by the caller; the rest are read from the pre-move board and the node
+    /// context.
+    fn policy_features(
+        &self,
+        board: &Board,
+        mv: ChessMove,
+        ctx: &PolicyOrderContext,
+        ply: usize,
+        order_score: i32,
+        tt_move: Option<ChessMove>,
+        counter_move: Option<ChessMove>,
+    ) -> [f32; POLICY_FEATURES] {
+        let is_capture = self.is_capture_move(board, mv);
+        let is_promotion = mv.promotion.is_some();
+        let is_quiet = !is_capture && !is_promotion;
+        let is_tt_move = Some(mv) == tt_move;
+        let is_killer = self
+            .killer_moves
+            .get(ply)
+            .is_some_and(|killers| killers.contains(&Some(mv)));
+        let is_counter = counter_move == Some(mv);
+        let history_score = self.history[history_index(mv)];
+        let see = if is_capture {
+            static_exchange_evaluation(board, mv)
+        } else {
+            0
+        };
+        let mover_piece = board
+            .piece_at(mv.from)
+            .map(|piece| piece_kind_ordinal(piece.kind))
+            .unwrap_or(0);
+        let captured_piece = board
+            .piece_at(mv.to)
+            .map(|piece| piece_kind_ordinal(piece.kind))
+            .unwrap_or(if is_capture { piece_kind_ordinal(PieceKind::Pawn) } else { 0 });
+        [
+            f32::from(ctx.depth),
+            ply as f32,
+            f32::from(u8::from(ctx.pv_node)),
+            f32::from(u8::from(ctx.node_in_check)),
+            ctx.static_eval as f32,
+            f32::from(u8::from(is_quiet)),
+            f32::from(u8::from(is_capture)),
+            f32::from(u8::from(is_promotion)),
+            f32::from(u8::from(is_tt_move)),
+            f32::from(u8::from(is_killer)),
+            f32::from(u8::from(is_counter)),
+            history_score as f32,
+            f32::from(ctx.tt_depth),
+            order_score as f32,
+            see as f32,
+            f32::from(mover_piece),
+            f32::from(captured_piece),
+        ]
     }
 
     fn move_order_score(
@@ -2780,7 +2916,8 @@ mod tests {
     use pyrrhic_rs::{Piece as TbPiece, WdlProbeResult};
 
     use super::{
-        Bound, ClockControl, EvalParams, LMR_FEATURES, LmrModel, MATE_SCORE, Nnue, OpeningBook, SearchLimits, SearchOptions,
+        Bound, ClockControl, DEFAULT_POLICY_ORDER_BOUND, EvalParams, LMR_FEATURES, LmrModel,
+        MATE_SCORE, Nnue, OpeningBook, POLICY_FEATURES, PolicyModel, SearchLimits, SearchOptions,
         SearchParams, Searcher, SharedTranspositionTable, SyzygyRootProbe,
         SyzygyTablebases, SyzygyWdl, TaperedScore, TranspositionEntry, TranspositionTable,
         evaluate_position, history_index, late_move_reduction, passed_pawn_extension,
@@ -2833,6 +2970,49 @@ mod tests {
             let off_result = off.search(&board, limits.clone());
             let mut on = Searcher::default();
             on.set_lmr_model(Some(model.clone()));
+            let on_result = on.search(&board, limits.clone());
+            assert_eq!(off_result.best_move, on_result.best_move, "best_move differs for {fen}");
+            assert_eq!(off_result.score_cp, on_result.score_cp, "score differs for {fen}");
+            assert_eq!(off_result.nodes, on_result.nodes, "node count differs for {fen}");
+        }
+    }
+
+    /// An all-zero-weights RFPO with `b2 = 0` so P(cutoff) = sigmoid(0) = 0.5 for every
+    /// input, which maps to a zero ordering correction at any bound. Installing it must
+    /// therefore leave the search byte-identical to policy-off.
+    fn zero_correction_policy_model() -> PolicyModel {
+        PolicyModel::from_parameters(
+            [0.0; POLICY_FEATURES],
+            [1.0; POLICY_FEATURES],
+            vec![0.0; POLICY_FEATURES], // w1 (hidden = 1)
+            vec![0.0],                  // b1
+            vec![0.0],                  // w2
+            0.0,                        // b2 => p = 0.5 => correction 0
+        )
+        .expect("valid policy parameters")
+    }
+
+    #[test]
+    fn policy_model_with_zero_correction_is_byte_identical_to_policy_off() {
+        let model = zero_correction_policy_model();
+        assert_eq!(
+            model.order_correction(&[0.0; POLICY_FEATURES], DEFAULT_POLICY_ORDER_BOUND),
+            0
+        );
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 4 4",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        ];
+        for fen in fens {
+            let board = Board::from_fen(fen).unwrap();
+            let limits = SearchLimits { depth: Some(8), ..SearchLimits::default() };
+            // `off` = classical ordering (policy is None by default); `on` = the
+            // zero-correction policy. Every search decision must be identical.
+            let mut off = Searcher::default();
+            let off_result = off.search(&board, limits.clone());
+            let mut on = Searcher::default();
+            on.set_policy_model(Some(model.clone()));
             let on_result = on.search(&board, limits.clone());
             assert_eq!(off_result.best_move, on_result.best_move, "best_move differs for {fen}");
             assert_eq!(off_result.score_cp, on_result.score_cp, "score differs for {fen}");

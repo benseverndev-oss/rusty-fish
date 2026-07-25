@@ -157,6 +157,18 @@ impl PolicyModel {
         bytes
     }
 
+    /// Additive move-ordering correction, in classical order-score units, from the
+    /// cutoff probability and a tunable magnitude `bound`. `(2p - 1) * bound` maps
+    /// `p in [0, 1]` onto `[-bound, +bound]`: a move the policy is confident cuts is
+    /// ordered earlier, one it doubts later, and `p = 0.5` is exactly neutral (zero
+    /// correction). Integer output so the policy magnitude can live in `SearchParams`
+    /// and be gated by A/B while the model itself stays a pure predictor — the same
+    /// split learned LMR uses for its thresholds.
+    pub fn order_correction(&self, feats: &[f32; POLICY_FEATURES], bound: i32) -> i32 {
+        let raw = (2.0 * self.cutoff_prob(feats) - 1.0) * bound as f32;
+        (raw.round() as i32).clamp(-bound, bound)
+    }
+
     /// P(move causes a cutoff) for the raw (un-normalized) feature vector. Clamps the
     /// unbounded columns exactly as the trainer does, standardizes with the stored
     /// mean/scale, then runs the forward pass (matching the trainer).
@@ -185,14 +197,22 @@ impl PolicyModel {
 /// the identical clamps when it builds its dataset (single-sourced with `CLAMPS`).
 pub const POLICY_CLAMP_INDICES: [(usize, f32); 4] = CLAMPS;
 
+/// Default magnitude of the move-ordering correction, in classical order-score units.
+/// Chosen to reorder meaningfully *within* the quiet-move history band (history scores
+/// run to ~20000) and nudge near bucket edges, while staying far below the priority
+/// gaps (TT/capture/killer buckets are hundreds of thousands apart) so the policy
+/// refines ordering rather than overriding the proven structure. Tunable like the LMR
+/// thresholds; the real value is whatever a gate prefers.
+pub const DEFAULT_POLICY_ORDER_BOUND: i32 = 4000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Build an RFPO byte buffer for a given (hidden) net through the public
-    /// serializer so tests exercise the real round-trip. Identity standardization
+    /// Build an RFPO byte buffer through the public serializer so tests exercise the
+    /// real round-trip. Hidden size is inferred from `b1`. Identity standardization
     /// (mean 0, scale 1).
-    fn build(hidden: usize, w1: Vec<f32>, b1: Vec<f32>, w2: Vec<f32>, b2: f32) -> Vec<u8> {
+    fn build(w1: Vec<f32>, b1: Vec<f32>, w2: Vec<f32>, b2: f32) -> Vec<u8> {
         PolicyModel::from_parameters([0.0; POLICY_FEATURES], [1.0; POLICY_FEATURES], w1, b1, w2, b2)
             .expect("valid parameters")
             .to_bytes()
@@ -202,7 +222,7 @@ mod tests {
     fn rfpo_round_trips_and_forward_matches_hand_computation() {
         // One hidden unit; w1 = all-ones, b1 = 0, w2 = [1], b2 = 0.
         let w1 = vec![1.0f32; POLICY_FEATURES];
-        let bytes = build(1, w1, vec![0.0], vec![1.0], 0.0);
+        let bytes = build(w1, vec![0.0], vec![1.0], 0.0);
         let model = PolicyModel::from_bytes(&bytes).expect("parse");
         // A single unit feature => hidden h = 1.0 (relu) => out = 1.0 => sigmoid(1).
         let mut feats = [0.0f32; POLICY_FEATURES];
@@ -217,7 +237,7 @@ mod tests {
         let w1 = vec![0.0f32; POLICY_FEATURES];
         for b2 in [-5.0f32, -2.0, 0.0, 2.0, 5.0] {
             let model =
-                PolicyModel::from_bytes(&build(1, w1.clone(), vec![0.0], vec![0.0], b2)).unwrap();
+                PolicyModel::from_bytes(&build(w1.clone(), vec![0.0], vec![0.0], b2)).unwrap();
             let p = model.cutoff_prob(&[0.0; POLICY_FEATURES]);
             assert!((0.0..=1.0).contains(&p), "probability {p} out of [0,1] for b2={b2}");
         }
@@ -226,9 +246,36 @@ mod tests {
     #[test]
     fn rejects_bad_magic_and_dim() {
         assert!(PolicyModel::from_bytes(b"XXXX....").is_err());
-        let mut bytes = build(1, vec![0.0; POLICY_FEATURES], vec![0.0], vec![0.0], 0.0);
+        let mut bytes = build(vec![0.0; POLICY_FEATURES], vec![0.0], vec![0.0], 0.0);
         bytes[8] = 9; // corrupt input_dim (byte after magic+version)
         assert!(PolicyModel::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn order_correction_is_signed_neutral_at_half_and_bounded() {
+        let bound = 1000;
+        // One hidden unit h = relu(x0), out = h - 2. A larger feature keeps the unit
+        // active and lifts the logit above 0 (p > 0.5 => earlier); a small feature
+        // leaves out = -2 (p < 0.5 => later). Both within ±bound. (A single ReLU unit
+        // with a *negative* pre-activation would clamp to 0 and can't go negative, so
+        // the negative case comes from the bias, not from driving the unit negative.)
+        let mut w1 = vec![0.0f32; POLICY_FEATURES];
+        w1[0] = 1.0;
+        let model = PolicyModel::from_bytes(&build(w1, vec![0.0], vec![1.0], -2.0)).unwrap();
+        let mut hi = [0.0f32; POLICY_FEATURES];
+        hi[0] = 5.0;
+        let lo = [0.0f32; POLICY_FEATURES];
+        let c_hi = model.order_correction(&hi, bound);
+        let c_lo = model.order_correction(&lo, bound);
+        assert!(c_hi > 0 && c_lo < 0, "expected signed correction, got hi={c_hi} lo={c_lo}");
+        assert!((-bound..=bound).contains(&c_hi) && (-bound..=bound).contains(&c_lo));
+
+        // All-zero net with b2 = 0 => p = 0.5 for every input => exactly neutral. This
+        // is the property the search's byte-identical test relies on.
+        let neutral =
+            PolicyModel::from_bytes(&build(vec![0.0; POLICY_FEATURES], vec![0.0], vec![0.0], 0.0))
+                .unwrap();
+        assert_eq!(neutral.order_correction(&[7.0; POLICY_FEATURES], bound), 0);
     }
 
     #[test]
@@ -239,7 +286,7 @@ mod tests {
             let mut w1 = vec![0.0f32; POLICY_FEATURES];
             w1[index] = 1.0;
             let model =
-                PolicyModel::from_bytes(&build(1, w1, vec![0.0], vec![1.0], 0.0)).unwrap();
+                PolicyModel::from_bytes(&build(w1, vec![0.0], vec![1.0], 0.0)).unwrap();
             let mut at_bound = [0.0f32; POLICY_FEATURES];
             at_bound[index] = bound;
             let mut way_past = [0.0f32; POLICY_FEATURES];
