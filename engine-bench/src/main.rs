@@ -14,6 +14,7 @@ use engine_bench::{
     run_label_sf, run_label_fens,
     search_params_from_tsv, run_search_gate_fens,
 };
+use engine_bench::policy_train::{PolicyTrainConfig, train_policy};
 use engine_bench::bench_harness::{
     BenchCompareConfig, BenchReportConfig, BudgetMode, EngineConfig, bench_compare_tsv_report,
     bench_full_report_text, bench_sweep_tsv_report, compare_openings, run_bench_compare,
@@ -747,6 +748,48 @@ fn main() -> Result<(), String> {
         println!(
             "LMR_EXPORT_DONE prefix={prefix} rows={} scanned={} base_rate={base_rate:.4}",
             summary.rows, summary.scanned
+        );
+        return Ok(());
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("train-policy") {
+        // train-policy <telemetry_tsv_or_-> <out.rfpo> [hidden] [epochs] [lr] [stride]
+        //              [max_rows] [seed]:
+        // fit the Phase 4 move-ordering policy in-process (no Python/Modal) from a
+        // `gen-search-telemetry` TSV and write the RFPO model. Prints val AUC — the
+        // signal that "search this move first" is learnable from ordering-time features.
+        let usage = "usage: train-policy <telemetry_or_-> <out.rfpo> [hidden] [epochs] [lr] \
+                     [stride] [max_rows] [seed]";
+        let source = std::env::args().nth(2).ok_or_else(|| usage.to_string())?;
+        let out_path = std::env::args().nth(3).ok_or_else(|| usage.to_string())?;
+        let default = PolicyTrainConfig::default();
+        let learning_rate = std::env::args()
+            .nth(6)
+            .map(|arg| arg.parse::<f32>().map_err(|_| format!("invalid lr `{arg}`")))
+            .transpose()?
+            .unwrap_or(default.learning_rate);
+        let config = PolicyTrainConfig {
+            hidden: arg_u64(4).map(|value| value as usize).unwrap_or(default.hidden),
+            epochs: arg_u64(5).map(|value| value as usize).unwrap_or(default.epochs),
+            learning_rate,
+            stride: arg_u64(7).unwrap_or(default.stride),
+            max_rows: arg_u64(8).map(|value| value as usize).unwrap_or(default.max_rows),
+            seed: arg_u64(9).unwrap_or(default.seed),
+            ..default
+        };
+        let (bytes, summary) = if source == "-" {
+            train_policy(std::io::stdin().lock(), config)?
+        } else {
+            let file = std::fs::File::open(&source)
+                .map_err(|error| format!("failed to open telemetry {source}: {error}"))?;
+            train_policy(file, config)?
+        };
+        std::fs::write(&out_path, &bytes)
+            .map_err(|error| format!("failed to write {out_path}: {error}"))?;
+        println!(
+            "POLICY_TRAIN_DONE out={out_path} rows={} scanned={} base_rate={:.4} \
+             val_acc={:.4} val_auc={:.4}",
+            summary.rows, summary.scanned, summary.base_rate, summary.val_accuracy, summary.val_auc
         );
         return Ok(());
     }

@@ -154,6 +154,49 @@ pub const LMR_FILTER_COLUMN: &str = "lmp_pruned";
 pub const LMR_FEATURE_CLAMPS: [(&str, f32); 2] =
     [("static_eval", 2000.0), ("history_score", 20000.0)];
 
+/// The move-ordering policy's input columns (Phase 4), **by header name**, in the exact
+/// order the model expects them (matching `policy_model::POLICY_FEATURES`'s documented
+/// order and the trainer's `POLICY_FEATURE_COLUMNS`).
+///
+/// These are the signals the move orderer has *before* a move is searched, resolved by
+/// name against the TSV header for the same reason the LMR set is. Deliberately absent:
+/// `move_index` (the classical rank the policy is trying to improve — circular), and
+/// `reduction` / `extension` / `gives_check` (decided or costly only after ordering).
+pub const POLICY_FEATURE_COLUMNS: [&str; crate::policy_model::POLICY_FEATURES] = [
+    "depth",
+    "ply",
+    "pv_node",
+    "node_in_check",
+    "static_eval",
+    "is_quiet",
+    "is_capture",
+    "is_promotion",
+    "is_tt_move",
+    "is_killer",
+    "is_counter",
+    "history_score",
+    "tt_depth",
+    "order_score",
+    "see",
+    "mover_piece",
+    "captured_piece",
+];
+
+/// Policy label column: did the searched move cause a beta cutoff — i.e. was it the move
+/// the node should have ordered first. Denser targets like `raised_alpha` are available;
+/// `caused_cutoff` is the sharper "search this first" signal for ordering.
+pub const POLICY_TARGET_COLUMN: &str = "caused_cutoff";
+
+/// Inclusive clamp bounds for the policy's unbounded feature columns, keyed by header
+/// name. Mirrored by `policy_model`'s `POLICY_CLAMP_INDICES` and applied identically by
+/// the trainer, for the same standardization reason as [`LMR_FEATURE_CLAMPS`].
+pub const POLICY_FEATURE_CLAMPS: [(&str, f32); 4] = [
+    ("static_eval", 2000.0),
+    ("history_score", 20000.0),
+    ("order_score", 2_000_000.0),
+    ("see", 2000.0),
+];
+
 impl MoveDecision {
     /// Serializes this record as one TSV row, prefixed with `pos_id`. The column
     /// order matches [`TELEMETRY_TSV_HEADER`]. Booleans render as `0`/`1`.
@@ -252,8 +295,10 @@ impl TelemetryCollector {
 mod tests {
     use super::{
         MoveDecision, TelemetryCollector, LMR_FEATURE_CLAMPS, LMR_FEATURE_COLUMNS,
-        LMR_FILTER_COLUMN, LMR_TARGET_COLUMN, TELEMETRY_TSV_HEADER,
+        LMR_FILTER_COLUMN, LMR_TARGET_COLUMN, POLICY_FEATURE_CLAMPS, POLICY_FEATURE_COLUMNS,
+        POLICY_TARGET_COLUMN, TELEMETRY_TSV_HEADER,
     };
+    use crate::policy_model::POLICY_CLAMP_INDICES;
 
     /// Every name the dataset exporter resolves must actually exist in the header,
     /// and no feature may be listed twice. Without this a typo would surface only as
@@ -278,6 +323,44 @@ mod tests {
         assert_eq!(before, seen.len(), "duplicate column in LMR_FEATURE_COLUMNS");
         // The label must not also be an input — that would be pure leakage.
         assert!(!LMR_FEATURE_COLUMNS.contains(&LMR_TARGET_COLUMN));
+    }
+
+    /// Same guardrail as the LMR test, for the policy feature set: every name the
+    /// trainer resolves must exist in the header exactly once, the label must not leak
+    /// in as a feature, and the by-index clamps the inference path uses must line up
+    /// with the by-name clamps — a mismatch would clamp the wrong column at inference.
+    #[test]
+    fn policy_column_names_all_resolve_against_the_header() {
+        let header: Vec<&str> = TELEMETRY_TSV_HEADER.split('\t').collect();
+        for name in POLICY_FEATURE_COLUMNS
+            .iter()
+            .chain([&POLICY_TARGET_COLUMN, &LMR_FILTER_COLUMN])
+            .chain(POLICY_FEATURE_CLAMPS.iter().map(|(name, _)| name))
+        {
+            assert!(header.contains(name), "{name} is not a column of TELEMETRY_TSV_HEADER");
+        }
+        let mut seen = POLICY_FEATURE_COLUMNS.to_vec();
+        seen.sort_unstable();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(before, seen.len(), "duplicate column in POLICY_FEATURE_COLUMNS");
+        assert!(!POLICY_FEATURE_COLUMNS.contains(&POLICY_TARGET_COLUMN));
+
+        // Each by-name clamp must map to the by-index clamp at the same feature slot.
+        assert_eq!(POLICY_FEATURE_CLAMPS.len(), POLICY_CLAMP_INDICES.len());
+        for (name, bound) in POLICY_FEATURE_CLAMPS {
+            let slot = POLICY_FEATURE_COLUMNS
+                .iter()
+                .position(|column| *column == name)
+                .expect("clamped column is a policy feature");
+            let (index, index_bound) = POLICY_CLAMP_INDICES
+                .iter()
+                .copied()
+                .find(|(index, _)| *index == slot)
+                .unwrap_or_else(|| panic!("no by-index clamp for `{name}` at slot {slot}"));
+            assert_eq!(index, slot);
+            assert_eq!(bound, index_bound, "clamp bound mismatch for `{name}`");
+        }
     }
 
     #[test]

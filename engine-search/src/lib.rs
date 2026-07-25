@@ -11,13 +11,16 @@ use pyrrhic_rs::{
 
 mod lmr_model;
 mod nnue;
+mod policy_model;
 mod telemetry;
 
 pub use lmr_model::{bundled_lmr_model, LmrModel, LMR_FEATURES};
 pub use nnue::{active_features, bundled_network, Nnue, INPUT_DIMENSION};
+pub use policy_model::{PolicyModel, POLICY_CLAMP_INDICES, POLICY_FEATURES};
 pub use telemetry::{
     MoveDecision, TelemetryCollector, LMR_FEATURE_CLAMPS, LMR_FEATURE_COLUMNS, LMR_FILTER_COLUMN,
-    LMR_TARGET_COLUMN, TELEMETRY_TSV_HEADER,
+    LMR_TARGET_COLUMN, POLICY_FEATURE_CLAMPS, POLICY_FEATURE_COLUMNS, POLICY_TARGET_COLUMN,
+    TELEMETRY_TSV_HEADER,
 };
 
 const MATE_SCORE: i32 = 100_000;

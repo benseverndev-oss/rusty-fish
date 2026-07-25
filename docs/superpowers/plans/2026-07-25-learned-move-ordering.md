@@ -27,11 +27,16 @@ names and the LMR result points to.
    `captured_piece`. Append-only v3 columns; the byte-identical telemetry invariant
    test proves the search is unchanged. Unblocks a policy dataset — the labels
    (`caused_cutoff`, `raised_alpha`, `move_index`) already exist in v1/v2.
-2. **Train** (`modal/train_policy.py`). Per node, the ordered move list is a
-   ranking problem: target = which move caused the cutoff / raised alpha. Fit a small
-   MLP (per-move features → score) with a pairwise/listwise ranking loss, or a
-   pointwise P(best-move) as a first cut. Export an `RFPO` binary (the `RFLM` format's
-   sibling: magic, version, dims, standardization, one hidden layer).
+2. **Train** — *done, in Rust.* `engine-bench`'s `train-policy` fits the policy
+   in-process (no Python, no Modal): standardize → class-weighted BCE-with-logits →
+   Adam → 90/10 val split → AUC, a port of `train_lmr.py`'s math. It reads a
+   `gen-search-telemetry` TSV, resolves the ordering-time feature columns by name, and
+   exports an `RFPO` binary — the `RFLM` format's sibling (own magic, same shape),
+   defined by `engine-search/src/policy_model.rs` so the trainer and the engine's
+   inference agree by construction. A first cut uses the pointwise `caused_cutoff`
+   target; a pairwise/listwise ranking loss is a later refinement. Keeping this in Rust
+   removes Modal from the critical path for the small nets — the whole train→gate loop
+   can run in one binary in the sandbox.
 3. **Wire** behind a neutral toggle. `PolicyModel` on `Searcher`, `None` by default →
    byte-identical search (same guarantee, same test shape as learned LMR). When
    installed, `move_order_score` adds a clamped learned correction; the correction is
