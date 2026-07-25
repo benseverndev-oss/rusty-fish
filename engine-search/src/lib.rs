@@ -1378,6 +1378,34 @@ impl Searcher {
             // PV node iff a full-width window remains at this decision. Cheap to
             // compute; used only for telemetry.
             let pv_node = beta - alpha > 1;
+            // Move-ordering telemetry (Phase 4): the move as the *orderer* saw it —
+            // the classical order score, its SEE, and the piece kinds. Computed only
+            // when a collector is installed and only from the pre-move board, so it
+            // costs nothing in a normal search and cannot perturb a decision. `board`
+            // is pre-move at both record sites (the searched-move site reads it after
+            // `nnue_unmake` restores it), and the history-bearing `order_score` is
+            // snapshotted here at the decision point for the same no-leak reason as
+            // `history_score` above.
+            let (order_score, see, mover_piece, captured_piece) = if self.telemetry.is_some() {
+                let order_score =
+                    self.move_order_score(board, mv, ply as usize, tt_move, counter_move);
+                let see = if is_capture {
+                    static_exchange_evaluation(board, mv)
+                } else {
+                    0
+                };
+                let mover_piece = board
+                    .piece_at(mv.from)
+                    .map(|piece| piece_kind_ordinal(piece.kind))
+                    .unwrap_or(0);
+                let captured_piece = board
+                    .piece_at(mv.to)
+                    .map(|piece| piece_kind_ordinal(piece.kind))
+                    .unwrap_or(if is_capture { piece_kind_ordinal(PieceKind::Pawn) } else { 0 });
+                (order_score, see, mover_piece, captured_piece)
+            } else {
+                (0, 0, 0, 0)
+            };
             if can_static_prune
                 && move_index >= late_move_pruning_limit(&self.params, depth)
                 && is_quiet
@@ -1413,6 +1441,10 @@ impl Searcher {
                         is_promotion,
                         node_in_check: in_check,
                         tt_depth,
+                        order_score,
+                        see,
+                        mover_piece,
+                        captured_piece,
                     });
                 }
                 break;
@@ -1539,6 +1571,10 @@ impl Searcher {
                     is_promotion,
                     node_in_check: in_check,
                     tt_depth,
+                    order_score,
+                    see,
+                    mover_piece,
+                    captured_piece,
                 });
             }
             if caused_cutoff {
@@ -2126,6 +2162,20 @@ fn piece_kind_value(kind: PieceKind) -> i32 {
         PieceKind::Rook => 500,
         PieceKind::Queen => 900,
         PieceKind::King => 0,
+    }
+}
+
+/// Piece kind as a `1..=6` ordinal (pawn..king) for the search telemetry. `0` is
+/// reserved for "no piece", so the encoding is total: a captured-piece column reads
+/// `0` for a quiet move and a moving-piece column never does for a legal move.
+fn piece_kind_ordinal(kind: PieceKind) -> u8 {
+    match kind {
+        PieceKind::Pawn => 1,
+        PieceKind::Knight => 2,
+        PieceKind::Bishop => 3,
+        PieceKind::Rook => 4,
+        PieceKind::Queen => 5,
+        PieceKind::King => 6,
     }
 }
 

@@ -82,12 +82,33 @@ pub struct MoveDecision {
     pub node_in_check: bool,
     /// Depth of the transposition-table entry at this node, `0` when there is none.
     pub tt_depth: u8,
+
+    // --- v3 context (APPENDED, never inserted) ---
+    // Move-ordering signal for the Phase 4 policy. The v1/v2 fields describe how the
+    // node *searched* a move; these describe the move *as the orderer saw it*, which is
+    // what a learned move-ordering policy has to reproduce and improve on. Captured at
+    // the decision point (pre-move board, history snapshotted before the subtree) so
+    // they never leak the outcome, and appended so every existing column index — and
+    // the `train_lmr.py` FEATURE_COLS that reference them positionally — is unchanged.
+    /// The classical move-ordering score (`move_order_score`): TT/capture-SEE/promotion/
+    /// counter/killer priorities plus the history score. The residual baseline a learned
+    /// policy corrects (`order = classical + learned_correction`), mirroring learned LMR.
+    pub order_score: i32,
+    /// Static exchange evaluation of the move, in centipawns; `0` for a non-capture. The
+    /// single most discriminative capture-ordering signal, and absent from the v1/v2 set.
+    pub see: i32,
+    /// Kind of the moving piece, `1..=6` (pawn..king); `0` only if the square is somehow
+    /// empty (never, for a legal move — kept as a total encoding).
+    pub mover_piece: u8,
+    /// Kind of the captured piece, `1..=6` (pawn..king), `0` for a non-capture. En
+    /// passant records the captured pawn as `1`, matching `is_capture`.
+    pub captured_piece: u8,
 }
 
 /// TSV header row for the v1 schema, including the leading `pos_id` column that
 /// the dataset generator prepends. Kept adjacent to [`MoveDecision::to_tsv_row`]
 /// so the column order stays single-sourced.
-pub const TELEMETRY_TSV_HEADER: &str = "pos_id\tdepth\tply\tmove_index\tis_quiet\tis_priority\tpv_node\tgives_check\tstatic_eval\textension\treduction\tlmp_pruned\traised_alpha\tcaused_cutoff\tneeded_lmr_research\tneeded_pvs_research\tsubtree_nodes\thistory_score\tis_tt_move\tis_killer\tis_counter\tis_capture\tis_promotion\tnode_in_check\ttt_depth";
+pub const TELEMETRY_TSV_HEADER: &str = "pos_id\tdepth\tply\tmove_index\tis_quiet\tis_priority\tpv_node\tgives_check\tstatic_eval\textension\treduction\tlmp_pruned\traised_alpha\tcaused_cutoff\tneeded_lmr_research\tneeded_pvs_research\tsubtree_nodes\thistory_score\tis_tt_move\tis_killer\tis_counter\tis_capture\tis_promotion\tnode_in_check\ttt_depth\torder_score\tsee\tmover_piece\tcaptured_piece";
 
 /// The learned-LMR model's input columns, **by header name**, in the exact order the
 /// model expects them (matching `train_lmr.py`'s `FEATURE_COLS` and the feature
@@ -140,7 +161,7 @@ impl MoveDecision {
         let b = |flag: bool| u8::from(flag);
         format!(
             "{pos_id}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\
-             \t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+             \t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.depth,
             self.ply,
             self.move_index,
@@ -165,6 +186,10 @@ impl MoveDecision {
             b(self.is_promotion),
             b(self.node_in_check),
             self.tt_depth,
+            self.order_score,
+            self.see,
+            self.mover_piece,
+            self.captured_piece,
         )
     }
 }
@@ -301,6 +326,10 @@ mod tests {
             is_promotion: true,
             node_in_check: false,
             tt_depth: 4,
+            order_score: 1_000_042,
+            see: -17,
+            mover_piece: 3,
+            captured_piece: 5,
         };
         let row = record.to_tsv_row(9);
         let header_cols = TELEMETRY_TSV_HEADER.split('\t').count();
@@ -308,7 +337,8 @@ mod tests {
         assert_eq!(header_cols, row_cols, "row arity must match the header");
         assert_eq!(
             row,
-            "9\t7\t3\t5\t1\t0\t1\t0\t-42\t1\t2\t0\t1\t1\t0\t1\t1234\t-55\t1\t0\t1\t0\t1\t0\t4"
+            "9\t7\t3\t5\t1\t0\t1\t0\t-42\t1\t2\t0\t1\t1\t0\t1\t1234\t-55\t1\t0\t1\t0\t1\t0\t4\
+             \t1000042\t-17\t3\t5"
         );
     }
 }
