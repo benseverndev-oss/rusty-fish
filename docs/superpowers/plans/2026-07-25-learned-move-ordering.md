@@ -157,14 +157,60 @@ or dropping `order_score`/`move_index` so the model can't just echo the classica
 
 ## Ideas / backlog
 
-- **Decision-mutation label augmentation (Ben's idea).** Take labelled games and add
-  an element of *decision mutation* to cheaply generate more labels — i.e. perturb the
-  decisions the search made and re-observe the outcome, turning one played game into
-  many labelled decision points instead of paying for a fresh self-play game per label.
-  *(Rough read, to firm up with Ben: the appeal is that labels are the expensive part —
-  a game costs a full search, but a decision point is cheap. Open questions before
-  building: which decision to mutate (the move ordered first? the reduction taken?),
-  what the resulting label is (did the mutated choice still cut / still hold alpha?),
-  and whether a mutated line stays on-distribution enough that its label is meaningful
-  for the policy that will run on un-mutated searches. Could apply beyond move ordering
-  — same trick could densify LMR / pruning labels.)*
+### Decision-mutation label augmentation (Ben's idea)
+
+Take labelled games and add an element of *decision mutation* to cheaply generate more
+labels — perturb the decisions the search made and re-observe the outcome, turning one
+search into many labelled decision points instead of paying for a fresh search per
+label.
+
+**Reframing the value (the important part).** Labels are *not* currently the binding
+constraint — a single depth-8 sweep already emits ~100M rows and the trainer hits val
+AUC 0.93. The binding constraint is that every label is recorded under *classical*
+ordering, and `caused_cutoff` is order-dependent (a move "causes a cutoff" only relative
+to the alpha/beta window left by whatever was searched before it). So the model trains
+on the classical distribution and — with `order_score` as a feature — largely echoes
+it. The real prize in decision mutation is therefore **off-policy / counterfactual
+labels**: labels for orderings the base search never took, which is exactly the
+distribution the policy *creates* once it re-ranks. Volume is a side benefit; the
+distribution shift is the point.
+
+**Tier 1 — replay (free, approximate).** Record, per move-decision, two more things
+besides the ordering-time features: the score the search returned for that move and the
+node's alpha/beta on entry (append-only v4 telemetry, same byte-identical discipline).
+Then *offline*, replay a node's cutoff logic under a mutated move order using the
+recorded scores — walk the moves in the new order maintaining the running alpha; the
+first whose recorded score ≥ beta is the counterfactual cutoff. This synthesizes
+`caused_cutoff` for any permutation with **zero extra search**. Caveat: recorded scores
+come from order-dependent windows (PVS null-window, LMR reductions), so they approximate
+a move's order-invariant value — good enough to probe re-orderings near the top,
+loosest for deep re-search cases.
+
+**Tier 2 — re-search (cheap-ish, exact).** On a *sampled* subset of nodes, actually
+re-run the move loop under a mutated order from the node's saved board state (not from
+root), letting the search produce true labels. Bound cost by sampling few nodes at
+shallow depth. Use this to (a) get exact labels where Tier 1 is weakest and (b)
+*measure* Tier 1's fidelity (compare synthesized vs true cutoff on the same nodes).
+
+**Mutation policies**, roughly in increasing value:
+- random small permutations / swap the classical-first move with a later one — cheap
+  coverage of "what if we'd tried this quiet move first";
+- **order by the current policy's predicted cutoff prob** — a DAgger-style loop:
+  train → relabel under the policy's *own* ordering → retrain, converging the training
+  distribution onto the deployment one. This is the version that directly attacks the
+  "echoes classical" problem.
+
+**Plumbing.** The mutation/replay is a new engine-bench step (e.g. `gen-mutated-labels`)
+that reads v4 telemetry and emits extra rows in the *same* TSV schema `train-policy`
+already consumes, tagged `synthetic` with a weight so the trainer can down-weight
+approximate labels. Trainer and model formats stay put; only the dataset grows/shifts.
+
+**Open questions to firm up with Ben:**
+- Off-policy correction vs raw volume — if it's the former (likely), prioritise mutation
+  policy (b) (policy-ordered relabel) over cheap random mutation.
+- Tier-1 fidelity: how far does the recorded-score proxy drift from a full-window score?
+  Measure with a Tier-2 sample before trusting Tier-1 at scale.
+- Does the DAgger loop actually move the gate, given inference is now cheap? The clean
+  experiment: one round of policy-ordered relabel → retrain → re-gate at K=4/bound≈500.
+- Generalises beyond ordering — the same replay trick could densify LMR / pruning labels
+  (`raised_alpha`, `needed_lmr_research` are also order/threshold-dependent).
