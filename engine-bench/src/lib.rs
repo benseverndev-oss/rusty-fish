@@ -2417,6 +2417,73 @@ pub fn run_gen_search_telemetry<R: std::io::Read>(reader: R, depth: u8) -> Resul
     Ok(())
 }
 
+/// What a Tier 2 re-search generation run produced.
+pub struct ResearchGenSummary {
+    pub positions: u64,
+    pub skipped: u64,
+    pub rows: u64,
+}
+
+/// Tier 2 (decision-mutation, re-search) telemetry: reads FENs one per line, runs a
+/// fixed-depth search over each with the re-search pass enabled, and prints every
+/// collected row as a v4 TSV row (same schema as `gen-search-telemetry`, so the outputs
+/// concatenate and feed `train-policy` unchanged). Each sampled node contributes an
+/// *order-independent* `caused_cutoff` for every legal move — the true "would this cut
+/// first?", including moves the real search pruned or never reached. `stride` samples
+/// nodes (`node_id % stride == 0`) to bound the extra full-window work; `min_depth` skips
+/// shallow nodes. Classical LMR is observed (learned LMR off), matching
+/// `gen-search-telemetry` so the two datasets share a feature/reduction regime.
+pub fn run_gen_research_telemetry<R: std::io::Read>(
+    reader: R,
+    depth: u8,
+    stride: u64,
+    min_depth: u8,
+) -> Result<ResearchGenSummary, String> {
+    if depth == 0 {
+        return Err("invalid depth 0: need depth >= 1".to_string());
+    }
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    writeln!(out, "{TELEMETRY_TSV_HEADER}")
+        .map_err(|error| format!("failed to write telemetry header: {error}"))?;
+    let mut searcher = Searcher::default();
+    searcher.set_lmr_model(None);
+    searcher.enable_research(stride, min_depth, SEARCH_TELEMETRY_CAP);
+    let mut skipped: u64 = 0;
+    let mut pos_id: u64 = 0;
+    let mut rows: u64 = 0;
+    for line in BufReader::new(reader).lines() {
+        let line = line.map_err(|error| format!("failed to read positions: {error}"))?;
+        let fen = line.trim();
+        if fen.is_empty() {
+            continue;
+        }
+        let board = match Board::from_fen(fen) {
+            Ok(board) => board,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        searcher.search(
+            &board,
+            SearchLimits { depth: Some(depth), ..SearchLimits::default() },
+        );
+        for record in searcher.take_research() {
+            writeln!(out, "{}", record.to_tsv_row(pos_id))
+                .map_err(|error| format!("failed to write research row: {error}"))?;
+            rows += 1;
+        }
+        pos_id += 1;
+    }
+    out.flush()
+        .map_err(|error| format!("failed to flush research telemetry: {error}"))?;
+    if skipped > 0 {
+        eprintln!("gen-research-telemetry: skipped {skipped} malformed FENs");
+    }
+    Ok(ResearchGenSummary { positions: pos_id, skipped, rows })
+}
+
 /// Number of rows the exporter reports alongside the written files.
 pub struct LmrExportSummary {
     pub rows: usize,

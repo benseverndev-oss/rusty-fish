@@ -562,6 +562,31 @@ pub struct Searcher {
     /// `Some` adds a clamped, `SearchParams`-scaled correction to each move's ordering
     /// score in the main `negamax` move loop (not root, not quiescence).
     policy_model: Option<PolicyModel>,
+    /// Optional Tier 2 decision-mutation re-search config (Phase 4). `None` (the default)
+    /// is byte-identical to off. `Some` makes sampled main-`negamax` nodes run an extra
+    /// *order-independent* pass: every legal move is searched full-window, so the recorded
+    /// `caused_cutoff` is the true "would this move cut first?" — including moves the real
+    /// search pruned or never reached, which Tier 1 replay cannot label. This mutates the
+    /// TT (its child searches store entries), so it is for offline data generation only,
+    /// never a played search.
+    research: Option<ResearchConfig>,
+    /// Rows collected by the research pass; drained with [`take_research`](Self::take_research).
+    research_records: Vec<MoveDecision>,
+    /// Guard so a research pass's own child searches do not themselves sample (which would
+    /// blow up cost); set for the duration of one node's pass.
+    in_research: bool,
+}
+
+/// Tier 2 re-search sampling knobs.
+#[derive(Clone, Copy, Debug)]
+struct ResearchConfig {
+    /// Sample a node when `node_id % stride == 0` — bounds the extra full-window work.
+    stride: u64,
+    /// Only sample nodes with at least this remaining depth (shallow nodes give little
+    /// ordering signal and are the most numerous).
+    min_depth: u8,
+    /// Stop collecting after this many rows (bounds memory).
+    cap: usize,
 }
 
 /// Node-level context the move-ordering policy needs, computed once per node and shared
@@ -619,6 +644,9 @@ impl Default for Searcher {
             // No bundled ordering policy yet — Phase 4 is wired but unadopted, so the
             // default orderer is classical. `set_policy_model(Some(..))` opts in.
             policy_model: None,
+            research: None,
+            research_records: Vec::new(),
+            in_research: false,
         }
     }
 }
@@ -887,6 +915,23 @@ impl Searcher {
         self.telemetry = None;
     }
 
+    /// Enables Tier 2 re-search data generation (Phase 4): at sampled main-`negamax`
+    /// nodes (`node_id % stride == 0`, remaining depth `>= min_depth`), every legal move
+    /// is searched full-window so the recorded `caused_cutoff` is order-independent — the
+    /// true "would this move cut first?", including moves the real search pruned or never
+    /// reached. Rows accumulate (bounded by `cap`) until drained with
+    /// [`take_research`](Self::take_research). This is offline data generation: the pass's
+    /// child searches store TT entries, so it must not be used on a played search.
+    pub fn enable_research(&mut self, stride: u64, min_depth: u8, cap: usize) {
+        self.research = Some(ResearchConfig { stride: stride.max(1), min_depth, cap });
+        self.research_records.clear();
+    }
+
+    /// Drains and returns the collected Tier 2 re-search rows, leaving research enabled.
+    pub fn take_research(&mut self) -> Vec<MoveDecision> {
+        std::mem::take(&mut self.research_records)
+    }
+
     /// Installs (or clears with `None`) the learned-LMR model (Phase 2). With no model
     /// the search is byte-identical to classical LMR; with a model, moves the classical
     /// formula reduces get a clamped reduction correction.
@@ -947,6 +992,9 @@ impl Searcher {
             telemetry: None,
             lmr_model,
             policy_model,
+            research: None,
+            research_records: Vec::new(),
+            in_research: false,
         }
     }
 
@@ -1674,6 +1722,24 @@ impl Searcher {
                 break;
             }
         }
+        // Tier 2 re-search (Phase 4 data generation): at sampled nodes, label every legal
+        // move with an order-independent full-window score. Runs after the node's own
+        // result is settled (`board` is back at this position), guarded so its child
+        // searches don't recurse into sampling. Off by default => never touches a search.
+        if let Some(cfg) = self.research {
+            if !self.in_research
+                && depth >= cfg.min_depth
+                && node_id % cfg.stride == 0
+                && self.research_records.len() < cfg.cap
+            {
+                self.in_research = true;
+                self.run_research_pass(
+                    board, moves.as_slice(), depth, ply, node_alpha, beta, node_id,
+                    node_static_eval, in_check, tt_depth, tt_move, counter_move,
+                );
+                self.in_research = false;
+            }
+        }
         let bound = if best_score <= original_alpha {
             Bound::Upper
         } else if best_score >= beta {
@@ -1693,6 +1759,112 @@ impl Searcher {
             );
         }
         (best_score, best_line)
+    }
+
+    /// Tier 2 re-search pass: label every legal move at this node with an
+    /// order-independent full-window score. For each move it searches full-window to the
+    /// node's child depth — no PVS null-window, no LMR reduction — and records
+    /// `caused_cutoff = score >= node_beta`, the true "would this move cut first?",
+    /// independent of the order the real search happened to try. This is the signal Tier 1
+    /// replay cannot produce: a move the real search pruned or never reached still gets a
+    /// genuine label. Features come from the live searcher state (this node's real
+    /// history/killers/TT), so they match what the policy sees at inference. `board` is at
+    /// this node's position on entry and restored after each move.
+    #[allow(clippy::too_many_arguments)]
+    fn run_research_pass(
+        &mut self,
+        board: &mut Board,
+        moves: &[ChessMove],
+        depth: u8,
+        ply: i32,
+        node_alpha: i32,
+        node_beta: i32,
+        node_id: u64,
+        node_static_eval: i32,
+        in_check: bool,
+        tt_depth: u8,
+        tt_move: Option<ChessMove>,
+        counter_move: Option<ChessMove>,
+    ) {
+        let cap = match self.research {
+            Some(cfg) => cfg.cap,
+            None => return,
+        };
+        let pv_node = node_beta - node_alpha > 1;
+        for (index, &mv) in moves.iter().enumerate() {
+            if self.research_records.len() >= cap {
+                break;
+            }
+            // Features exactly as the v3/v4 telemetry computes them, from the pre-move
+            // board and the live tables — so a research row is indistinguishable from a
+            // real telemetry row except for its order-independent label.
+            let history_score = self.history[history_index(mv)];
+            let is_tt_move = Some(mv) == tt_move;
+            let is_killer = self
+                .killer_moves
+                .get(ply as usize)
+                .is_some_and(|killers| killers.contains(&Some(mv)));
+            let is_counter = counter_move == Some(mv);
+            let is_priority = is_tt_move || is_killer || is_counter;
+            let is_capture = self.is_capture_move(board, mv);
+            let is_promotion = mv.promotion.is_some();
+            let is_quiet = !is_capture && !is_promotion;
+            let order_score = self.move_order_score(board, mv, ply as usize, tt_move, counter_move);
+            let see = if is_capture { static_exchange_evaluation(board, mv) } else { 0 };
+            let mover_piece = board
+                .piece_at(mv.from)
+                .map(|piece| piece_kind_ordinal(piece.kind))
+                .unwrap_or(0);
+            let captured_piece = board
+                .piece_at(mv.to)
+                .map(|piece| piece_kind_ordinal(piece.kind))
+                .unwrap_or(if is_capture { piece_kind_ordinal(PieceKind::Pawn) } else { 0 });
+
+            let undo = self.nnue_make(board, mv);
+            let gives_check = board.in_check(board.side_to_move);
+            let extension = u8::from(gives_check);
+            let child_depth = depth.saturating_sub(1) + extension.min(1);
+            let nodes_before = self.nodes;
+            let (child_score, _) =
+                self.negamax(board, child_depth, ply + 1, -node_beta, -node_alpha, Some(mv), None);
+            let score = -child_score;
+            self.nnue_unmake(board, mv, undo);
+
+            self.research_records.push(MoveDecision {
+                depth,
+                ply: ply as u16,
+                move_index: index as u16,
+                is_quiet,
+                is_priority,
+                pv_node,
+                gives_check,
+                static_eval: node_static_eval,
+                extension,
+                reduction: 0,
+                lmp_pruned: false,
+                raised_alpha: score > node_alpha,
+                caused_cutoff: score >= node_beta,
+                needed_lmr_research: false,
+                needed_pvs_research: false,
+                subtree_nodes: self.nodes - nodes_before,
+                history_score,
+                is_tt_move,
+                is_killer,
+                is_counter,
+                is_capture,
+                is_promotion,
+                node_in_check: in_check,
+                tt_depth,
+                order_score,
+                see,
+                mover_piece,
+                captured_piece,
+                node_id,
+                move_score: score,
+                node_alpha,
+                node_beta,
+            });
+        }
     }
 
     fn quiescence(&mut self, board: &mut Board, mut alpha: i32, beta: i32) -> i32 {
@@ -4088,6 +4260,49 @@ mod tests {
         assert!(
             records.last().is_some_and(|record| record.caused_cutoff),
             "the cutoff move must be the last move searched at the node"
+        );
+    }
+
+    #[test]
+    fn research_pass_labels_moves_order_independently() {
+        use std::collections::HashMap;
+        // A couple of rich middlegames so some sampled node has several moves that each
+        // reach beta — the order-independent labeling normal telemetry can't produce
+        // (it records exactly one cutter per node, whatever was searched first).
+        let fens = [
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQK2R w KQkq - 0 1",
+        ];
+        let mut multi_cutter_seen = false;
+        let mut total_rows = 0usize;
+        for fen in fens {
+            let board = Board::from_fen(fen).unwrap();
+            let mut searcher = Searcher::default();
+            searcher.enable_research(1, 2, 5_000_000); // sample every node with depth >= 2
+            searcher.search(&board, SearchLimits { depth: Some(5), ..SearchLimits::default() });
+            let rows = searcher.take_research();
+            assert!(!rows.is_empty(), "research must produce rows for {fen}");
+            total_rows += rows.len();
+
+            // Every research label is the order-independent truth from its own score.
+            for row in &rows {
+                assert!(!row.lmp_pruned, "research rows are all searched");
+                assert_eq!(row.caused_cutoff, row.move_score >= row.node_beta);
+                assert_eq!(row.raised_alpha, row.move_score > row.node_alpha);
+            }
+            // Some node credits >= 2 moves with a cutoff — impossible for normal telemetry.
+            let mut cutters_per_node: HashMap<u64, usize> = HashMap::new();
+            for row in rows.iter().filter(|r| r.caused_cutoff) {
+                *cutters_per_node.entry(row.node_id).or_default() += 1;
+            }
+            if cutters_per_node.values().any(|&count| count >= 2) {
+                multi_cutter_seen = true;
+            }
+        }
+        assert!(total_rows > 0);
+        assert!(
+            multi_cutter_seen,
+            "Tier 2 should find nodes where several moves each reach beta"
         );
     }
 }

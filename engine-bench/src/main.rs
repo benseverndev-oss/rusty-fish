@@ -10,7 +10,8 @@ use engine_bench::{
     run_spsa_campaign, run_tactical_suite,
     spsa_tsv_report, sprt, sprt_tsv_report, summarize, tactical_tsv_report, throughput_tsv_report,
     gen_wdl_data_samples_from_reader, WdlSampleConfig,
-    gen_eval_positions_from_reader, run_gen_search_telemetry, run_lmr_export_features,
+    gen_eval_positions_from_reader, run_gen_search_telemetry, run_gen_research_telemetry,
+    run_lmr_export_features,
     run_label_sf, run_label_fens,
     search_params_from_tsv, run_search_gate_fens, run_policy_gate_fens, measure_policy_overhead,
 };
@@ -799,6 +800,33 @@ fn main() -> Result<(), String> {
                 .map_err(|error| format!("failed to open positions {source}: {error}"))?;
             run_gen_search_telemetry(std::io::BufReader::new(file), depth)?;
         }
+        return Ok(());
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("gen-research-telemetry") {
+        // gen-research-telemetry <positions_or_-> <depth> [stride] [min_depth]:
+        // Tier 2 decision-mutation labels. Like gen-search-telemetry, but at sampled nodes
+        // (node_id % stride == 0, remaining depth >= min_depth) every legal move is
+        // searched full-window, so each row's `caused_cutoff` is order-independent — the
+        // true "would this move cut first?", including moves the real search pruned or
+        // never reached (which Tier 1 replay cannot label). Same v4 schema, so the output
+        // concatenates with gen-search-telemetry and feeds `train-policy` unchanged.
+        let usage = "usage: gen-research-telemetry <positions_or_-> <depth> [stride] [min_depth]";
+        let source = std::env::args().nth(2).ok_or_else(|| usage.to_string())?;
+        let depth = arg_u32(3).and_then(|d| u8::try_from(d).ok()).ok_or_else(|| usage.to_string())?;
+        let stride = arg_u64(4).unwrap_or(64);
+        let min_depth = arg_u32(5).and_then(|d| u8::try_from(d).ok()).unwrap_or(3);
+        let summary = if source == "-" {
+            run_gen_research_telemetry(std::io::stdin().lock(), depth, stride, min_depth)?
+        } else {
+            let file = std::fs::File::open(&source)
+                .map_err(|error| format!("failed to open positions {source}: {error}"))?;
+            run_gen_research_telemetry(std::io::BufReader::new(file), depth, stride, min_depth)?
+        };
+        eprintln!(
+            "GEN_RESEARCH_DONE positions={} skipped={} rows={} stride={stride} min_depth={min_depth}",
+            summary.positions, summary.skipped, summary.rows,
+        );
         return Ok(());
     }
 

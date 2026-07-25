@@ -272,3 +272,39 @@ missing "an unsearched move would have cut first" labels — the actual off-poli
 Tier 1's `raised_alpha` output is worth one cheap experiment (retrain on the
 `raised_alpha` target with the augmented set, re-gate at K=4/bound≈500) but is not
 expected to beat the −55 Elo on its own.
+
+#### Tier 2 — built (2026-07-25)
+
+Shipped: a **re-search pass** in `engine-search` (`enable_research(stride, min_depth,
+cap)` / `take_research`) that, at sampled main-`negamax` nodes, searches *every* legal
+move full-window (no PVS null-window, no LMR reduction) and records an **order-independent
+`caused_cutoff`** — the true "would this move cut first?" — with features from the live
+searcher state (this node's real history/killers/TT), so a research row is
+indistinguishable from a real telemetry row but for its label. It runs after the node's
+own result is settled and is guarded so its child searches don't recurse into sampling.
+Off by default → byte-identical (all invariants green); it mutates the TT, so it is
+offline data-gen only. Exposed as `engine-bench gen-research-telemetry <fens|-> <depth>
+[stride] [min_depth]`, same v4 schema, so it concatenates with `gen-search-telemetry` and
+feeds `train-policy` unchanged.
+
+**This is the signal Tier 1 couldn't produce, and the data proves it.** On 30 openings at
+depth 8 (stride 32): 42.5k research rows, and **78% of cut-nodes have ≥2 moves that each
+reach beta.** Normal telemetry records *exactly one* cutter per node — so it was
+systematically under-labelling by ~4×, and the extra cutters are exactly the
+low-classical-rank moves the policy needs to learn to promote.
+
+**And it's harder to predict — which is the point.** Training on research-only rows
+reaches val **AUC ≈ 0.68** (vs 0.93 on normal telemetry). The drop is not a regression:
+normal `caused_cutoff` is easy because `order_score` (the classical rank) all but names
+the one move classical searched first; the order-independent label deliberately strips
+that crutch, so 0.68 is the *real* difficulty of "which move would cut, independent of
+how classical ranked it." It confirms the features carry genuine but limited
+order-independent signal — motivating **dropping `order_score`/`move_index`** so the model
+must learn move quality rather than echo the rank.
+
+**The clean next experiment** (now fully tooled, no new infra): build a training set from
+`gen-research-telemetry` (optionally DAgger-style: order by the current policy before
+sampling), retrain the policy — ideally without `order_score`/`move_index` — and re-gate
+at K=4/bound≈500 against the −55 Elo baseline. This is the first run with a real shot at
+beating classical ordering, because it's the first trained on what the policy actually
+faces when it re-ranks.
