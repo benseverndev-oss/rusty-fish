@@ -185,8 +185,11 @@ pub const LMR_FEATURE_CLAMPS: [(&str, f32); 2] =
 ///
 /// These are the signals the move orderer has *before* a move is searched, resolved by
 /// name against the TSV header for the same reason the LMR set is. Deliberately absent:
-/// `move_index` (the classical rank the policy is trying to improve — circular), and
-/// `reduction` / `extension` / `gives_check` (decided or costly only after ordering).
+/// `move_index` and `order_score` (both encode the classical rank the policy is trying to
+/// improve on — the classical score still enters the search as the residual base, so the
+/// model does not need it as an input), and `reduction` / `extension` / `gives_check`
+/// (decided or costly only after ordering). `order_score` remains a *telemetry column* —
+/// it is just no longer selected as a model feature.
 pub const POLICY_FEATURE_COLUMNS: [&str; crate::policy_model::POLICY_FEATURES] = [
     "depth",
     "ply",
@@ -201,7 +204,6 @@ pub const POLICY_FEATURE_COLUMNS: [&str; crate::policy_model::POLICY_FEATURES] =
     "is_counter",
     "history_score",
     "tt_depth",
-    "order_score",
     "see",
     "mover_piece",
     "captured_piece",
@@ -215,10 +217,9 @@ pub const POLICY_TARGET_COLUMN: &str = "caused_cutoff";
 /// Inclusive clamp bounds for the policy's unbounded feature columns, keyed by header
 /// name. Mirrored by `policy_model`'s `POLICY_CLAMP_INDICES` and applied identically by
 /// the trainer, for the same standardization reason as [`LMR_FEATURE_CLAMPS`].
-pub const POLICY_FEATURE_CLAMPS: [(&str, f32); 4] = [
+pub const POLICY_FEATURE_CLAMPS: [(&str, f32); 3] = [
     ("static_eval", 2000.0),
     ("history_score", 20000.0),
-    ("order_score", 2_000_000.0),
     ("see", 2000.0),
 ];
 

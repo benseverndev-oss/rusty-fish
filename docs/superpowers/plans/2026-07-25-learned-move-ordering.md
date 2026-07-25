@@ -308,3 +308,37 @@ sampling), retrain the policy — ideally without `order_score`/`move_index` —
 at K=4/bound≈500 against the −55 Elo baseline. This is the first run with a real shot at
 beating classical ordering, because it's the first trained on what the policy actually
 faces when it re-ranks.
+
+#### Experiment run — order-score-free policy on Tier 2 labels (2026-07-25)
+
+Done. Dropped `order_score` from the policy feature set (`POLICY_FEATURES` 17→16 — the
+telemetry *column* stays; it is just no longer a model input; the classical score still
+enters the search as the residual base, and `move_index` was already excluded). Generated
+a 1.43M-row research corpus (480 openings, depth 8, stride 16), trained the 16-feature
+policy on it, and gated it.
+
+- **Offline:** val **AUC ≈ 0.765** on the order-independent target — *up* from ~0.68 with
+  `order_score` in, i.e. removing the classical-rank crutch and giving more data let the
+  model learn real move quality, not less.
+- **Gate (800 games each, K=4, 30 ms, same openings as the −55 baseline):**
+
+  | bound | 1000 | **2000** | 3000 | 4000 |
+  |---|---|---|---|---|
+  | Elo | −47.6 | **−30.9** | −47.2 | −39.3 |
+
+  Best is `bound=2000` at **−30.9 Elo** — a **~24 Elo improvement over the −55 baseline**
+  (the `order_score`-in, telemetry-trained policy). The larger optimal bound is expected:
+  without `order_score` as a feature the model's raw prediction needs more scale to move
+  the ordering. The curve peaks at 2000 (over-correction beyond).
+
+**Verdict: the thesis is validated directionally but not yet a win.** Tier 2's
+order-independent labels + an order-score-free model recover ~24 Elo — the biggest single
+step — confirming that "train on which moves would actually cut, with a model that can't
+echo the classical rank" is the right axis. But it is still **−31 Elo**, not positive. The
+residual gap is the remaining inference tax (~16% NPS at K=4) plus a still-modest predictor
+(AUC 0.765). Next levers, in order of expected payoff: (1) a **DAgger loop** — regenerate
+research labels under *this* policy's ordering and retrain, iterating the training
+distribution onto the deployed one; (2) a bigger/better model or richer move-quality
+features now that the rank crutch is gone; (3) drive the K/bound sweep at higher game
+counts around K=4/bound=2000. The policy stays opt-in with no bundled asset — default
+search unchanged.

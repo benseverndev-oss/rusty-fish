@@ -2072,7 +2072,7 @@ impl Searcher {
                 let (_, see, is_capture) =
                     self.order_score_parts(board, mv, ply, tt_move, counter_move, true);
                 let feats = self.policy_features(
-                    board, mv, &ctx, ply, base, see, is_capture, tt_move, counter_move,
+                    board, mv, &ctx, ply, see, is_capture, tt_move, counter_move,
                 );
                 scratch[index].0 =
                     base.saturating_add(model.order_correction(&feats, self.params.policy_order_bound));
@@ -2086,18 +2086,17 @@ impl Searcher {
     }
 
     /// Builds the policy's ordering-time feature vector for `mv`, in exactly the order
-    /// of [`POLICY_FEATURE_COLUMNS`](crate::POLICY_FEATURE_COLUMNS). This mirrors the v3
+    /// of [`POLICY_FEATURE_COLUMNS`](crate::POLICY_FEATURE_COLUMNS). This mirrors the
     /// telemetry the policy is trained on field-for-field, so the features at inference
-    /// match the features at training. `order_score` is the classical score already
-    /// computed by the caller; the rest are read from the pre-move board and the node
-    /// context.
+    /// match the features at training. The classical `order_score` is deliberately *not*
+    /// a feature (it enters the search as the residual base instead); the rest are read
+    /// from the pre-move board and the node context.
     fn policy_features(
         &self,
         board: &Board,
         mv: ChessMove,
         ctx: &PolicyOrderContext,
         ply: usize,
-        order_score: i32,
         see: i32,
         is_capture: bool,
         tt_move: Option<ChessMove>,
@@ -2136,7 +2135,6 @@ impl Searcher {
             f32::from(u8::from(is_counter)),
             history_score as f32,
             f32::from(ctx.tt_depth),
-            order_score as f32,
             see as f32,
             f32::from(mover_piece),
             f32::from(captured_piece),
