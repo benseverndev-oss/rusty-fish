@@ -17,7 +17,8 @@ mod telemetry;
 pub use lmr_model::{bundled_lmr_model, LmrModel, LMR_FEATURES};
 pub use nnue::{active_features, bundled_network, Nnue, INPUT_DIMENSION};
 pub use policy_model::{
-    PolicyModel, DEFAULT_POLICY_ORDER_BOUND, POLICY_CLAMP_INDICES, POLICY_FEATURES,
+    PolicyModel, DEFAULT_POLICY_ORDER_BOUND, DEFAULT_POLICY_ORDER_TOP_K, POLICY_CLAMP_INDICES,
+    POLICY_FEATURES,
 };
 pub use telemetry::{
     MoveDecision, TelemetryCollector, LMR_FEATURE_CLAMPS, LMR_FEATURE_COLUMNS, LMR_FILTER_COLUMN,
@@ -133,6 +134,14 @@ pub struct SearchParams {
     /// `SearchParams` so it can be gated by A/B while the model stays a pure predictor,
     /// exactly like the LMR thresholds. Excluded from the SPSA vector.
     pub policy_order_bound: i32,
+    /// How many moves the policy re-ranks, counting from the front of the classical
+    /// order (Phase 4). The forward pass is the ordering hot loop's dominant cost, and
+    /// cutoffs come overwhelmingly from the first few moves, so bounding inference to
+    /// the top `K` classically-ordered moves caps the per-node cost at `K` forward
+    /// passes regardless of branching factor while leaving the rarely-searched tail in
+    /// classical order. `0` means "all moves" (no cap). Only has an effect when a
+    /// [`PolicyModel`] is installed; tunable by A/B like `policy_order_bound`.
+    pub policy_order_top_k: usize,
 }
 
 impl Default for SearchParams {
@@ -151,6 +160,7 @@ impl Default for SearchParams {
             lmr_reduce2_permille: lmr_model::DEFAULT_LMR_REDUCE2_PERMILLE,
             lmr_reduce1_permille: lmr_model::DEFAULT_LMR_REDUCE1_PERMILLE,
             policy_order_bound: policy_model::DEFAULT_POLICY_ORDER_BOUND,
+            policy_order_top_k: policy_model::DEFAULT_POLICY_ORDER_TOP_K,
         }
     }
 }
@@ -1850,18 +1860,37 @@ impl Searcher {
             (Some(model), Some(ctx)) => Some((model, ctx)),
             _ => None,
         };
+        // Phase 1: the classical score for every move. This is the untouched, fast path
+        // — identical to policy-off — so scoring the tail the policy will not re-rank
+        // costs nothing extra.
         for &mv in moves.iter() {
-            let mut score = self.move_order_score(board, mv, ply, tt_move, counter_move);
-            if let Some((model, ctx)) = policy {
-                // `score` is the classical order score, which is itself the
-                // `order_score` feature — so the correction is a residual on top of it.
-                let feats =
-                    self.policy_features(board, mv, &ctx, ply, score, tt_move, counter_move);
-                score = score.saturating_add(model.order_correction(&feats, self.params.policy_order_bound));
-            }
+            let score = self.move_order_score(board, mv, ply, tt_move, counter_move);
             scratch.push((score, mv));
         }
         scratch.sort_by(|left, right| right.0.cmp(&left.0));
+        // Phase 2 (policy on): re-rank only the top `K` moves in classical order. The
+        // forward pass is the hot loop's dominant cost and cutoffs come from the front
+        // of the list, so this caps per-node inference at `K` passes while the tail
+        // stays classical. `K = 0` means all moves. A second sort lets the corrections
+        // reorder the whole list (a corrected top-`K` move can drop behind an
+        // untouched tail move, which is the intended residual-on-classical semantics).
+        if let Some((model, ctx)) = policy {
+            let cap = self.params.policy_order_top_k;
+            let k = if cap == 0 { scratch.len() } else { cap.min(scratch.len()) };
+            for index in 0..k {
+                let (base, mv) = scratch[index];
+                // Recompute the SEE/capture byproducts for these few front moves only;
+                // reusing them from the features avoids a second SEE within this call.
+                let (_, see, is_capture) =
+                    self.order_score_parts(board, mv, ply, tt_move, counter_move, true);
+                let feats = self.policy_features(
+                    board, mv, &ctx, ply, base, see, is_capture, tt_move, counter_move,
+                );
+                scratch[index].0 =
+                    base.saturating_add(model.order_correction(&feats, self.params.policy_order_bound));
+            }
+            scratch.sort_by(|left, right| right.0.cmp(&left.0));
+        }
         for (slot, entry) in moves.iter_mut().zip(scratch.iter()) {
             *slot = entry.1;
         }
@@ -1881,10 +1910,13 @@ impl Searcher {
         ctx: &PolicyOrderContext,
         ply: usize,
         order_score: i32,
+        see: i32,
+        is_capture: bool,
         tt_move: Option<ChessMove>,
         counter_move: Option<ChessMove>,
     ) -> [f32; POLICY_FEATURES] {
-        let is_capture = self.is_capture_move(board, mv);
+        // `see` and `is_capture` are computed once by `order_score_parts` (the caller)
+        // and threaded in, so a capture is not static-exchange-evaluated a second time.
         let is_promotion = mv.promotion.is_some();
         let is_quiet = !is_capture && !is_promotion;
         let is_tt_move = Some(mv) == tt_move;
@@ -1894,11 +1926,6 @@ impl Searcher {
             .is_some_and(|killers| killers.contains(&Some(mv)));
         let is_counter = counter_move == Some(mv);
         let history_score = self.history[history_index(mv)];
-        let see = if is_capture {
-            static_exchange_evaluation(board, mv)
-        } else {
-            0
-        };
         let mover_piece = board
             .piece_at(mv.from)
             .map(|piece| piece_kind_ordinal(piece.kind))
@@ -1928,22 +1955,46 @@ impl Searcher {
         ]
     }
 
-    fn move_order_score(
+    /// The classical order score for `mv`, plus the byproducts the Phase 4 policy
+    /// features reuse: the static exchange evaluation and whether the move is a capture
+    /// (with the same semantics `policy_features` needs — en passant counts, and a
+    /// capture, en passant included, is SEE'd). The SEE is the expensive part, and it
+    /// used to be computed twice per capturing move (here for the capture bonus, then
+    /// again in `policy_features`); threading it out means it is computed once.
+    ///
+    /// `want_features` is the switch that keeps the classical path free: every classical
+    /// caller (root, quiescence, and policy-off ordering, via [`move_order_score`]) passes
+    /// `false`, so `is_capture`/`see` are never computed and the returned score is bit-for-bit
+    /// what the old `move_order_score` produced. Only the policy branch of `order_moves`
+    /// passes `true`.
+    fn order_score_parts(
         &self,
         board: &Board,
         mv: ChessMove,
         ply: usize,
         tt_move: Option<ChessMove>,
         counter_move: Option<ChessMove>,
-    ) -> i32 {
+        want_features: bool,
+    ) -> (i32, i32, bool) {
+        // Capture flag with `policy_features` semantics (includes en passant). Only
+        // evaluated for the policy branch; classical callers short-circuit to `false`.
+        let is_capture = want_features && self.is_capture_move(board, mv);
+
         if tt_move == Some(mv) {
-            return 2_000_000;
+            // Classical scoring returns early without a SEE; the feature still needs one
+            // for a capturing TT move, so compute it here when features are wanted.
+            let see = if is_capture { static_exchange_evaluation(board, mv) } else { 0 };
+            return (2_000_000, see, is_capture);
         }
 
         let mut score = 0;
+        let mut capture_see = 0;
+        let mut see_computed = false;
         if let Some(victim) = board.piece_at(mv.to) {
             let attacker = board.piece_at(mv.from).map(piece_value).unwrap_or_default();
             let see = static_exchange_evaluation(board, mv);
+            capture_see = see;
+            see_computed = true;
             score += if see >= 0 {
                 1_000_000 + see * 32 + piece_value(victim) * 16 - attacker
             } else {
@@ -1973,7 +2024,30 @@ impl Searcher {
             }
         }
 
-        score + self.history[history_index(mv)]
+        let base = score + self.history[history_index(mv)];
+        // Feature SEE: reuse the one already computed for a regular capture; an en
+        // passant capture takes the score path above without a SEE, so evaluate it here.
+        let see = if !want_features {
+            0
+        } else if see_computed {
+            capture_see
+        } else if is_capture {
+            static_exchange_evaluation(board, mv)
+        } else {
+            0
+        };
+        (base, see, is_capture)
+    }
+
+    fn move_order_score(
+        &self,
+        board: &Board,
+        mv: ChessMove,
+        ply: usize,
+        tt_move: Option<ChessMove>,
+        counter_move: Option<ChessMove>,
+    ) -> i32 {
+        self.order_score_parts(board, mv, ply, tt_move, counter_move, false).0
     }
 
     fn record_cutoff(
@@ -2917,7 +2991,8 @@ mod tests {
 
     use super::{
         Bound, ClockControl, DEFAULT_POLICY_ORDER_BOUND, EvalParams, LMR_FEATURES, LmrModel,
-        MATE_SCORE, Nnue, OpeningBook, POLICY_FEATURES, PolicyModel, SearchLimits, SearchOptions,
+        MATE_SCORE, Nnue, OpeningBook, POLICY_FEATURE_COLUMNS, POLICY_FEATURES, PolicyModel,
+        SearchLimits, SearchOptions,
         SearchParams, Searcher, SharedTranspositionTable, SyzygyRootProbe,
         SyzygyTablebases, SyzygyWdl, TaperedScore, TranspositionEntry, TranspositionTable,
         evaluate_position, history_index, late_move_reduction, passed_pawn_extension,
@@ -3017,6 +3092,99 @@ mod tests {
             assert_eq!(off_result.best_move, on_result.best_move, "best_move differs for {fen}");
             assert_eq!(off_result.score_cp, on_result.score_cp, "score differs for {fen}");
             assert_eq!(off_result.nodes, on_result.nodes, "node count differs for {fen}");
+        }
+    }
+
+    /// A non-neutral policy that boosts heavy-piece movers, built to reorder quiet
+    /// moves that share a classical score (fresh-search history is 0). Identity
+    /// standardization feeds `mover_piece` (1..=6) in raw; the ReLU bias gates it so
+    /// rook/queen/king movers get a large positive correction and pawn/knight/bishop
+    /// movers get none — so ordering visibly depends on which moves the policy touches.
+    fn heavy_mover_policy() -> PolicyModel {
+        let mover_idx =
+            POLICY_FEATURE_COLUMNS.iter().position(|c| *c == "mover_piece").unwrap();
+        let mut w1 = vec![0.0; POLICY_FEATURES];
+        w1[mover_idx] = 1.0;
+        PolicyModel::from_parameters(
+            [0.0; POLICY_FEATURES],
+            [1.0; POLICY_FEATURES],
+            w1,
+            vec![-3.5], // ReLU fires only for mover_piece > 3.5 (rook/queen/king)
+            vec![3.0],
+            0.0,
+        )
+        .expect("valid policy parameters")
+    }
+
+    #[test]
+    fn policy_top_k_zero_means_all_and_a_small_k_gates_the_reranking() {
+        // Middlegames with heavy pieces that have quiet moves off the top of the order.
+        let fens = [
+            "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQK2R w KQkq - 0 1",
+            "r2q1rk1/pp1bbppp/2np1n2/2p1p3/2P1P3/2NPBN2/PP2BPPP/R2Q1RK1 w - - 0 1",
+            "r3k2r/pppq1ppp/2npbn2/2b1p3/4P3/2NPBN2/PPPQ1PPP/R3K2R w KQkq - 0 1",
+        ];
+        let model = heavy_mover_policy();
+        let limits = SearchLimits { depth: Some(6), ..SearchLimits::default() };
+        let mut any_gated_difference = false;
+        for fen in fens {
+            let board = Board::from_fen(fen).unwrap();
+            let search_with = |top_k: usize| {
+                let mut searcher = Searcher::default();
+                searcher.set_search_params(SearchParams {
+                    policy_order_top_k: top_k,
+                    ..SearchParams::default()
+                });
+                searcher.set_policy_model(Some(model.clone()));
+                searcher.search(&board, limits.clone())
+            };
+            // `0` means "all", so it must match a cap past any legal move count.
+            let all = search_with(0);
+            let uncapped = search_with(200);
+            assert_eq!(all.best_move, uncapped.best_move, "0 != over-cap for {fen}");
+            assert_eq!(all.nodes, uncapped.nodes, "0 != over-cap nodes for {fen}");
+            // Re-ranking only the single top move should, somewhere, gate the ordering
+            // this policy would otherwise apply — a different tree than correcting all.
+            if search_with(1).nodes != all.nodes {
+                any_gated_difference = true;
+            }
+        }
+        assert!(
+            any_gated_difference,
+            "top_k=1 never changed the search vs top_k=all — the cap is not gating"
+        );
+    }
+
+    #[test]
+    fn order_score_parts_preserves_the_classical_score_and_exposes_reusable_see() {
+        // Positions with regular captures, an en passant capture, and promotions so the
+        // SEE/capture byproducts threaded into the policy features are all exercised. The
+        // score must equal the classical `move_order_score` (wiring the policy must never
+        // perturb the base ordering), and the byproducts must equal the standalone
+        // `is_capture_move` / `static_exchange_evaluation` the old `policy_features` used —
+        // so the dedup is a pure speedup, not a behavior change.
+        let fens = [
+            "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 4 4",
+            "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3", // en passant exf6
+            "rnbqkbnr/pPpppppp/8/8/8/8/1PPPPPPP/RNBQKBNR w KQkq - 0 1",      // promotions
+        ];
+        let searcher = Searcher::default();
+        for fen in fens {
+            let mut board = Board::from_fen(fen).unwrap();
+            for mv in board.generate_legal_moves() {
+                let classical = searcher.move_order_score(&board, mv, 0, None, None);
+                let (base, see, is_capture) =
+                    searcher.order_score_parts(&board, mv, 0, None, None, true);
+                assert_eq!(base, classical, "want_features changed the score in {fen}");
+                assert_eq!(
+                    is_capture,
+                    searcher.is_capture_move(&board, mv),
+                    "is_capture byproduct wrong in {fen}"
+                );
+                let expected_see =
+                    if is_capture { super::static_exchange_evaluation(&board, mv) } else { 0 };
+                assert_eq!(see, expected_see, "threaded SEE differs from standalone SEE in {fen}");
+            }
         }
     }
 

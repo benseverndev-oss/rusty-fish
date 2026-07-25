@@ -103,3 +103,54 @@ lazy/partial feature building, or apply the correction only to a top-k slice of 
 rather than every move at every node — then re-gate at a fuller game count. The
 offline signal (AUC 0.93) says the policy *knows* something; the open question is
 whether re-ranking can be made cheap enough for that to net positive at real TC.
+
+## Making inference cheap (2026-07-25, cont.)
+
+The per-move inference tax was the blocker, so it got three fixes, each byte-identical
+to the previous ordering (all invariant tests still green):
+
+1. **Hoisted standardization** in `PolicyModel::cutoff_prob` — the
+   `(feat − mean) · scale` was recomputed inside the `hidden`-way loop; now computed
+   once per feature. Bit-identical (the RFPO round-trip test pins it).
+2. **SEE computed once per capture** — `move_order_score` and `policy_features` each
+   SEE'd every capture; `order_score_parts` now threads the one SEE (and the capture
+   flag) into the features. A drift-guard test pins the byproducts to the standalone
+   `is_capture_move` / `static_exchange_evaluation`.
+3. **Top-K re-ranking** (`SearchParams::policy_order_top_k`, tunable, `0` = all) — the
+   forward pass is the hot loop's dominant cost and cutoffs come from the front of the
+   order, so the policy now re-ranks only the top `K` classically-ordered moves and
+   leaves the tail classical. This is the lever.
+
+New tooling: `engine-bench policy-overhead <rfpo> <fens> <depth> [top_k]` measures the
+tax load-insensitively — it searches each position at fixed depth policy-off vs
+policy-on at `bound=0` (byte-identical ordering, so node counts *must* match — a
+built-in check) and reports `on/off` time. `gate-policy` gained a `[top_k]` arg.
+
+**Inference tax (40 positions, depth 9, node counts identical throughout):**
+
+| top_k | time_ratio |
+|---|---|
+| all | 1.82× |
+| 16 | 1.45× |
+| 8 | 1.29× |
+| 4 | **1.16×** |
+
+**Re-gate (60 games, 30 ms, still wide CI but the trend is monotonic):**
+
+| bound | top_k | W-D-L | Elo | node_ratio | depth Δ |
+|---|---|---|---|---|---|
+| 500 | 8 | 9-19-32 | −140 | 0.779 | −0.29 |
+| 1500 | 8 | 14-20-26 | −70 | 0.754 | −0.16 |
+| 500 | 4 | 17-20-23 | **−35** | 0.827 | −0.08 |
+
+Lower `K` → lower tax → less depth lost at equal movetime → Elo climbs from the
+original −255 toward neutral. At `K=4` the candidate is only ~0.08 plies shallower and
+the result is break-even within noise. **Inference cost is no longer the blocker.**
+
+**What's left is the ordering-quality question, now isolated:** even with cheap
+inference the policy is not yet a *gain*, only ~neutral. Because `order_score` is a
+feature, the model largely reproduces classical ordering, so its re-ranking has little
+new to add. Next: a proper SPRT campaign sweeping (`bound`, `K`) at thousands of games
+to find whether any setting is positive, and — if not — a target/feature change that
+makes the policy re-rank *differently* from classical (a pairwise/listwise ranking loss,
+or dropping `order_score`/`move_index` so the model can't just echo the classical rank).

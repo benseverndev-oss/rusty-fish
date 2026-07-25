@@ -177,13 +177,22 @@ impl PolicyModel {
         for (index, bound) in CLAMPS {
             feats[index] = feats[index].clamp(-bound, bound);
         }
+        // Standardize once per feature into a stack buffer, then the hidden loop is a
+        // plain dot product. This computes the exact same `(feat - mean) * scale` value
+        // as before — just hoisted out of the `hidden`-way inner loop instead of
+        // recomputed for every hidden unit — so the result is bit-identical (the
+        // zero-correction byte-identical guarantee still holds) while the standardize
+        // arithmetic drops from `hidden * POLICY_FEATURES` to `POLICY_FEATURES`.
+        let mut normalized = [0f32; POLICY_FEATURES];
+        for i in 0..POLICY_FEATURES {
+            normalized[i] = (feats[i] - self.mean[i]) * self.scale[i];
+        }
         let mut out = self.b2;
         for j in 0..self.hidden {
             let mut h = self.b1[j];
             let row = j * POLICY_FEATURES;
             for i in 0..POLICY_FEATURES {
-                let normalized = (feats[i] - self.mean[i]) * self.scale[i];
-                h += self.w1[row + i] * normalized;
+                h += self.w1[row + i] * normalized[i];
             }
             if h > 0.0 {
                 out += self.w2[j] * h; // ReLU: non-positive hidden units contribute 0
@@ -204,6 +213,13 @@ pub const POLICY_CLAMP_INDICES: [(usize, f32); 4] = CLAMPS;
 /// refines ordering rather than overriding the proven structure. Tunable like the LMR
 /// thresholds; the real value is whatever a gate prefers.
 pub const DEFAULT_POLICY_ORDER_BOUND: i32 = 4000;
+
+/// Default number of top-of-order moves the policy re-ranks. `0` means "all moves":
+/// the reference behavior, so a run that does not opt into a cap reproduces the
+/// full-policy ordering. The real value is whatever a gate prefers once the inference
+/// tax is traded off against ordering quality — a small `K` is the lever that makes
+/// per-node inference cheap.
+pub const DEFAULT_POLICY_ORDER_TOP_K: usize = 0;
 
 #[cfg(test)]
 mod tests {

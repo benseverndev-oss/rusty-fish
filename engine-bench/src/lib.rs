@@ -889,9 +889,13 @@ pub struct PolicyGateResult {
 /// way [`gate_searcher`] does: the mobility/eval gates isolate a hand-crafted eval
 /// term, but the move-ordering policy is only meaningful against the eval and
 /// reductions it ships with, so candidate and baseline differ *only* in the policy.
-fn policy_gate_searcher(policy: Option<PolicyModel>, order_bound: i32) -> Searcher {
+fn policy_gate_searcher(policy: Option<PolicyModel>, order_bound: i32, top_k: usize) -> Searcher {
     let mut searcher = Searcher::default();
-    let params = SearchParams { policy_order_bound: order_bound, ..SearchParams::default() };
+    let params = SearchParams {
+        policy_order_bound: order_bound,
+        policy_order_top_k: top_k,
+        ..SearchParams::default()
+    };
     searcher.set_search_params(params);
     searcher.set_policy_model(policy);
     let mut options = searcher.options().clone();
@@ -911,14 +915,15 @@ fn play_policy_game(
     candidate_color: Color,
     policy: &PolicyModel,
     order_bound: i32,
+    top_k: usize,
     move_time: Duration,
     max_plies: u32,
     candidate_tally: &mut PolicyGateTally,
     baseline_tally: &mut PolicyGateTally,
 ) -> Result<GameRecord, String> {
     let mut board = Board::from_fen(fen)?;
-    let mut candidate = policy_gate_searcher(Some(policy.clone()), order_bound);
-    let mut baseline = policy_gate_searcher(None, order_bound);
+    let mut candidate = policy_gate_searcher(Some(policy.clone()), order_bound, top_k);
+    let mut baseline = policy_gate_searcher(None, order_bound, top_k);
     for ply in 0..max_plies {
         let is_candidate = board.side_to_move == candidate_color;
         let searcher = if is_candidate { &mut candidate } else { &mut baseline };
@@ -962,6 +967,7 @@ pub fn run_policy_gate_fens<S: AsRef<str>>(
     fens: &[S],
     policy: &PolicyModel,
     order_bound: i32,
+    top_k: usize,
     move_time: Duration,
     max_plies: u32,
 ) -> Result<PolicyGateResult, String> {
@@ -975,6 +981,7 @@ pub fn run_policy_gate_fens<S: AsRef<str>>(
                 candidate_color,
                 policy,
                 order_bound,
+                top_k,
                 move_time,
                 max_plies,
                 &mut candidate,
@@ -983,6 +990,64 @@ pub fn run_policy_gate_fens<S: AsRef<str>>(
         }
     }
     Ok(PolicyGateResult { records, candidate, baseline })
+}
+
+/// Load-insensitive measurement of the policy's *inference cost* — the thing a
+/// movetime gate's node-ratio confounds with game-play variance. Searches each FEN to
+/// a fixed `depth` twice: policy off, then policy on with `policy_order_bound = 0`.
+/// A zero bound makes every correction exactly 0, so the ordering — and therefore the
+/// whole search tree and node count — is byte-identical to policy-off, yet all the
+/// feature-building and forward-pass work still runs. Equal node counts are thus a
+/// correctness check, and `on_elapsed / off_elapsed` is the pure per-node inference tax.
+pub struct PolicyOverhead {
+    pub off_nodes: u64,
+    pub on_nodes: u64,
+    pub off_elapsed: Duration,
+    pub on_elapsed: Duration,
+}
+
+impl PolicyOverhead {
+    /// Inference overhead as a multiplier on search time (1.0 = free). `None` if the
+    /// baseline took no measurable time.
+    pub fn time_ratio(&self) -> Option<f64> {
+        let off = self.off_elapsed.as_secs_f64();
+        (off > 0.0).then(|| self.on_elapsed.as_secs_f64() / off)
+    }
+}
+
+/// Runs the [`PolicyOverhead`] measurement over `fens` at fixed `depth`.
+pub fn measure_policy_overhead<S: AsRef<str>>(
+    fens: &[S],
+    policy: &PolicyModel,
+    depth: u8,
+    top_k: usize,
+) -> Result<PolicyOverhead, String> {
+    let limits = SearchLimits { depth: Some(depth), ..SearchLimits::default() };
+    let mut off_nodes = 0u64;
+    let mut on_nodes = 0u64;
+    let mut off_elapsed = Duration::ZERO;
+    let mut on_elapsed = Duration::ZERO;
+    for fen in fens {
+        let board = Board::from_fen(fen.as_ref())?;
+
+        let mut off = Searcher::default();
+        let off_result = off.search(&board, limits.clone());
+
+        let mut on = Searcher::default();
+        on.set_search_params(SearchParams {
+            policy_order_bound: 0,
+            policy_order_top_k: top_k,
+            ..SearchParams::default()
+        });
+        on.set_policy_model(Some(policy.clone()));
+        let on_result = on.search(&board, limits.clone());
+
+        off_nodes += off_result.nodes;
+        on_nodes += on_result.nodes;
+        off_elapsed += off_result.elapsed;
+        on_elapsed += on_result.elapsed;
+    }
+    Ok(PolicyOverhead { off_nodes, on_nodes, off_elapsed, on_elapsed })
 }
 
 fn play_external_game(
