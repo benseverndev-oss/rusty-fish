@@ -2737,9 +2737,13 @@ mod tests {
         singular_verification_beta,
     };
 
-    /// Builds an all-zero-weights RFLM with `b2 = -1` so P(raise alpha) = sigmoid(-1)
-    /// ~= 0.27 for every input -> `reduction_correction` is always 0. Installing it must
-    /// therefore leave the search byte-identical to LMR-off.
+    /// Builds an all-zero-weights RFLM whose bias lands mid-way through the
+    /// no-correction band, so `reduction_correction` is 0 for every input. Installing
+    /// it must therefore leave the search byte-identical to LMR-off.
+    ///
+    /// The bias comes from [`crate::lmr_model::neutral_correction_bias`] rather than a
+    /// literal, so re-sweeping the thresholds cannot quietly turn this into a
+    /// non-neutral model that still claims to test neutrality.
     fn zero_correction_lmr_model() -> LmrModel {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"RFLM");
@@ -2757,7 +2761,7 @@ mod tests {
         }
         bytes.extend_from_slice(&0f32.to_le_bytes()); // b1
         bytes.extend_from_slice(&0f32.to_le_bytes()); // w2
-        bytes.extend_from_slice(&(-1f32).to_le_bytes()); // b2
+        bytes.extend_from_slice(&crate::lmr_model::neutral_correction_bias().to_le_bytes());
         LmrModel::from_bytes(&bytes).expect("valid RFLM")
     }
 

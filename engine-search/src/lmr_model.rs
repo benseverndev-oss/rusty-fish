@@ -153,7 +153,7 @@ impl LmrModel {
     }
 
     /// [`reduction_correction_with`](Self::reduction_correction_with) at the default
-    /// thresholds (the settings that gated +38.3 Elo).
+    /// thresholds (the settings the bundled model was swept for).
     pub fn reduction_correction(&self, feats: &[f32; LMR_FEATURES]) -> i8 {
         self.reduction_correction_with(
             feats,
@@ -167,23 +167,29 @@ impl LmrModel {
 /// Default correction thresholds, per-mille P(raise alpha). `SearchParams` mirrors
 /// these and is what the search actually reads, so they can be tuned per-run.
 ///
-/// Tuned by gated A/B (4096 games, 50 ms/move, equal movetime, sharded SPRT).
-/// Reducing *harder* than the original guess pays, matching what the telemetry said:
-/// classical LMR errs on only 2.31% of the moves it reduces — it is conservative, so
-/// the predictably-safe majority can take another ply. The curve plateaus:
+/// Tuned by gated A/B at equal movetime (50 ms/move, sharded SPRT). Reducing *harder*
+/// than the original guess pays, matching what the telemetry said: classical LMR errs
+/// on only 2.31% of the moves it reduces, so the predictably-safe majority can take
+/// another ply.
 ///
-///   unreduce/reduce2/reduce1 -> Elo vs classical
-///   500 /  20 /  60 (guess)  -> +38.3
-///   500 /  50 / 120          -> +49.6   (+11.3)
-///   500 / 100 / 220 (ADOPTED)-> +56.5   ( +6.9)
-///   500 / 180 / 400          -> +57.3   ( +0.8, i.e. noise — the plateau)
+/// **These are per-model.** The thresholds slice a probability distribution, and a
+/// retrained model recalibrates — so a model swap without a re-sweep is a regression,
+/// not a neutral change. Measured, at 16384 games (SE ~±2.3 Elo):
 ///
-/// 220/100 and 400/180 are statistically indistinguishable, so we take the *less*
-/// aggressive of the two: equal measured strength, but less over-reduction tail risk
-/// at time controls longer than the 50 ms the gate exercised.
+///   model              unreduce/reduce2/reduce1 -> Elo vs classical
+///   v1 (10 features)   500 / 100 / 220          -> +57.7
+///   v2 (18 features)   500 / 100 / 220          -> +50.6   (v1's thresholds: -7.1)
+///   v2 (18 features)   500 / 250 / 450 (ADOPTED)-> +57.2   (re-swept: recovered)
+///
+/// The earlier 4096-game sweep (+38.3 -> +49.6 -> +56.5 -> +57.3) established the
+/// direction, but its steps were 1-2 sigma at that sample size and its fine ordering
+/// should not be read as resolved.
+///
+/// `reduce1` has little headroom left: at >= `unreduce` it is unreachable, because the
+/// unreduce branch is tested first.
 pub const DEFAULT_LMR_UNREDUCE_PERMILLE: i32 = 500;
-pub const DEFAULT_LMR_REDUCE2_PERMILLE: i32 = 100;
-pub const DEFAULT_LMR_REDUCE1_PERMILLE: i32 = 220;
+pub const DEFAULT_LMR_REDUCE2_PERMILLE: i32 = 250;
+pub const DEFAULT_LMR_REDUCE1_PERMILLE: i32 = 450;
 
 /// The engine's default learned-LMR model, compiled into the binary and parsed once.
 /// Adopted 2026-07-24 after gating +38.3 Elo (equal movetime, 4096 games, AcceptH1),
@@ -196,6 +202,21 @@ static BUNDLED_LMR_MODEL: LazyLock<LmrModel> = LazyLock::new(|| {
 /// The bundled default learned-LMR model (a cheap clone of the parsed-once model).
 pub fn bundled_lmr_model() -> LmrModel {
     BUNDLED_LMR_MODEL.clone()
+}
+
+/// Bias that puts an all-zero-weight model in the middle of the no-correction band
+/// `[reduce1, unreduce)`, expressed as a logit so the forward pass reproduces exactly
+/// that probability for every input.
+///
+/// Derived from the threshold constants rather than hardcoded: a fixture pinned to
+/// one set of thresholds silently stops testing what it claims the moment they are
+/// re-swept, which is exactly what happened when the v2 model moved the band.
+#[cfg(test)]
+pub(crate) fn neutral_correction_bias() -> f32 {
+    let permille =
+        (DEFAULT_LMR_REDUCE1_PERMILLE + DEFAULT_LMR_UNREDUCE_PERMILLE) as f32 / 2.0;
+    let probability = permille / 1000.0;
+    (probability / (1.0 - probability)).ln()
 }
 
 #[cfg(test)]
@@ -255,12 +276,18 @@ mod tests {
 
     #[test]
     fn zero_weights_with_neutral_bias_gives_zero_correction() {
-        // All-zero weights => out = b2; b2 = -1 => p = sigmoid(-1) ~= 0.269, which is in
-        // [0.06, 0.50) => correction 0. This is the model used by the search's
-        // byte-identical test (its only effect is via the correction).
-        let model =
-            LmrModel::from_bytes(&build_rflm(1, &vec![0.0; LMR_FEATURES], &[0.0], &[0.0], -1.0))
-                .unwrap();
+        // All-zero weights => out = b2 for every input, so the bias alone decides the
+        // probability. `neutral_correction_bias` places it mid-band, which is the
+        // model the search's byte-identical test installs (its only possible effect on
+        // the search is via the correction, so a zero correction must change nothing).
+        let model = LmrModel::from_bytes(&build_rflm(
+            1,
+            &vec![0.0; LMR_FEATURES],
+            &[0.0],
+            &[0.0],
+            neutral_correction_bias(),
+        ))
+        .unwrap();
         assert_eq!(model.reduction_correction(&[42.0; LMR_FEATURES]), 0);
     }
 
