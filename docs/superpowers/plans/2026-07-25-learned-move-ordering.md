@@ -154,3 +154,17 @@ new to add. Next: a proper SPRT campaign sweeping (`bound`, `K`) at thousands of
 to find whether any setting is positive, and — if not — a target/feature change that
 makes the policy re-rank *differently* from classical (a pairwise/listwise ranking loss,
 or dropping `order_score`/`move_index` so the model can't just echo the classical rank).
+
+## Ideas / backlog
+
+- **Decision-mutation label augmentation (Ben's idea).** Take labelled games and add
+  an element of *decision mutation* to cheaply generate more labels — i.e. perturb the
+  decisions the search made and re-observe the outcome, turning one played game into
+  many labelled decision points instead of paying for a fresh self-play game per label.
+  *(Rough read, to firm up with Ben: the appeal is that labels are the expensive part —
+  a game costs a full search, but a decision point is cheap. Open questions before
+  building: which decision to mutate (the move ordered first? the reduction taken?),
+  what the resulting label is (did the mutated choice still cut / still hold alpha?),
+  and whether a mutated line stays on-distribution enough that its label is meaningful
+  for the policy that will run on un-mutated searches. Could apply beyond move ordering
+  — same trick could densify LMR / pruning labels.)*
