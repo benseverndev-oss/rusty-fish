@@ -555,6 +555,10 @@ pub struct Searcher {
     /// Reused scratch for move ordering: `(score, move)` pairs sorted per node,
     /// kept across calls so ordering never heap-allocates in the hot loop.
     move_order_scratch: Vec<(i32, ChessMove)>,
+    /// Reused scratch for the policy's `eval_after` values (one per re-ranked move),
+    /// computed under `&mut self` before the correction pass reads them under `&self`.
+    /// Kept across calls so the search-derived feature never heap-allocates per node.
+    policy_eval_scratch: Vec<i32>,
     opening_book: Option<OpeningBook>,
     syzygy: Option<SyzygyTablebases>,
     /// Optional per-move-decision telemetry sink. `None` (the default) makes the
@@ -644,6 +648,7 @@ impl Default for Searcher {
             nnue_accumulator: None,
             nnue_stack: Vec::new(),
             move_order_scratch: Vec::new(),
+            policy_eval_scratch: Vec::new(),
             opening_book: None,
             syzygy: None,
             telemetry: None,
@@ -996,6 +1001,7 @@ impl Searcher {
             nnue_accumulator: None,
             nnue_stack: Vec::new(),
             move_order_scratch: Vec::new(),
+            policy_eval_scratch: Vec::new(),
             opening_book: None,
             syzygy: None,
             telemetry: None,
@@ -1587,12 +1593,17 @@ impl Searcher {
                         move_score: 0, // late-move-pruned: not searched
                         node_alpha,
                         node_beta: beta,
+                        eval_after: 0, // not made: no child to evaluate (row is dropped anyway)
                     });
                 }
                 break;
             }
             let undo = self.nnue_make(board, mv);
             let gives_check = board.in_check(board.side_to_move);
+            // Search-derived telemetry feature: static eval of the child, mover's
+            // perspective. Computed only when a collector is installed (the accumulator
+            // already reflects the child here), so a normal search pays nothing.
+            let eval_after = if self.telemetry.is_some() { -self.evaluate(board) } else { 0 };
             let extension = u8::from(gives_check)
                 .max(pawn_extension)
                 .max(u8::from(singular_extension));
@@ -1721,6 +1732,7 @@ impl Searcher {
                     move_score: score,
                     node_alpha,
                     node_beta: beta,
+                    eval_after,
                 });
             }
             if caused_cutoff {
@@ -1831,6 +1843,9 @@ impl Searcher {
 
             let undo = self.nnue_make(board, mv);
             let gives_check = board.in_check(board.side_to_move);
+            // Search-derived feature: static eval of the child, mover's perspective.
+            // Free here — the accumulator already reflects the child after nnue_make.
+            let eval_after = -self.evaluate(board);
             let extension = u8::from(gives_check);
             let child_depth = depth.saturating_sub(1) + extension.min(1);
             let nodes_before = self.nodes;
@@ -1872,6 +1887,7 @@ impl Searcher {
                 move_score: score,
                 node_alpha,
                 node_beta,
+                eval_after,
             });
         }
     }
@@ -2035,7 +2051,7 @@ impl Searcher {
 
     fn order_moves(
         &mut self,
-        board: &Board,
+        board: &mut Board,
         moves: &mut [ChessMove],
         ply: usize,
         tt_move: Option<ChessMove>,
@@ -2056,9 +2072,12 @@ impl Searcher {
         // Node-sparse application: skip the policy entirely at nodes shallower than
         // `policy_order_min_depth` (they order classically). Near-leaf nodes are most of
         // the tree, so this is the main lever on the per-node inference tax.
-        let policy = match (self.policy_model.as_ref(), policy_ctx) {
-            (Some(model), Some(ctx)) if ctx.depth >= self.params.policy_order_min_depth => {
-                Some((model, ctx))
+        let policy_ctx_active = match policy_ctx {
+            Some(ctx)
+                if self.policy_model.is_some()
+                    && ctx.depth >= self.params.policy_order_min_depth =>
+            {
+                Some(ctx)
             }
             _ => None,
         };
@@ -2071,14 +2090,32 @@ impl Searcher {
         }
         scratch.sort_by(|left, right| right.0.cmp(&left.0));
         // Phase 2 (policy on): re-rank only the top `K` moves in classical order. The
-        // forward pass is the hot loop's dominant cost and cutoffs come from the front
-        // of the list, so this caps per-node inference at `K` passes while the tail
-        // stays classical. `K = 0` means all moves. A second sort lets the corrections
-        // reorder the whole list (a corrected top-`K` move can drop behind an
-        // untouched tail move, which is the intended residual-on-classical semantics).
-        if let Some((model, ctx)) = policy {
+        // forward pass and the `eval_after` lookahead are the hot loop's dominant cost
+        // and cutoffs come from the front of the list, so this caps per-node inference at
+        // `K` moves while the tail stays classical. `K = 0` means all moves. A second
+        // sort lets the corrections reorder the whole list (a corrected top-`K` move can
+        // drop behind an untouched tail move — the intended residual-on-classical
+        // semantics). Two passes because `eval_after` needs `&mut self`/`&mut board`
+        // (make/eval/unmake) while the correction needs the model as a shared borrow of
+        // `self`; splitting them keeps both borrows legal without cloning the model.
+        if let Some(ctx) = policy_ctx_active {
             let cap = self.params.policy_order_top_k;
             let k = if cap == 0 { scratch.len() } else { cap.min(scratch.len()) };
+            // Pass A: the search-derived feature — static eval of the child, mover's
+            // perspective — for each top-`K` move, under `&mut self`. A make/eval/unmake
+            // per move; the accumulator is restored on unmake, so the search is unaffected.
+            let mut evals = std::mem::take(&mut self.policy_eval_scratch);
+            evals.clear();
+            for index in 0..k {
+                let mv = scratch[index].1;
+                let undo = self.nnue_make(board, mv);
+                evals.push(-self.evaluate(board));
+                self.nnue_unmake(board, mv, undo);
+            }
+            // Pass B: the correction. `model` is a pure shared borrow of `self` now, so
+            // the SEE/feature reads coexist with it.
+            let bound = self.params.policy_order_bound;
+            let model = self.policy_model.as_ref().expect("policy installed");
             for index in 0..k {
                 let (base, mv) = scratch[index];
                 // Recompute the SEE/capture byproducts for these few front moves only;
@@ -2086,11 +2123,11 @@ impl Searcher {
                 let (_, see, is_capture) =
                     self.order_score_parts(board, mv, ply, tt_move, counter_move, true);
                 let feats = self.policy_features(
-                    board, mv, &ctx, ply, see, is_capture, tt_move, counter_move,
+                    board, mv, &ctx, ply, see, is_capture, evals[index], tt_move, counter_move,
                 );
-                scratch[index].0 =
-                    base.saturating_add(model.order_correction(&feats, self.params.policy_order_bound));
+                scratch[index].0 = base.saturating_add(model.order_correction(&feats, bound));
             }
+            self.policy_eval_scratch = evals;
             scratch.sort_by(|left, right| right.0.cmp(&left.0));
         }
         for (slot, entry) in moves.iter_mut().zip(scratch.iter()) {
@@ -2113,6 +2150,7 @@ impl Searcher {
         ply: usize,
         see: i32,
         is_capture: bool,
+        eval_after: i32,
         tt_move: Option<ChessMove>,
         counter_move: Option<ChessMove>,
     ) -> [f32; POLICY_FEATURES] {
@@ -2152,6 +2190,7 @@ impl Searcher {
             see as f32,
             f32::from(mover_piece),
             f32::from(captured_piece),
+            eval_after as f32,
         ]
     }
 
@@ -3281,7 +3320,12 @@ mod tests {
         ];
         for fen in fens {
             let board = Board::from_fen(fen).unwrap();
-            let limits = SearchLimits { depth: Some(8), ..SearchLimits::default() };
+            // Depth 6, not 8: with `min_depth = 0` the policy (and its per-move
+            // `eval_after` make/eval/unmake) runs at *every* node, so the tree cost is
+            // what a debug `cargo test` pays. The zero-correction ⇒ identical invariant
+            // holds at any depth; depth 6 still drives the policy path across the full
+            // tree while keeping the test ~10× cheaper.
+            let limits = SearchLimits { depth: Some(6), ..SearchLimits::default() };
             // `off` = classical ordering (policy is None by default); `on` = the
             // zero-correction policy. Every search decision must be identical.
             let mut off = Searcher::default();
