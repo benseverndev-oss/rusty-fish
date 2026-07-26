@@ -376,3 +376,38 @@ move-quality features (the rank crutch is gone, so capacity can finally matter),
 cheaper inference to shrink the ~16% K=4 tax, and only **(3)** revisit DAgger *after* a
 round crosses into positive Elo, where its premise actually holds. Policy stays opt-in;
 default search unchanged.
+
+#### Capacity lever — tried, counterproductive (2026-07-25)
+
+Trained the order-score-free policy on the round-1 research corpus at `hidden ∈ {16, 32,
+64}` and gated each at K=4/bound=2000, 800 games, same openings:
+
+| hidden | val AUC | inference overhead | Elo |
+|---|---|---|---|
+| **16** | 0.765 | 1.16× | **−30.9** |
+| 32 | 0.771 | 1.25× | −53.0 |
+| 64 | 0.773 | 1.55× | −128.5 |
+
+**Bigger is monotonically worse.** Offline AUC creeps up (0.765 → 0.773) but *plateaus* —
+the same feature-limited signature learned LMR hit at ~0.94 — while the inference tax
+scales with `hidden` (the forward pass is `hidden × features` per move) and swamps the
+gain. This is the decisive finding of the whole arc: the policy is pinned between two
+walls — **features cap AUC at ~0.77** (capacity barely moves it) and **inference cost caps
+how big a model can pay for itself** at fast TC. So neither "more capacity" nor "more
+data/DAgger" is the lever.
+
+**Remaining untested levers, in order:**
+1. **Apply the policy to far fewer *nodes*, not just fewer moves.** Today it re-ranks the
+   top-K at *every* sampled main-`negamax` node; gating it to, say, PV nodes or nodes above
+   a depth threshold would cut the tax by a large factor for little ordering loss (most
+   cutoffs at shallow/all-nodes are already classical-clean). This directly attacks the
+   dominant cost and is a small `order_moves` change.
+2. **Richer, cheap features** to lift the ~0.77 ceiling — but each added input also adds
+   `hidden` MACs/move, so only features with a high signal-per-cost (e.g. a cheap
+   see-of-the-best-reply, or piece-on-square hints) are worth it.
+3. **Longer time controls.** The NPS penalty is TC-independent, but the *Elo* cost of a
+   fixed depth deficit shrinks at higher depth (diminishing returns of depth), so a learned
+   orderer may fare better at long TC than the 30 ms gates here — worth one check.
+
+Best result of the arc remains the **hidden=16, order-score-free, Tier-2-trained policy at
+−30.9 Elo**. Nothing adopted; default search unchanged.
