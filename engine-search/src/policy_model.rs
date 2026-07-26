@@ -226,6 +226,11 @@ pub const DEFAULT_POLICY_ORDER_BOUND: i32 = 4000;
 /// per-node inference cheap.
 pub const DEFAULT_POLICY_ORDER_TOP_K: usize = 0;
 
+/// Default minimum remaining depth for the policy to re-rank a node. `0` applies at every
+/// depth (the reference behaviour); a positive value skips near-leaf nodes to cut the
+/// per-node inference tax. The real value is whatever a gate prefers.
+pub const DEFAULT_POLICY_ORDER_MIN_DEPTH: u8 = 0;
+
 #[cfg(test)]
 mod tests {
     use super::*;

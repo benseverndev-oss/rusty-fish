@@ -17,8 +17,8 @@ mod telemetry;
 pub use lmr_model::{bundled_lmr_model, LmrModel, LMR_FEATURES};
 pub use nnue::{active_features, bundled_network, Nnue, INPUT_DIMENSION};
 pub use policy_model::{
-    PolicyModel, DEFAULT_POLICY_ORDER_BOUND, DEFAULT_POLICY_ORDER_TOP_K, POLICY_CLAMP_INDICES,
-    POLICY_FEATURES,
+    PolicyModel, DEFAULT_POLICY_ORDER_BOUND, DEFAULT_POLICY_ORDER_MIN_DEPTH,
+    DEFAULT_POLICY_ORDER_TOP_K, POLICY_CLAMP_INDICES, POLICY_FEATURES,
 };
 pub use telemetry::{
     MoveDecision, TelemetryCollector, LMR_FEATURE_CLAMPS, LMR_FEATURE_COLUMNS, LMR_FILTER_COLUMN,
@@ -142,6 +142,14 @@ pub struct SearchParams {
     /// classical order. `0` means "all moves" (no cap). Only has an effect when a
     /// [`PolicyModel`] is installed; tunable by A/B like `policy_order_bound`.
     pub policy_order_top_k: usize,
+    /// Minimum remaining depth for the policy to re-rank a node (Phase 4). The forward
+    /// pass runs once per re-ranked move *per node*, and near-leaf nodes are both the vast
+    /// majority of the tree and the ones where classical ordering is already clean, so
+    /// skipping them (`depth < policy_order_min_depth` → classical order) cuts the total
+    /// inference by a large factor while keeping the high, tree-shaping interior nodes.
+    /// `0` applies at every depth (the reference). Only has an effect when a
+    /// [`PolicyModel`] is installed; tunable by A/B like the other policy knobs.
+    pub policy_order_min_depth: u8,
 }
 
 impl Default for SearchParams {
@@ -161,6 +169,7 @@ impl Default for SearchParams {
             lmr_reduce1_permille: lmr_model::DEFAULT_LMR_REDUCE1_PERMILLE,
             policy_order_bound: policy_model::DEFAULT_POLICY_ORDER_BOUND,
             policy_order_top_k: policy_model::DEFAULT_POLICY_ORDER_TOP_K,
+            policy_order_min_depth: policy_model::DEFAULT_POLICY_ORDER_MIN_DEPTH,
         }
     }
 }
@@ -2044,8 +2053,13 @@ impl Searcher {
         // the caller supplied node context (the main `negamax` loop — not root, not
         // quiescence). With either absent the score is exactly the classical one, so
         // the ordering is byte-identical to policy-off.
+        // Node-sparse application: skip the policy entirely at nodes shallower than
+        // `policy_order_min_depth` (they order classically). Near-leaf nodes are most of
+        // the tree, so this is the main lever on the per-node inference tax.
         let policy = match (self.policy_model.as_ref(), policy_ctx) {
-            (Some(model), Some(ctx)) => Some((model, ctx)),
+            (Some(model), Some(ctx)) if ctx.depth >= self.params.policy_order_min_depth => {
+                Some((model, ctx))
+            }
             _ => None,
         };
         // Phase 1: the classical score for every move. This is the untouched, fast path

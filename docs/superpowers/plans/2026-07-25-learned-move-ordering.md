@@ -411,3 +411,39 @@ data/DAgger" is the lever.
 
 Best result of the arc remains the **hidden=16, order-score-free, Tier-2-trained policy at
 −30.9 Elo**. Nothing adopted; default search unchanged.
+
+#### Node-sparse application — the breakthrough lever (2026-07-26)
+
+Lever #1 above ("apply to fewer *nodes*"). Added `SearchParams::policy_order_min_depth`:
+the policy re-ranks a node only when its remaining depth `>= min_depth`, otherwise the node
+orders classically. Near-leaf nodes are the vast majority of the tree *and* the ones where
+classical ordering is already clean, so skipping them removes almost all the inference tax.
+Same `−30.9` model (`policy_research.rfpo`), no retraining — this is a pure search knob.
+
+**Overhead collapses** (40 pos, depth 9, K=4, `bound=0` so ordering is byte-identical and
+node counts match):
+
+| min_depth | 0 | 2 | 4 | 6 |
+|---|---|---|---|---|
+| inference overhead | 1.11× | 1.06× | **1.00×** | 0.99× |
+
+**And Elo climbs monotonically across zero** (K=4/bound=2000, 800 games each, same openings
+as the −30.9 baseline, which is `min_depth=0`):
+
+| min_depth | 0 | 2 | 4 | 6 |
+|---|---|---|---|---|
+| Elo | −30.9 | −26.5 | −9.6 | **+1.3** |
+
+`min_depth=6` is the **first non-negative result of the whole arc** (+1.3 Elo, within noise
+of zero at 800 games). The mechanism is clean: at shallow nodes the per-move forward pass
+cost outweighs any ordering gain (they're cheap to search classically and mostly already
+ordered right), so applying the policy there was *pure loss*; restricting it to the deep,
+tree-shaping nodes keeps the benefit and drops the cost to ~0. This is what the −30.9→−9.6→
++1.3 curve is: peeling off the loss-making shallow applications.
+
+A larger confirmation run (min_depth {5,6,7}, 1600 games each, out-of-sample openings) is
+in flight to resolve the sign; results appended when done. If `min_depth≈6` holds at or
+above zero, the policy is finally free (≈break-even at ~0 tax), and the levers that were
+capped by the tax — a slightly bigger model, richer features — could now pay for themselves,
+because the node-sparse gating hands back the NPS budget they need. Still opt-in, no bundled
+asset, default search unchanged.

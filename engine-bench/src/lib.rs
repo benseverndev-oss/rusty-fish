@@ -890,11 +890,17 @@ pub struct PolicyGateResult {
 /// way [`gate_searcher`] does: the mobility/eval gates isolate a hand-crafted eval
 /// term, but the move-ordering policy is only meaningful against the eval and
 /// reductions it ships with, so candidate and baseline differ *only* in the policy.
-fn policy_gate_searcher(policy: Option<PolicyModel>, order_bound: i32, top_k: usize) -> Searcher {
+fn policy_gate_searcher(
+    policy: Option<PolicyModel>,
+    order_bound: i32,
+    top_k: usize,
+    min_depth: u8,
+) -> Searcher {
     let mut searcher = Searcher::default();
     let params = SearchParams {
         policy_order_bound: order_bound,
         policy_order_top_k: top_k,
+        policy_order_min_depth: min_depth,
         ..SearchParams::default()
     };
     searcher.set_search_params(params);
@@ -911,20 +917,22 @@ fn policy_gate_searcher(policy: Option<PolicyModel>, order_bound: i32, top_k: us
 /// (not depth) bounds each move, so the whole game's cost is bounded by
 /// `max_plies * move_time` regardless of how sharp the position is.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn play_policy_game(
     fen: &str,
     candidate_color: Color,
     policy: &PolicyModel,
     order_bound: i32,
     top_k: usize,
+    min_depth: u8,
     move_time: Duration,
     max_plies: u32,
     candidate_tally: &mut PolicyGateTally,
     baseline_tally: &mut PolicyGateTally,
 ) -> Result<GameRecord, String> {
     let mut board = Board::from_fen(fen)?;
-    let mut candidate = policy_gate_searcher(Some(policy.clone()), order_bound, top_k);
-    let mut baseline = policy_gate_searcher(None, order_bound, top_k);
+    let mut candidate = policy_gate_searcher(Some(policy.clone()), order_bound, top_k, min_depth);
+    let mut baseline = policy_gate_searcher(None, order_bound, top_k, min_depth);
     for ply in 0..max_plies {
         let is_candidate = board.side_to_move == candidate_color;
         let searcher = if is_candidate { &mut candidate } else { &mut baseline };
@@ -964,11 +972,13 @@ fn play_policy_game(
 /// capped at `max_plies`. The two searchers are identical but for
 /// `set_policy_model`, so the SPRT isolates the learned ordering correction;
 /// `order_bound` scales the correction (`SearchParams::policy_order_bound`).
+#[allow(clippy::too_many_arguments)]
 pub fn run_policy_gate_fens<S: AsRef<str>>(
     fens: &[S],
     policy: &PolicyModel,
     order_bound: i32,
     top_k: usize,
+    min_depth: u8,
     move_time: Duration,
     max_plies: u32,
 ) -> Result<PolicyGateResult, String> {
@@ -983,6 +993,7 @@ pub fn run_policy_gate_fens<S: AsRef<str>>(
                 policy,
                 order_bound,
                 top_k,
+                min_depth,
                 move_time,
                 max_plies,
                 &mut candidate,
@@ -1022,6 +1033,7 @@ pub fn measure_policy_overhead<S: AsRef<str>>(
     policy: &PolicyModel,
     depth: u8,
     top_k: usize,
+    min_depth: u8,
 ) -> Result<PolicyOverhead, String> {
     let limits = SearchLimits { depth: Some(depth), ..SearchLimits::default() };
     let mut off_nodes = 0u64;
@@ -1038,6 +1050,7 @@ pub fn measure_policy_overhead<S: AsRef<str>>(
         on.set_search_params(SearchParams {
             policy_order_bound: 0,
             policy_order_top_k: top_k,
+            policy_order_min_depth: min_depth,
             ..SearchParams::default()
         });
         on.set_policy_model(Some(policy.clone()));

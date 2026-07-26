@@ -24,8 +24,8 @@ use engine_bench::bench_harness::{
 };
 use engine_bench::train::{generate_training_samples, train_nnue, TrainConfig};
 use engine_search::{
-    DEFAULT_POLICY_ORDER_BOUND, DEFAULT_POLICY_ORDER_TOP_K, EvalParams, Nnue, PolicyModel,
-    SearchParams,
+    DEFAULT_POLICY_ORDER_BOUND, DEFAULT_POLICY_ORDER_MIN_DEPTH, DEFAULT_POLICY_ORDER_TOP_K,
+    EvalParams, Nnue, PolicyModel, SearchParams,
 };
 
 /// Shared middlegame sampling window for both `gen-wdl-data` and
@@ -330,7 +330,7 @@ fn main() -> Result<(), String> {
         // node/depth summary — the tree-efficiency signal that moves even when Elo
         // is flat — goes to stderr along with the local SPRT verdict.
         let usage =
-            "usage: gate-policy <policy.rfpo> <openings_file> [move_time_ms] [order_bound] [top_k]";
+            "usage: gate-policy <policy.rfpo> <openings_file> [move_time_ms] [order_bound] [top_k] [min_depth]";
         let policy_path = std::env::args().nth(2).ok_or_else(|| usage.to_string())?;
         let openings_path = std::env::args().nth(3).ok_or_else(|| usage.to_string())?;
         let move_time = Duration::from_millis(arg_u64(4).unwrap_or(100));
@@ -338,16 +338,20 @@ fn main() -> Result<(), String> {
             .and_then(|value| i32::try_from(value).ok())
             .unwrap_or(DEFAULT_POLICY_ORDER_BOUND);
         let top_k = arg_u64(6).map(|value| value as usize).unwrap_or(DEFAULT_POLICY_ORDER_TOP_K);
+        let min_depth = arg_u32(7)
+            .and_then(|value| u8::try_from(value).ok())
+            .unwrap_or(DEFAULT_POLICY_ORDER_MIN_DEPTH);
         let policy = PolicyModel::from_file(&policy_path)?;
         let contents = std::fs::read_to_string(&openings_path)
             .map_err(|error| format!("failed to read openings {openings_path}: {error}"))?;
         let fens: Vec<&str> = contents.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-        let result = run_policy_gate_fens(&fens, &policy, order_bound, top_k, move_time, 160)?;
+        let result =
+            run_policy_gate_fens(&fens, &policy, order_bound, top_k, min_depth, move_time, 160)?;
         let score = summarize(&result.records);
         println!("{}\t{}\t{}", score.wins, score.draws, score.losses);
         let decision = sprt(score, SprtConfig::default()).map(|verdict| verdict.decision);
         eprintln!(
-            "gate-policy (bound={order_bound} top_k={top_k}): {}W {}D {}L; elo {}; decision = {decision:?}",
+            "gate-policy (bound={order_bound} top_k={top_k} min_depth={min_depth}): {}W {}D {}L; elo {}; decision = {decision:?}",
             score.wins,
             score.draws,
             score.losses,
@@ -379,19 +383,22 @@ fn main() -> Result<(), String> {
         // the policy off, then on at `order_bound = 0` (byte-identical ordering, so the
         // node counts must match — a built-in correctness check), and reports the
         // off/on nodes and the on/off time ratio (the per-node inference tax).
-        let usage = "usage: policy-overhead <policy.rfpo> <openings_file> <depth> [top_k]";
+        let usage = "usage: policy-overhead <policy.rfpo> <openings_file> <depth> [top_k] [min_depth]";
         let policy_path = std::env::args().nth(2).ok_or_else(|| usage.to_string())?;
         let openings_path = std::env::args().nth(3).ok_or_else(|| usage.to_string())?;
         let depth = arg_u32(4).and_then(|d| u8::try_from(d).ok()).unwrap_or(9);
         let top_k = arg_u64(5).map(|value| value as usize).unwrap_or(DEFAULT_POLICY_ORDER_TOP_K);
+        let min_depth = arg_u32(6)
+            .and_then(|value| u8::try_from(value).ok())
+            .unwrap_or(DEFAULT_POLICY_ORDER_MIN_DEPTH);
         let policy = PolicyModel::from_file(&policy_path)?;
         let contents = std::fs::read_to_string(&openings_path)
             .map_err(|error| format!("failed to read openings {openings_path}: {error}"))?;
         let fens: Vec<&str> = contents.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-        let overhead = measure_policy_overhead(&fens, &policy, depth, top_k)?;
+        let overhead = measure_policy_overhead(&fens, &policy, depth, top_k, min_depth)?;
         let node_check = if overhead.off_nodes == overhead.on_nodes { "OK" } else { "MISMATCH" };
         println!(
-            "POLICY_OVERHEAD depth={depth} top_k={top_k} positions={} off_nodes={} on_nodes={} nodes={node_check} \
+            "POLICY_OVERHEAD depth={depth} top_k={top_k} min_depth={min_depth} positions={} off_nodes={} on_nodes={} nodes={node_check} \
              off_ms={:.1} on_ms={:.1} time_ratio={}",
             fens.len(),
             overhead.off_nodes,
