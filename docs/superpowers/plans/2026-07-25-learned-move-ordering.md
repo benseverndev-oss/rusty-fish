@@ -441,9 +441,27 @@ ordered right), so applying the policy there was *pure loss*; restricting it to 
 tree-shaping nodes keeps the benefit and drops the cost to ~0. This is what the −30.9→−9.6→
 +1.3 curve is: peeling off the loss-making shallow applications.
 
-A larger confirmation run (min_depth {5,6,7}, 1600 games each, out-of-sample openings) is
-in flight to resolve the sign; results appended when done. If `min_depth≈6` holds at or
-above zero, the policy is finally free (≈break-even at ~0 tax), and the levers that were
-capped by the tax — a slightly bigger model, richer features — could now pay for themselves,
-because the node-sparse gating hands back the NPS budget they need. Still opt-in, no bundled
-asset, default search unchanged.
+**Confirmation** (min_depth {5,6,7}, **1600 games each**, out-of-sample openings 500–503,
+±~12 Elo CI):
+
+| min_depth | 5 | **6** | 7 |
+|---|---|---|---|
+| Elo | −6.3 | **+0.2** | −6.1 |
+
+`min_depth=6` is the confirmed peak at **+0.2 Elo — statistically break-even** — with a
+sharp peak (both neighbours ~−6). So the full arc, at K=4/bound=2000:
+
+**−255 (initial) → −55 (order_score-in) → −30.9 (order-score-free + Tier 2) → +0.2
+(node-sparse, min_depth=6).** The learned move-ordering policy went from a large regression
+to **break-even at ~0 inference cost.**
+
+**What this does and doesn't mean.** It is *not* an adoptable gain — +0.2 ± 12 is
+indistinguishable from zero and nowhere near the +5 an SPRT would require to ship, so the
+policy stays opt-in with no bundled asset. What it *does* mean is that the inference tax —
+the wall that made every previous lever (bigger model, DAgger, richer features) a net loss —
+is gone: the policy now rides along for free. That reopens exactly those levers, because a
+model that orders even slightly better would previously have been eaten by the tax and can
+now show through. The most promising follow-up is therefore **a better predictor evaluated
+at min_depth≈6** (a bigger hidden layer or a cheap extra feature, whose cost is now
+amortised over far fewer nodes), gated at high game counts around K=4/bound=2000. Default
+search unchanged.
