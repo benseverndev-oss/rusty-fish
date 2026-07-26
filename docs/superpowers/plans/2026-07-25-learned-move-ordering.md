@@ -515,14 +515,47 @@ green; the code was correct.
 raise the ceiling. Reverted the widening (it added the `gives_check` clone and an
 incompatible RFPO `input_dim` for zero gain) back to the **16-feature +0.2 champion**.
 
+#### Search-derived signal — `eval_after` — best AUC of the arc, still gates negative (2026-07-26)
+
+Took the one genuinely unexplored lever: a *search-derived* feature. Every feature so far is
+available *before* a move is searched; the one thing they can't see is what the move does.
+Added `eval_after` (v5 telemetry, append-only): the static NNUE eval of the resulting
+position from the mover's perspective (`-evaluate(child)`), a 1-ply lookahead with no
+recursion. Captured free in the research pass and the collector's searched-move path (both
+already hold the child accumulator); at inference it is computed only for the top-`K` moves
+at nodes the node-sparse gate admits, via make/eval/unmake on the incremental accumulator (a
+two-pass order loop keeps the `&mut self` eval and the shared-borrow correction from
+aliasing). Byte-identical/clamp/arity invariants stayed green.
+
+- **Offline:** AUC **0.7810** — the **highest of the whole arc** (16-feat champion 0.7651;
+  the capacity/widening plateau was ~0.773). This is the *first* feature to push past the
+  0.77 ceiling. The signal is real.
+- **Overhead, `min_depth=6`/K=4:** `time_ratio` **1.000**, nodes identical — the deep-node
+  gate makes even a per-move NNUE eval free.
+- **Gate, `min_depth=6`, 800 games/bound:** bound 1500/2000/2500 → **+1.3** / −9.6 / −10.0
+  (smaller-is-better; best bound looked break-even-positive).
+- **Confirmation, 1600 games each, out-of-sample openings 600–603:** bound 1500 → **−6.1**,
+  bound 1000 → **−4.8**. The +1.3 was small-sample noise (same trap as −35→−55 and the
+  widening's +20→−1.6). Confirmed **negative**.
+
+**This is the decisive result of the arc.** A feature with the *best offline AUC yet*
+(0.781, clearly above the ceiling) applied *for free* (1.000×) still gates **below the
+16-feature champion**. So the wall is not the features and not the inference cost — it is that
+**offline `caused_cutoff` AUC and game Elo are decoupled** for this engine: a marginally
+better predictor at the front of an already-good order does not change enough cutoffs to move
+Elo. Reverted `eval_after` to the **16-feature +0.2 champion** (full implementation preserved
+in git for a future ranking-loss experiment, which is the direction this points at).
+
 **Final standing of the whole arc.** Everything actionable has now been swept — inference
 cost (top-K + node-sparse), training distribution (DAgger, both variants), model capacity
-(hidden 16/32/48/64), thresholds (bound/K/min_depth), and two move-quality features — and
-the ceiling holds: the best the learned move-ordering policy reaches is **break-even
-(≈+0.2 Elo) at ~0 inference tax**, not a shippable gain. The engineering (Tier 1/2 label
-tooling, the gate, top-K, node-sparse, order-score-free training) all lands and is reusable;
-the honest scientific conclusion is that ordering-time features carry a real but
-**sub-adoption** signal for this engine. Genuinely new lines (a pairwise/listwise ranking
-loss instead of pointwise `caused_cutoff`, or a fundamentally richer feature like
-continuation history with its own table) remain, but each is a larger build than any lever
-tried here. Policy stays opt-in; default search unchanged.
+(hidden 16/32/48/64), thresholds (bound/K/min_depth), two ordering-time move-quality features,
+and now a search-derived feature (best AUC, still negative) — and the ceiling holds: the best
+the learned move-ordering policy reaches is **break-even (≈+0.2 Elo) at ~0 inference tax**,
+not a shippable gain. The engineering (Tier 1/2 label tooling, the gate, top-K, node-sparse,
+order-score-free training, the search-derived-feature plumbing) all lands and is reusable; the
+honest scientific conclusion is now sharper than "features carry a sub-adoption signal" — even
+the *best* predictor we can build gates negative, so the **pointwise objective, not the
+feature set, is the constraint**. The remaining genuinely-new line is a **pairwise/listwise
+ranking loss** (optimize the *order* directly, not per-move `caused_cutoff`); `eval_after`
+would be the natural feature to pair with it. That is a larger build than any lever tried
+here. Policy stays opt-in; default search unchanged.
