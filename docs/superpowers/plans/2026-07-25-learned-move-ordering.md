@@ -465,3 +465,33 @@ now show through. The most promising follow-up is therefore **a better predictor
 at min_depth≈6** (a bigger hidden layer or a cheap extra feature, whose cost is now
 amortised over far fewer nodes), gated at high game counts around K=4/bound=2000. Default
 search unchanged.
+
+#### Better predictor at min_depth=6 — capacity is exhausted (2026-07-26)
+
+Ran the follow-up: retrained on the *same cached corpus* (no regeneration — reused across
+all three) at `hidden ∈ {16, 32, 48, 64}`, and confirmed the overhead stays negligible at
+`min_depth=6` (nodes=OK, byte-identical ordering): 1.00× / 1.03× / — / 1.03×. So capacity
+is now nearly free, exactly as node-sparse promised. Gated `hidden {16, 32, 64}` at
+`min_depth=6`, K=4/bound=2000, **1600 games each**, same openings as the `+0.2` baseline:
+
+| hidden | val AUC | Elo @ md=6 |
+|---|---|---|
+| **16** | 0.765 | **+0.2** |
+| 32 | 0.771 | −10.6 |
+| 64 | 0.773 | −5.6 |
+
+**Bigger is still worse, even for free.** Offline AUC plateaus at ~0.773 (hidden 48 and 64
+identical) and the +0.008 over hidden=16 is offline overfit — it does not translate to
+ordering quality, and the bigger models gate *below* hidden=16. So the capacity lever is
+now ruled out **twice, independently**: at `min_depth=0` it lost on *cost*, and at
+`min_depth=6` — where cost is gone — it still loses, on *signal*. The ~0.77 AUC ceiling is a
+**feature limit**, not a capacity or cost one.
+
+**Bottom line for the whole arc.** Best config is unchanged: **hidden=16, order-score-free,
+Tier-2-trained, K=4/bound=2000, min_depth=6 → +0.2 Elo (break-even, ±12)**. To push past
+break-even into a *shippable* (+5) gain, the single remaining lever is **richer
+move-quality features** to raise the 0.77 AUC ceiling — a larger change (new append-only
+telemetry columns + feature-set widening, à la the `order_score` drop but adding), with
+candidates like a cheap SEE-of-the-best-reply, continuation/counter-move history, or
+piece-on-square hints. Everything else (capacity, DAgger, bound/K/min_depth tuning) has been
+swept and is not the constraint. Policy remains opt-in; default search unchanged.
