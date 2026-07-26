@@ -342,3 +342,37 @@ distribution onto the deployed one; (2) a bigger/better model or richer move-qua
 features now that the rank crutch is gone; (3) drive the K/bound sweep at higher game
 counts around K=4/bound=2000. The policy stays opt-in with no bundled asset — default
 search unchanged.
+
+#### DAgger iteration — tried, did not help (2026-07-25)
+
+`gen-research-telemetry` gained an optional trailing `[policy.rfpo] [bound] [top_k]`: with
+a policy installed the search *orders* moves like the deployed policy, so the re-search
+pass samples nodes on the policy's own distribution (labels stay order-independent). Ran
+one round: generated a 1.45M-row DAgger corpus with the round-1 policy driving ordering
+(K=4/bound=2000), retrained, and gated at K=4, 800 games/config, same openings as round-1.
+
+| policy (K=4, bound=2000, 800g) | Elo |
+|---|---|
+| round-1 (research, classical distribution) | **−30.9** |
+| round-2, replacement (train on DAgger corpus only) | −61.4 (AcceptH0) |
+| round-2, aggregated (train on round-1 ∪ DAgger) | −48.1 |
+
+**Both regressed.** Offline AUC was flat across all three (0.765 / 0.764 / 0.769), so this
+is purely a distribution effect, and the *right* way round: DAgger's premise is to train on
+the distribution the policy induces so it sees its own mistakes — but that only helps when
+the policy is *better* than the reference it will run against. Here the round-1 policy is
+**−31 Elo, i.e. worse than classical**, so its induced node distribution is a *degraded*
+search's, not a better one; training toward it moves away from the useful (≈classical)
+distribution the residual actually runs in. Aggregation (−48) beat pure replacement (−61)
+but still lost to plain round-1. Compounding it: the correction is a nudge within the quiet
+band (bound 2000 ≪ the 100k+ classical bucket gaps), so the policy's node distribution is
+already *nearly* classical's — DAgger's shift is small and slightly harmful.
+
+**Conclusion: DAgger is not the lever while the policy is below the reference.** The
+round-1 Tier 2 / order-score-free policy at **−30.9 Elo remains the best result**. The
+binding constraint is predictor quality (AUC 0.765) plus the residual inference tax, not the
+training distribution — so the payoff order is now **(1)** a bigger/better model or richer
+move-quality features (the rank crutch is gone, so capacity can finally matter), **(2)**
+cheaper inference to shrink the ~16% K=4 tax, and only **(3)** revisit DAgger *after* a
+round crosses into positive Elo, where its premise actually holds. Policy stays opt-in;
+default search unchanged.

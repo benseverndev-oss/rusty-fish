@@ -811,20 +811,36 @@ fn main() -> Result<(), String> {
         // true "would this move cut first?", including moves the real search pruned or
         // never reached (which Tier 1 replay cannot label). Same v4 schema, so the output
         // concatenates with gen-search-telemetry and feeds `train-policy` unchanged.
-        let usage = "usage: gen-research-telemetry <positions_or_-> <depth> [stride] [min_depth]";
+        // Optional trailing [policy.rfpo] [bound] [top_k] turns this into a DAgger pass:
+        // the search orders moves with that policy, so sampled nodes are on the policy's
+        // own distribution (labels stay order-independent either way).
+        let usage = "usage: gen-research-telemetry <positions_or_-> <depth> [stride] [min_depth] \
+                     [policy.rfpo] [bound] [top_k]";
         let source = std::env::args().nth(2).ok_or_else(|| usage.to_string())?;
         let depth = arg_u32(3).and_then(|d| u8::try_from(d).ok()).ok_or_else(|| usage.to_string())?;
         let stride = arg_u64(4).unwrap_or(64);
         let min_depth = arg_u32(5).and_then(|d| u8::try_from(d).ok()).unwrap_or(3);
+        let policy = match std::env::args().nth(6) {
+            Some(path) => {
+                let model = PolicyModel::from_file(&path)?;
+                let bound = arg_u64(7)
+                    .and_then(|value| i32::try_from(value).ok())
+                    .unwrap_or(DEFAULT_POLICY_ORDER_BOUND);
+                let top_k = arg_u64(8).map(|value| value as usize).unwrap_or(DEFAULT_POLICY_ORDER_TOP_K);
+                Some((model, bound, top_k))
+            }
+            None => None,
+        };
+        let dagger = policy.is_some();
         let summary = if source == "-" {
-            run_gen_research_telemetry(std::io::stdin().lock(), depth, stride, min_depth)?
+            run_gen_research_telemetry(std::io::stdin().lock(), depth, stride, min_depth, policy)?
         } else {
             let file = std::fs::File::open(&source)
                 .map_err(|error| format!("failed to open positions {source}: {error}"))?;
-            run_gen_research_telemetry(std::io::BufReader::new(file), depth, stride, min_depth)?
+            run_gen_research_telemetry(std::io::BufReader::new(file), depth, stride, min_depth, policy)?
         };
         eprintln!(
-            "GEN_RESEARCH_DONE positions={} skipped={} rows={} stride={stride} min_depth={min_depth}",
+            "GEN_RESEARCH_DONE positions={} skipped={} rows={} stride={stride} min_depth={min_depth} dagger={dagger}",
             summary.positions, summary.skipped, summary.rows,
         );
         return Ok(());

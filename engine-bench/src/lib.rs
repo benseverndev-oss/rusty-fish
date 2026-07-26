@@ -2438,6 +2438,7 @@ pub fn run_gen_research_telemetry<R: std::io::Read>(
     depth: u8,
     stride: u64,
     min_depth: u8,
+    policy: Option<(PolicyModel, i32, usize)>,
 ) -> Result<ResearchGenSummary, String> {
     if depth == 0 {
         return Err("invalid depth 0: need depth >= 1".to_string());
@@ -2448,6 +2449,21 @@ pub fn run_gen_research_telemetry<R: std::io::Read>(
         .map_err(|error| format!("failed to write telemetry header: {error}"))?;
     let mut searcher = Searcher::default();
     searcher.set_lmr_model(None);
+    // DAgger: with a policy installed the search *orders* moves like the deployed policy,
+    // so the nodes the research pass samples are on the policy's own distribution — the
+    // positions/windows it actually creates when it re-ranks, not classical's. The
+    // re-search labels stay order-independent regardless; only which nodes get labelled
+    // shifts. `set_lmr_model(None)` above keeps the reduction regime matching the rest of
+    // the telemetry.
+    if let Some((model, bound, top_k)) = policy {
+        let params = SearchParams {
+            policy_order_bound: bound,
+            policy_order_top_k: top_k,
+            ..SearchParams::default()
+        };
+        searcher.set_search_params(params);
+        searcher.set_policy_model(Some(model));
+    }
     searcher.enable_research(stride, min_depth, SEARCH_TELEMETRY_CAP);
     let mut skipped: u64 = 0;
     let mut pos_id: u64 = 0;
