@@ -22,33 +22,29 @@ const VERSION: u32 = 1;
 /// The ordering-time context features, in the exact order the trainer uses (matching
 /// `telemetry::POLICY_FEATURE_COLUMNS`): depth, ply, pv_node, node_in_check,
 /// static_eval, is_quiet, is_capture, is_promotion, is_tt_move, is_killer, is_counter,
-/// history_score, tt_depth, see, mover_piece, captured_piece, gives_check, psqt_delta.
+/// history_score, tt_depth, see, mover_piece, captured_piece.
 ///
-/// These are the signals available to the move orderer *before* a move is searched.
-/// Deliberately excluded: `move_index` and `order_score` (both encode the *classical
-/// rank* the policy is trying to improve on — with them in, the model just re-derives the
-/// classical ordering and adds nothing; the classical score still enters the search as
-/// the residual base, `order = classical + correction`), and `reduction` / `extension`
-/// (decided only after ordering). The raw constituents of the classical score — `see`,
-/// `history_score`, `is_tt_move`, `is_killer`, `is_counter`, `is_capture` — are kept.
-///
-/// Move-quality widening (does the ordering-time signal have a ceiling above the classical
-/// constituents?): `gives_check` — a strong cutoff predictor since checks force replies,
-/// costed out of ordering before but affordable under node-sparse application — and
-/// `psqt_delta`, the tapered-midgame piece-square gain of the move (a cheap positional
-/// signal). Both are computed from the pre-move board so training and inference agree.
-pub const POLICY_FEATURES: usize = 18;
+/// These are exactly the signals available to the move orderer *before* a move is
+/// searched, and cheap to compute there. Deliberately excluded: `move_index` and
+/// `order_score` (both encode the *classical rank* the policy is trying to improve on —
+/// with them in, the model just re-derives the classical ordering and adds nothing; the
+/// classical score still enters the search as the residual base, `order = classical +
+/// correction`, so the model does not need it as an input), and `reduction` / `extension`
+/// / `gives_check` (decided or costly only after ordering). The raw constituents of the
+/// classical score — `see`, `history_score`, `is_tt_move`, `is_killer`, `is_counter`,
+/// `is_capture` — are kept, so the model sees the underlying signals, just not the
+/// pre-baked ranking.
+pub const POLICY_FEATURES: usize = 16;
 
 /// Indices of the unbounded feature columns, clamped before standardization exactly as
 /// the trainer clamps them. Kept in lockstep with `telemetry::POLICY_FEATURE_CLAMPS`
 /// (checked by a test there): the trainer fits its standardization on clamped values,
 /// so an unclamped mate eval or runaway history entry would land far outside the
 /// distribution the stored mean/scale describe.
-const CLAMPS: [(usize, f32); 4] = [
+const CLAMPS: [(usize, f32); 3] = [
     (4, 2_000.0),   // static_eval
     (11, 20_000.0), // history_score
     (13, 2_000.0),  // see
-    (17, 100.0),    // psqt_delta
 ];
 
 /// A loaded move-ordering policy. Immutable after load, cheap to share behind `Arc`.
@@ -213,7 +209,7 @@ impl PolicyModel {
 
 /// The feature indices clamped before standardization, exposed so the trainer applies
 /// the identical clamps when it builds its dataset (single-sourced with `CLAMPS`).
-pub const POLICY_CLAMP_INDICES: [(usize, f32); 4] = CLAMPS;
+pub const POLICY_CLAMP_INDICES: [(usize, f32); 3] = CLAMPS;
 
 /// Default magnitude of the move-ordering correction, in classical order-score units.
 /// Chosen to reorder meaningfully *within* the quiet-move history band (history scores

@@ -1524,10 +1524,7 @@ impl Searcher {
             // `nnue_unmake` restores it), and the history-bearing `order_score` is
             // snapshotted here at the decision point for the same no-leak reason as
             // `history_score` above.
-            let (order_score, see, mover_piece, captured_piece, psqt_delta) = if self
-                .telemetry
-                .is_some()
-            {
+            let (order_score, see, mover_piece, captured_piece) = if self.telemetry.is_some() {
                 let order_score =
                     self.move_order_score(board, mv, ply as usize, tt_move, counter_move);
                 let see = if is_capture {
@@ -1535,16 +1532,17 @@ impl Searcher {
                 } else {
                     0
                 };
-                let mover = board.piece_at(mv.from);
-                let mover_piece = mover.map(|piece| piece_kind_ordinal(piece.kind)).unwrap_or(0);
+                let mover_piece = board
+                    .piece_at(mv.from)
+                    .map(|piece| piece_kind_ordinal(piece.kind))
+                    .unwrap_or(0);
                 let captured_piece = board
                     .piece_at(mv.to)
                     .map(|piece| piece_kind_ordinal(piece.kind))
                     .unwrap_or(if is_capture { piece_kind_ordinal(PieceKind::Pawn) } else { 0 });
-                let psqt_delta = mover.map(|piece| psqt_delta_mg(piece, mv)).unwrap_or(0);
-                (order_score, see, mover_piece, captured_piece, psqt_delta)
+                (order_score, see, mover_piece, captured_piece)
             } else {
-                (0, 0, 0, 0, 0)
+                (0, 0, 0, 0)
             };
             if can_static_prune
                 && move_index >= late_move_pruning_limit(&self.params, depth)
@@ -1589,7 +1587,6 @@ impl Searcher {
                         move_score: 0, // late-move-pruned: not searched
                         node_alpha,
                         node_beta: beta,
-                        psqt_delta,
                     });
                 }
                 break;
@@ -1724,7 +1721,6 @@ impl Searcher {
                     move_score: score,
                     node_alpha,
                     node_beta: beta,
-                    psqt_delta,
                 });
             }
             if caused_cutoff {
@@ -1824,13 +1820,14 @@ impl Searcher {
             let is_quiet = !is_capture && !is_promotion;
             let order_score = self.move_order_score(board, mv, ply as usize, tt_move, counter_move);
             let see = if is_capture { static_exchange_evaluation(board, mv) } else { 0 };
-            let mover = board.piece_at(mv.from);
-            let mover_piece = mover.map(|piece| piece_kind_ordinal(piece.kind)).unwrap_or(0);
+            let mover_piece = board
+                .piece_at(mv.from)
+                .map(|piece| piece_kind_ordinal(piece.kind))
+                .unwrap_or(0);
             let captured_piece = board
                 .piece_at(mv.to)
                 .map(|piece| piece_kind_ordinal(piece.kind))
                 .unwrap_or(if is_capture { piece_kind_ordinal(PieceKind::Pawn) } else { 0 });
-            let psqt_delta = mover.map(|piece| psqt_delta_mg(piece, mv)).unwrap_or(0);
 
             let undo = self.nnue_make(board, mv);
             let gives_check = board.in_check(board.side_to_move);
@@ -1875,7 +1872,6 @@ impl Searcher {
                 move_score: score,
                 node_alpha,
                 node_beta,
-                psqt_delta,
             });
         }
     }
@@ -2131,24 +2127,14 @@ impl Searcher {
             .is_some_and(|killers| killers.contains(&Some(mv)));
         let is_counter = counter_move == Some(mv);
         let history_score = self.history[history_index(mv)];
-        let mover = board.piece_at(mv.from);
-        let mover_piece = mover.map(|piece| piece_kind_ordinal(piece.kind)).unwrap_or(0);
+        let mover_piece = board
+            .piece_at(mv.from)
+            .map(|piece| piece_kind_ordinal(piece.kind))
+            .unwrap_or(0);
         let captured_piece = board
             .piece_at(mv.to)
             .map(|piece| piece_kind_ordinal(piece.kind))
             .unwrap_or(if is_capture { piece_kind_ordinal(PieceKind::Pawn) } else { 0 });
-        // `gives_check` matches the telemetry's post-move `in_check`: make the move on a
-        // throwaway clone (cheap, and only at the few `min_depth`-deep nodes the policy
-        // re-ranks) and read whether the side to move is now in check. `psqt_delta` is a
-        // pure lookup on the pre-move board — same function the telemetry used.
-        let gives_check = {
-            let mut probe = board.clone();
-            probe
-                .make_move(mv)
-                .map(|_| probe.in_check(probe.side_to_move))
-                .unwrap_or(false)
-        };
-        let psqt_delta = mover.map(|piece| psqt_delta_mg(piece, mv)).unwrap_or(0);
         [
             f32::from(ctx.depth),
             ply as f32,
@@ -2166,8 +2152,6 @@ impl Searcher {
             see as f32,
             f32::from(mover_piece),
             f32::from(captured_piece),
-            f32::from(u8::from(gives_check)),
-            psqt_delta as f32,
         ]
     }
 
@@ -2693,14 +2677,6 @@ fn tapered_piece_value(piece: Piece, params: &EvalParams) -> TaperedScore {
         PieceKind::Queen => params.queen,
         PieceKind::King => TaperedScore::equal(0),
     }
-}
-
-/// Tapered-midgame piece-square gain of `mv` for the moving `piece`: destination bonus
-/// minus origin bonus. A cheap positional move-quality feature for the Phase 4 policy,
-/// computed identically at telemetry capture, in the re-search pass, and at inference so
-/// training and inference agree.
-fn psqt_delta_mg(piece: Piece, mv: ChessMove) -> i32 {
-    piece_square_bonus(piece, mv.to.0).middlegame - piece_square_bonus(piece, mv.from.0).middlegame
 }
 
 fn piece_square_bonus(piece: Piece, idx: u8) -> TaperedScore {
