@@ -495,3 +495,29 @@ telemetry columns + feature-set widening, à la the `order_score` drop but addin
 candidates like a cheap SEE-of-the-best-reply, continuation/counter-move history, or
 piece-on-square hints. Everything else (capacity, DAgger, bound/K/min_depth tuning) has been
 swept and is not the constraint. Policy remains opt-in; default search unchanged.
+
+#### Feature widening — the first clearly-positive result (2026-07-26)
+
+Widened the policy feature set 16→18 (v5 telemetry, append-only): **`gives_check`** (already
+a telemetry column — a strong cutoff predictor, checks force replies — promoted to a model
+feature; computed at inference via a per-move board clone, which the `min_depth=6` node
+budget makes free) and a new **`psqt_delta`** column (tapered-midgame piece-square gain of
+the move). Byte-identical/clamp/arity invariants all stay green. Regenerated the corpus with
+the new column and retrained hidden=16.
+
+- **Offline: AUC 0.7597 — slightly *down* from 0.7651.** As before, corpus-wide AUC is a poor
+  proxy: it's dominated by shallow nodes, but the policy is only applied at `depth>=6`.
+- **Gate: it works.** `min_depth=6`, overhead still 1.003× (the `gives_check` clone is free at
+  these few nodes), 800 games/bound:
+
+  | bound | 1500 | **2000** | 2500 |
+  |---|---|---|---|
+  | Elo | −10.4 | **+20.0** | +3.9 |
+
+`bound=2000` gives **+20.0 Elo** — the **first clearly-positive result of the whole arc**,
+and it beats the 16-feature `+0.2` decisively *despite* the lower AUC. The reading: the new
+features (especially `gives_check`) discriminate best exactly at the deep tactical nodes
+where the policy runs, even while adding noise to the corpus-wide AUC. A large confirmation
+at `bound=2000` is running to nail the magnitude/sign (appended when done). If it holds
+above +5, this is the first candidate worth an adoption SPRT + a bundled asset. Policy still
+opt-in; default search unchanged.

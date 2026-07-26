@@ -128,12 +128,22 @@ pub struct MoveDecision {
     /// The node's beta (constant across the move loop). A move cuts iff `move_score >=
     /// node_beta`.
     pub node_beta: i32,
+
+    // --- v5 context (APPENDED, never inserted) ---
+    // Move-quality feature widening for the Phase 4 policy. `gives_check` already existed
+    // (this only promotes it to a model feature); `psqt_delta` is new: the tapered-midgame
+    // piece-square gain of the move (destination minus origin for the moving piece), a
+    // cheap positional signal computed from the pre-move board so it never leaks the
+    // outcome. Appended, so every existing column index is unchanged.
+    /// Tapered-midgame piece-square-table gain of the move for the moving piece
+    /// (`bonus(to) - bonus(from)`), `0` if the from-square is somehow empty.
+    pub psqt_delta: i32,
 }
 
 /// TSV header row for the v1 schema, including the leading `pos_id` column that
 /// the dataset generator prepends. Kept adjacent to [`MoveDecision::to_tsv_row`]
 /// so the column order stays single-sourced.
-pub const TELEMETRY_TSV_HEADER: &str = "pos_id\tdepth\tply\tmove_index\tis_quiet\tis_priority\tpv_node\tgives_check\tstatic_eval\textension\treduction\tlmp_pruned\traised_alpha\tcaused_cutoff\tneeded_lmr_research\tneeded_pvs_research\tsubtree_nodes\thistory_score\tis_tt_move\tis_killer\tis_counter\tis_capture\tis_promotion\tnode_in_check\ttt_depth\torder_score\tsee\tmover_piece\tcaptured_piece\tnode_id\tmove_score\tnode_alpha\tnode_beta";
+pub const TELEMETRY_TSV_HEADER: &str = "pos_id\tdepth\tply\tmove_index\tis_quiet\tis_priority\tpv_node\tgives_check\tstatic_eval\textension\treduction\tlmp_pruned\traised_alpha\tcaused_cutoff\tneeded_lmr_research\tneeded_pvs_research\tsubtree_nodes\thistory_score\tis_tt_move\tis_killer\tis_counter\tis_capture\tis_promotion\tnode_in_check\ttt_depth\torder_score\tsee\tmover_piece\tcaptured_piece\tnode_id\tmove_score\tnode_alpha\tnode_beta\tpsqt_delta";
 
 /// The learned-LMR model's input columns, **by header name**, in the exact order the
 /// model expects them (matching `train_lmr.py`'s `FEATURE_COLS` and the feature
@@ -207,6 +217,8 @@ pub const POLICY_FEATURE_COLUMNS: [&str; crate::policy_model::POLICY_FEATURES] =
     "see",
     "mover_piece",
     "captured_piece",
+    "gives_check",
+    "psqt_delta",
 ];
 
 /// Policy label column: did the searched move cause a beta cutoff — i.e. was it the move
@@ -217,10 +229,11 @@ pub const POLICY_TARGET_COLUMN: &str = "caused_cutoff";
 /// Inclusive clamp bounds for the policy's unbounded feature columns, keyed by header
 /// name. Mirrored by `policy_model`'s `POLICY_CLAMP_INDICES` and applied identically by
 /// the trainer, for the same standardization reason as [`LMR_FEATURE_CLAMPS`].
-pub const POLICY_FEATURE_CLAMPS: [(&str, f32); 3] = [
+pub const POLICY_FEATURE_CLAMPS: [(&str, f32); 4] = [
     ("static_eval", 2000.0),
     ("history_score", 20000.0),
     ("see", 2000.0),
+    ("psqt_delta", 100.0),
 ];
 
 impl MoveDecision {
@@ -230,7 +243,7 @@ impl MoveDecision {
         let b = |flag: bool| u8::from(flag);
         format!(
             "{pos_id}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\
-             \t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+             \t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.depth,
             self.ply,
             self.move_index,
@@ -263,6 +276,7 @@ impl MoveDecision {
             self.move_score,
             self.node_alpha,
             self.node_beta,
+            self.psqt_delta,
         )
     }
 }
@@ -447,6 +461,7 @@ mod tests {
             move_score: -128,
             node_alpha: -30,
             node_beta: 25,
+            psqt_delta: 12,
         };
         let row = record.to_tsv_row(9);
         let header_cols = TELEMETRY_TSV_HEADER.split('\t').count();
@@ -455,7 +470,7 @@ mod tests {
         assert_eq!(
             row,
             "9\t7\t3\t5\t1\t0\t1\t0\t-42\t1\t2\t0\t1\t1\t0\t1\t1234\t-55\t1\t0\t1\t0\t1\t0\t4\
-             \t1000042\t-17\t3\t5\t4242\t-128\t-30\t25"
+             \t1000042\t-17\t3\t5\t4242\t-128\t-30\t25\t12"
         );
     }
 }
