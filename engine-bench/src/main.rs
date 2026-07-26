@@ -10,17 +10,23 @@ use engine_bench::{
     run_spsa_campaign, run_tactical_suite,
     spsa_tsv_report, sprt, sprt_tsv_report, summarize, tactical_tsv_report, throughput_tsv_report,
     gen_wdl_data_samples_from_reader, WdlSampleConfig,
-    gen_eval_positions_from_reader, run_gen_search_telemetry, run_lmr_export_features,
+    gen_eval_positions_from_reader, run_gen_search_telemetry, run_gen_research_telemetry,
+    run_lmr_export_features,
     run_label_sf, run_label_fens,
-    search_params_from_tsv, run_search_gate_fens,
+    search_params_from_tsv, run_search_gate_fens, run_policy_gate_fens, measure_policy_overhead,
 };
+use engine_bench::policy_train::{PolicyTrainConfig, train_policy};
+use engine_bench::mutate::gen_mutated_labels;
 use engine_bench::bench_harness::{
     BenchCompareConfig, BenchReportConfig, BudgetMode, EngineConfig, bench_compare_tsv_report,
     bench_full_report_text, bench_sweep_tsv_report, compare_openings, run_bench_compare,
     run_bench_report, run_bench_sweep,
 };
 use engine_bench::train::{generate_training_samples, train_nnue, TrainConfig};
-use engine_search::{EvalParams, Nnue, SearchParams};
+use engine_search::{
+    DEFAULT_POLICY_ORDER_BOUND, DEFAULT_POLICY_ORDER_MIN_DEPTH, DEFAULT_POLICY_ORDER_TOP_K,
+    EvalParams, Nnue, PolicyModel, SearchParams,
+};
 
 /// Shared middlegame sampling window for both `gen-wdl-data` and
 /// `gen-eval-positions`. Single-sourced so the Stockfish teacher labels the
@@ -312,6 +318,97 @@ fn main() -> Result<(), String> {
         )?;
         let score = summarize(&records);
         println!("{}\t{}\t{}", score.wins, score.draws, score.losses);
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("gate-policy") {
+        // gate-policy <policy.rfpo> <openings_file> [move_time_ms] [order_bound]:
+        // play the Phase 4 move-ordering policy (candidate) vs classical ordering
+        // (baseline) over the file's openings, color-swapped, at equal movetime;
+        // emit "W\tD\tL" on stdout (shardable — a fan-out sums slices, then `sprt`
+        // gives the verdict). The engine is otherwise the shipped default on both
+        // sides, so the SPRT isolates the learned ordering correction. A per-side
+        // node/depth summary — the tree-efficiency signal that moves even when Elo
+        // is flat — goes to stderr along with the local SPRT verdict.
+        let usage =
+            "usage: gate-policy <policy.rfpo> <openings_file> [move_time_ms] [order_bound] [top_k] [min_depth]";
+        let policy_path = std::env::args().nth(2).ok_or_else(|| usage.to_string())?;
+        let openings_path = std::env::args().nth(3).ok_or_else(|| usage.to_string())?;
+        let move_time = Duration::from_millis(arg_u64(4).unwrap_or(100));
+        let order_bound = arg_u64(5)
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or(DEFAULT_POLICY_ORDER_BOUND);
+        let top_k = arg_u64(6).map(|value| value as usize).unwrap_or(DEFAULT_POLICY_ORDER_TOP_K);
+        let min_depth = arg_u32(7)
+            .and_then(|value| u8::try_from(value).ok())
+            .unwrap_or(DEFAULT_POLICY_ORDER_MIN_DEPTH);
+        let policy = PolicyModel::from_file(&policy_path)?;
+        let contents = std::fs::read_to_string(&openings_path)
+            .map_err(|error| format!("failed to read openings {openings_path}: {error}"))?;
+        let fens: Vec<&str> = contents.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let result =
+            run_policy_gate_fens(&fens, &policy, order_bound, top_k, min_depth, move_time, 160)?;
+        let score = summarize(&result.records);
+        println!("{}\t{}\t{}", score.wins, score.draws, score.losses);
+        let decision = sprt(score, SprtConfig::default()).map(|verdict| verdict.decision);
+        eprintln!(
+            "gate-policy (bound={order_bound} top_k={top_k} min_depth={min_depth}): {}W {}D {}L; elo {}; decision = {decision:?}",
+            score.wins,
+            score.draws,
+            score.losses,
+            score.elo_difference().map_or_else(|| "n/a".to_string(), |elo| format!("{elo:.1}")),
+        );
+        let (cand, base) = (result.candidate, result.baseline);
+        let node_ratio = if base.nodes == 0 {
+            0.0
+        } else {
+            cand.nodes as f64 / base.nodes as f64
+        };
+        eprintln!(
+            "gate-policy nodes: candidate avg_depth={:.2} avg_nodes={:.0} total={} | \
+             baseline avg_depth={:.2} avg_nodes={:.0} total={} | depth_delta={:+.2} node_ratio={:.3}",
+            cand.avg_depth(),
+            cand.avg_nodes(),
+            cand.nodes,
+            base.avg_depth(),
+            base.avg_nodes(),
+            base.nodes,
+            cand.avg_depth() - base.avg_depth(),
+            node_ratio,
+        );
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("policy-overhead") {
+        // policy-overhead <policy.rfpo> <openings_file> <depth>: measure the policy's
+        // pure inference cost, load-insensitively. Searches each FEN to fixed depth with
+        // the policy off, then on at `order_bound = 0` (byte-identical ordering, so the
+        // node counts must match — a built-in correctness check), and reports the
+        // off/on nodes and the on/off time ratio (the per-node inference tax).
+        let usage = "usage: policy-overhead <policy.rfpo> <openings_file> <depth> [top_k] [min_depth]";
+        let policy_path = std::env::args().nth(2).ok_or_else(|| usage.to_string())?;
+        let openings_path = std::env::args().nth(3).ok_or_else(|| usage.to_string())?;
+        let depth = arg_u32(4).and_then(|d| u8::try_from(d).ok()).unwrap_or(9);
+        let top_k = arg_u64(5).map(|value| value as usize).unwrap_or(DEFAULT_POLICY_ORDER_TOP_K);
+        let min_depth = arg_u32(6)
+            .and_then(|value| u8::try_from(value).ok())
+            .unwrap_or(DEFAULT_POLICY_ORDER_MIN_DEPTH);
+        let policy = PolicyModel::from_file(&policy_path)?;
+        let contents = std::fs::read_to_string(&openings_path)
+            .map_err(|error| format!("failed to read openings {openings_path}: {error}"))?;
+        let fens: Vec<&str> = contents.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let overhead = measure_policy_overhead(&fens, &policy, depth, top_k, min_depth)?;
+        let node_check = if overhead.off_nodes == overhead.on_nodes { "OK" } else { "MISMATCH" };
+        println!(
+            "POLICY_OVERHEAD depth={depth} top_k={top_k} min_depth={min_depth} positions={} off_nodes={} on_nodes={} nodes={node_check} \
+             off_ms={:.1} on_ms={:.1} time_ratio={}",
+            fens.len(),
+            overhead.off_nodes,
+            overhead.on_nodes,
+            overhead.off_elapsed.as_secs_f64() * 1000.0,
+            overhead.on_elapsed.as_secs_f64() * 1000.0,
+            overhead
+                .time_ratio()
+                .map_or_else(|| "n/a".to_string(), |ratio| format!("{ratio:.3}")),
+        );
         return Ok(());
     }
     if std::env::args().nth(1).as_deref() == Some("mobility-gate-file") {
@@ -713,6 +810,49 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
 
+    if std::env::args().nth(1).as_deref() == Some("gen-research-telemetry") {
+        // gen-research-telemetry <positions_or_-> <depth> [stride] [min_depth]:
+        // Tier 2 decision-mutation labels. Like gen-search-telemetry, but at sampled nodes
+        // (node_id % stride == 0, remaining depth >= min_depth) every legal move is
+        // searched full-window, so each row's `caused_cutoff` is order-independent — the
+        // true "would this move cut first?", including moves the real search pruned or
+        // never reached (which Tier 1 replay cannot label). Same v4 schema, so the output
+        // concatenates with gen-search-telemetry and feeds `train-policy` unchanged.
+        // Optional trailing [policy.rfpo] [bound] [top_k] turns this into a DAgger pass:
+        // the search orders moves with that policy, so sampled nodes are on the policy's
+        // own distribution (labels stay order-independent either way).
+        let usage = "usage: gen-research-telemetry <positions_or_-> <depth> [stride] [min_depth] \
+                     [policy.rfpo] [bound] [top_k]";
+        let source = std::env::args().nth(2).ok_or_else(|| usage.to_string())?;
+        let depth = arg_u32(3).and_then(|d| u8::try_from(d).ok()).ok_or_else(|| usage.to_string())?;
+        let stride = arg_u64(4).unwrap_or(64);
+        let min_depth = arg_u32(5).and_then(|d| u8::try_from(d).ok()).unwrap_or(3);
+        let policy = match std::env::args().nth(6) {
+            Some(path) => {
+                let model = PolicyModel::from_file(&path)?;
+                let bound = arg_u64(7)
+                    .and_then(|value| i32::try_from(value).ok())
+                    .unwrap_or(DEFAULT_POLICY_ORDER_BOUND);
+                let top_k = arg_u64(8).map(|value| value as usize).unwrap_or(DEFAULT_POLICY_ORDER_TOP_K);
+                Some((model, bound, top_k))
+            }
+            None => None,
+        };
+        let dagger = policy.is_some();
+        let summary = if source == "-" {
+            run_gen_research_telemetry(std::io::stdin().lock(), depth, stride, min_depth, policy)?
+        } else {
+            let file = std::fs::File::open(&source)
+                .map_err(|error| format!("failed to open positions {source}: {error}"))?;
+            run_gen_research_telemetry(std::io::BufReader::new(file), depth, stride, min_depth, policy)?
+        };
+        eprintln!(
+            "GEN_RESEARCH_DONE positions={} skipped={} rows={} stride={stride} min_depth={min_depth} dagger={dagger}",
+            summary.positions, summary.skipped, summary.rows,
+        );
+        return Ok(());
+    }
+
     if std::env::args().nth(1).as_deref() == Some("lmr-export-features") {
         // lmr-export-features <telemetry_tsv_or_-> <out_prefix> [stride] [max_rows]:
         // stream a `gen-search-telemetry` TSV once and write the learned-LMR training
@@ -747,6 +887,81 @@ fn main() -> Result<(), String> {
         println!(
             "LMR_EXPORT_DONE prefix={prefix} rows={} scanned={} base_rate={base_rate:.4}",
             summary.rows, summary.scanned
+        );
+        return Ok(());
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("train-policy") {
+        // train-policy <telemetry_tsv_or_-> <out.rfpo> [hidden] [epochs] [lr] [stride]
+        //              [max_rows] [seed]:
+        // fit the Phase 4 move-ordering policy in-process (no Python/Modal) from a
+        // `gen-search-telemetry` TSV and write the RFPO model. Prints val AUC — the
+        // signal that "search this move first" is learnable from ordering-time features.
+        let usage = "usage: train-policy <telemetry_or_-> <out.rfpo> [hidden] [epochs] [lr] \
+                     [stride] [max_rows] [seed]";
+        let source = std::env::args().nth(2).ok_or_else(|| usage.to_string())?;
+        let out_path = std::env::args().nth(3).ok_or_else(|| usage.to_string())?;
+        let default = PolicyTrainConfig::default();
+        let learning_rate = std::env::args()
+            .nth(6)
+            .map(|arg| arg.parse::<f32>().map_err(|_| format!("invalid lr `{arg}`")))
+            .transpose()?
+            .unwrap_or(default.learning_rate);
+        let config = PolicyTrainConfig {
+            hidden: arg_u64(4).map(|value| value as usize).unwrap_or(default.hidden),
+            epochs: arg_u64(5).map(|value| value as usize).unwrap_or(default.epochs),
+            learning_rate,
+            stride: arg_u64(7).unwrap_or(default.stride),
+            max_rows: arg_u64(8).map(|value| value as usize).unwrap_or(default.max_rows),
+            seed: arg_u64(9).unwrap_or(default.seed),
+            ..default
+        };
+        let (bytes, summary) = if source == "-" {
+            train_policy(std::io::stdin().lock(), config)?
+        } else {
+            let file = std::fs::File::open(&source)
+                .map_err(|error| format!("failed to open telemetry {source}: {error}"))?;
+            train_policy(file, config)?
+        };
+        std::fs::write(&out_path, &bytes)
+            .map_err(|error| format!("failed to write {out_path}: {error}"))?;
+        println!(
+            "POLICY_TRAIN_DONE out={out_path} rows={} scanned={} base_rate={:.4} \
+             val_acc={:.4} val_auc={:.4}",
+            summary.rows, summary.scanned, summary.base_rate, summary.val_accuracy, summary.val_auc
+        );
+        return Ok(());
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("gen-mutated-labels") {
+        // gen-mutated-labels <telemetry_v4_tsv_or_-> <mutations_per_node> [seed]:
+        // Tier 1 decision-mutation augmentation. Reads a v4 `gen-search-telemetry` TSV,
+        // groups rows by node, and replays each node's cutoff logic under shuffled move
+        // orders to emit counterfactual rows (same schema, so the output concatenates
+        // with real telemetry and feeds `train-policy` unchanged). Prints the node/row
+        // counts and the actual-order replay fidelity to stderr — see the module docs for
+        // what this can and cannot synthesize (new `raised_alpha`, not new cutters).
+        let usage = "usage: gen-mutated-labels <telemetry_v4_or_-> <mutations_per_node> [seed]";
+        let source = std::env::args().nth(2).ok_or_else(|| usage.to_string())?;
+        let mutations = arg_u64(3).ok_or_else(|| usage.to_string())?;
+        let seed = arg_u64(4).unwrap_or(0);
+        let stdout = std::io::stdout();
+        let writer = std::io::BufWriter::new(stdout.lock());
+        let summary = if source == "-" {
+            gen_mutated_labels(std::io::stdin().lock(), writer, mutations, seed)?
+        } else {
+            let file = std::fs::File::open(&source)
+                .map_err(|error| format!("failed to open telemetry {source}: {error}"))?;
+            gen_mutated_labels(std::io::BufReader::new(file), writer, mutations, seed)?
+        };
+        eprintln!(
+            "GEN_MUTATED_DONE nodes={} mutable_nodes={} emitted_rows={} fidelity={}",
+            summary.nodes,
+            summary.mutable_nodes,
+            summary.emitted_rows,
+            summary
+                .fidelity()
+                .map_or_else(|| "n/a".to_string(), |value| format!("{value:.4}")),
         );
         return Ok(());
     }
