@@ -495,3 +495,34 @@ telemetry columns + feature-set widening, à la the `order_score` drop but addin
 candidates like a cheap SEE-of-the-best-reply, continuation/counter-move history, or
 piece-on-square hints. Everything else (capacity, DAgger, bound/K/min_depth tuning) has been
 swept and is not the constraint. Policy remains opt-in; default search unchanged.
+
+#### Feature widening — tried, does not help, reverted (2026-07-26)
+
+Took the lever above. Widened the feature set 16→18 (v5 telemetry, append-only):
+`gives_check` (already a telemetry column — a strong cutoff predictor; computed at
+inference via a per-move board clone, free at `min_depth=6`) and a new `psqt_delta`
+column (tapered-midgame piece-square gain). Byte-identical/clamp/arity invariants stayed
+green; the code was correct.
+
+- **Offline:** AUC **0.7597**, slightly *down* from 0.7651.
+- **Gate, `min_depth=6`, 800 games/bound:** bound 1500/2000/2500 → −10.4 / **+20.0** / +3.9.
+  The `+20.0` at `bound=2000` looked like the first real gain.
+- **Confirmation, `bound=2000`, 3200 games** (±8.5): **1110-965-1125 → −1.6 Elo.**
+
+**The +20 was small-sample noise** — exactly the trap that also turned an early −35 into
+−55. At a tight CI the widened policy is **−1.6, i.e. break-even, no better than the
+16-feature +0.2** (and the lower AUC predicted this). So these two features do **not**
+raise the ceiling. Reverted the widening (it added the `gives_check` clone and an
+incompatible RFPO `input_dim` for zero gain) back to the **16-feature +0.2 champion**.
+
+**Final standing of the whole arc.** Everything actionable has now been swept — inference
+cost (top-K + node-sparse), training distribution (DAgger, both variants), model capacity
+(hidden 16/32/48/64), thresholds (bound/K/min_depth), and two move-quality features — and
+the ceiling holds: the best the learned move-ordering policy reaches is **break-even
+(≈+0.2 Elo) at ~0 inference tax**, not a shippable gain. The engineering (Tier 1/2 label
+tooling, the gate, top-K, node-sparse, order-score-free training) all lands and is reusable;
+the honest scientific conclusion is that ordering-time features carry a real but
+**sub-adoption** signal for this engine. Genuinely new lines (a pairwise/listwise ranking
+loss instead of pointwise `caused_cutoff`, or a fundamentally richer feature like
+continuation history with its own table) remain, but each is a larger build than any lever
+tried here. Policy stays opt-in; default search unchanged.
